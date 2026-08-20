@@ -1,28 +1,39 @@
-# WASMIDI Pass 6.2 — consolidated FBO fix + renderer diagnostics
+# WASMIDI Pass 6.3 — Qt scene-graph synchronization fix
 
-This overlay contains the Pass 6.1 framebuffer restore fix and adds temporary
-diagnostics so the next browser run identifies the exact failure stage.
+The renderer itself was proven to work by Pass 6.2: real MIDI note pixels
+became visible after a resize/window event. The freeze is caused by
+QQuickFramebufferObject synchronization, not MIDI parsing or texture data.
 
-## Visible indicators
-A 12x12 square appears at the upper-left of the piano-roll FBO:
-- RED: private WebGL framebuffer is incomplete.
-- YELLOW: notes are loaded but the renderer has not generated any MIDI pixels.
-- GREEN: the renderer has generated real MIDI pixels.
+## Root cause
+`MainWindow::currentTimeChanged()` does not automatically dirty a
+QQuickFramebufferObject whose `controller` property merely points at
+MainWindow.
 
-An 8x8 MAGENTA marker is also inserted into the generated scroll texture at
-the upper-right. This marker travels through the exact same texture/blit path
-as MIDI notes.
+Pass 6 used `QQuickFramebufferObject::Renderer::update()` from the render
+thread. That schedules additional render passes, but the GUI-side PianoRoll
+item was not dirtied, so `synchronize()` kept supplying the old currentTime.
+A window resize dirtied the item, causing exactly one fresh synchronized frame.
 
-Interpretation:
-- GREEN square + magenta marker visible + no notes => tick/window/note geometry.
-- GREEN square + magenta marker absent => texture sampling/blit problem.
-- YELLOW square => writeStrip/filter/tick range problem.
-- RED square => private FBO creation problem.
+## Fix
+PianoRoll now calls its GUI-side `update()` on:
+- currentTimeChanged
+- documentRevisionChanged
+- noteSpeedChanged
+- postBufferChanged
+- perTrackColorsChanged
+- channelColorsChanged
+- playingChanged
 
-## Browser console
-Every ~60 render frames it emits:
-[WASMIDI-ROLL] notes=... firstTick=... lastTick=... currentTime=...
-currentTick=... windowTicks=... postTicks=... tpc=... search=...
-writtenNotes=... writtenPixels=... tex=... fbo=...
+Keyboard similarly updates on playback/document changes.
 
-Only src/renderer/gl_renderer.cpp changes.
+The autonomous Renderer::update() calls are removed. Every render request now
+goes through Qt's normal GUI -> synchronize -> render sequence.
+
+This package also restores the clean Pass 6.1 GL renderer, removing the
+temporary Pass 6.2 red/yellow/green and magenta diagnostics while retaining
+the required private-FBO restore fix.
+
+Files changed:
+- src/pianoroll.cpp
+- src/keyboard.cpp
+- src/renderer/gl_renderer.cpp

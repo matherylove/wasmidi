@@ -73,12 +73,14 @@ void main(){
     GLuint f = shader(GL_FRAGMENT_SHADER, fs);
     if (!v || !f)
         return 0;
+
     GLuint p = glCreateProgram();
     glAttachShader(p, v);
     glAttachShader(p, f);
     glLinkProgram(p);
     glDeleteShader(v);
     glDeleteShader(f);
+
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
     if (!ok) {
@@ -88,7 +90,8 @@ void main(){
     return p;
 }
 
-class KeyboardRenderer final : public QQuickFramebufferObject::Renderer {
+class KeyboardRenderer final
+    : public QQuickFramebufferObject::Renderer {
 public:
     ~KeyboardRenderer() override
     {
@@ -98,18 +101,28 @@ public:
         if (prog_) glDeleteProgram(prog_);
     }
 
-    QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override
+    QOpenGLFramebufferObject*
+    createFramebufferObject(const QSize& size) override
     {
         return new QOpenGLFramebufferObject(size);
     }
 
     void synchronize(QQuickFramebufferObject* item) override
     {
-        auto* k = static_cast<Keyboard*>(item);
-        auto* c = qobject_cast<MainWindow*>(k->controller());
-        width_ = std::max(1, int(k->width()));
-        height_ = std::max(1, int(k->height()));
-        active_ = c ? c->activePitchMask() : std::array<uint8_t,128>{};
+        auto* keyboard = static_cast<Keyboard*>(item);
+        auto* controller =
+            qobject_cast<MainWindow*>(
+                keyboard->controller());
+
+        width_ =
+            std::max(1, int(keyboard->width()));
+        height_ =
+            std::max(1, int(keyboard->height()));
+
+        active_ = controller
+            ? controller->activePitchMask()
+            : std::array<uint8_t,128>{};
+
         dirty_ = true;
     }
 
@@ -119,19 +132,29 @@ public:
             init();
         if (!prog_)
             return;
+
         if (dirty_)
             rebuild();
 
         glViewport(0, 0, width_, height_);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
-        glClearColor(.010f, .010f, .026f, 1.0f);
+
+        glClearColor(
+            .010f, .010f, .026f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
+
         glUseProgram(prog_);
         glBindVertexArray(vao_);
-        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(keys_.size()));
+
+        glDrawArraysInstanced(
+            GL_TRIANGLES,
+            0, 6,
+            GLsizei(keys_.size()));
+
         glBindVertexArray(0);
-        update();
+
+        // GUI-side signals below drive the next synchronize/render.
     }
 
 private:
@@ -144,28 +167,65 @@ private:
         glGenVertexArrays(1, &vao_);
         glBindVertexArray(vao_);
 
-        const float q[] = {0,0, 1,0, 0,1, 0,1, 1,0, 1,1};
+        const float q[] = {
+            0,0, 1,0, 0,1,
+            0,1, 1,0, 1,1
+        };
+
         glGenBuffers(1, &vbo_);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_STATIC_DRAW);
+        glBindBuffer(
+            GL_ARRAY_BUFFER, vbo_);
+
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            sizeof(q),
+            q,
+            GL_STATIC_DRAW);
+
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+        glVertexAttribPointer(
+            0, 2,
+            GL_FLOAT,
+            GL_FALSE,
+            0,
+            nullptr);
 
         glGenBuffers(1, &inst_);
-        glBindBuffer(GL_ARRAY_BUFFER, inst_);
+        glBindBuffer(
+            GL_ARRAY_BUFFER, inst_);
+
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(KeyInstance), reinterpret_cast<void*>(0));
+
+        glVertexAttribPointer(
+            1, 4,
+            GL_FLOAT,
+            GL_FALSE,
+            sizeof(KeyInstance),
+            reinterpret_cast<void*>(0));
+
         glVertexAttribDivisor(1, 1);
+
         glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(KeyInstance), reinterpret_cast<void*>(4*sizeof(float)));
+
+        glVertexAttribPointer(
+            2, 2,
+            GL_FLOAT,
+            GL_FALSE,
+            sizeof(KeyInstance),
+            reinterpret_cast<void*>(
+                4*sizeof(float)));
+
         glVertexAttribDivisor(2, 1);
+
         glBindVertexArray(0);
     }
 
     void rebuild()
     {
         static const bool black[12] = {
-            false,true,false,true,false,false,true,false,true,false,true,false
+            false,true,false,true,false,false,
+            true,false,true,false,true,false
         };
 
         keys_.clear();
@@ -176,50 +236,72 @@ private:
             if (!black[n % 12])
                 ++whiteTotal;
 
-        const float ww = 1.0f / float(whiteTotal);
-        const float bw = ww * 0.58f;
+        const float ww =
+            1.0f / float(whiteTotal);
+        const float bw =
+            ww * 0.58f;
 
         int wi = 0;
+
         for (int n = 0; n < 128; ++n) {
             if (black[n % 12])
                 continue;
+
             keys_.push_back({
-                wi * ww, 0.0f, ww, 1.0f,
-                0.0f, float(active_[n])
+                wi * ww,
+                0.0f,
+                ww,
+                1.0f,
+                0.0f,
+                float(active_[n])
             });
+
             ++wi;
         }
 
         wi = 0;
+
         for (int n = 0; n < 128; ++n) {
             if (black[n % 12]) {
-                const float x = wi * ww - bw * 0.5f;
+                const float x =
+                    wi * ww - bw * 0.5f;
 
-                /*
-                   QQuickFramebufferObject presents this FBO vertically
-                   opposite to the raw GL coordinate convention used here.
-                   y=0..0.62 therefore produces top-anchored black keys,
-                   matching the legacy keysCanvas.
-                */
                 keys_.push_back({
-                    x, 0.0f, bw, 0.62f,
-                    1.0f, float(active_[n])
+                    x,
+                    0.0f,
+                    bw,
+                    0.62f,
+                    1.0f,
+                    float(active_[n])
                 });
             } else {
                 ++wi;
             }
         }
 
-        glBindBuffer(GL_ARRAY_BUFFER, inst_);
-        glBufferData(GL_ARRAY_BUFFER,
-                     GLsizeiptr(keys_.size() * sizeof(KeyInstance)),
-                     keys_.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(
+            GL_ARRAY_BUFFER, inst_);
+
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            GLsizeiptr(
+                keys_.size() *
+                sizeof(KeyInstance)),
+            keys_.data(),
+            GL_DYNAMIC_DRAW);
+
         dirty_ = false;
     }
 
-    GLuint prog_ = 0, vao_ = 0, vbo_ = 0, inst_ = 0;
-    int width_ = 1, height_ = 1;
+    GLuint prog_ = 0;
+    GLuint vao_ = 0;
+    GLuint vbo_ = 0;
+    GLuint inst_ = 0;
+
+    int width_ = 1;
+    int height_ = 1;
     bool dirty_ = true;
+
     std::array<uint8_t,128> active_{};
     std::vector<KeyInstance> keys_;
 };
@@ -232,16 +314,42 @@ Keyboard::Keyboard(QQuickItem* parent)
     setMirrorVertically(false);
 }
 
-void Keyboard::setController(QObject* c)
+void Keyboard::setController(QObject* controller)
 {
-    if (controller_ == c)
+    if (controller_ == controller)
         return;
-    controller_ = c;
+
+    if (controller_)
+        QObject::disconnect(
+            controller_.data(), nullptr,
+            this, nullptr);
+
+    controller_ = controller;
+
+    if (auto* player =
+            qobject_cast<MainWindow*>(
+                controller_.data())) {
+        // activePitchMask() is time-dependent, so the keyboard must
+        // synchronize whenever playback time changes.
+        connect(
+            player, &MainWindow::currentTimeChanged,
+            this, [this]() { update(); });
+
+        connect(
+            player, &MainWindow::documentRevisionChanged,
+            this, [this]() { update(); });
+
+        connect(
+            player, &MainWindow::playingChanged,
+            this, [this]() { update(); });
+    }
+
     emit controllerChanged();
     update();
 }
 
-QQuickFramebufferObject::Renderer* Keyboard::createRenderer() const
+QQuickFramebufferObject::Renderer*
+Keyboard::createRenderer() const
 {
     return new KeyboardRenderer();
 }

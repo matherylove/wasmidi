@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <cstdio>
 
 namespace wasmidi {
 namespace {
@@ -50,16 +49,6 @@ GLuint linkProgram(const char* vertexSource, const char* fragmentSource)
 
     return program;
 }
-
-// Temporary Pass 6.2 diagnostics. These are render-thread-only globals.
-std::size_t g_debugSearchFrom = 0;
-std::size_t g_debugSearchTo = 0;
-std::size_t g_debugWrittenNotes = 0;
-std::size_t g_debugWrittenPixels = 0;
-std::size_t g_debugEverWrittenPixels = 0;
-double g_debugCurrentTick = 0.0;
-double g_debugTicksPerColumn = 0.0;
-GLenum g_debugFboStatus = GL_FRAMEBUFFER_COMPLETE;
 
 } // namespace
 
@@ -542,8 +531,6 @@ void GLRenderer::initTextures(int width, int height)
             textures_[i],
             0);
 
-        g_debugFboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-
         glViewport(
             0, 0,
             textureWidth_,
@@ -598,11 +585,6 @@ void GLRenderer::writeStrip(
 
     const double tpc = ticksPerColumn();
 
-    g_debugCurrentTick = currentTick;
-    g_debugTicksPerColumn = tpc;
-    g_debugWrittenNotes = 0;
-    g_debugWrittenPixels = 0;
-
     const double stripTickStart =
         currentTick - postTicks_ +
         double(columnStart) * tpc;
@@ -619,9 +601,6 @@ void GLRenderer::writeStrip(
 
     const std::size_t searchTo =
         upperBoundTick(stripTickEnd);
-
-    g_debugSearchFrom = searchFrom;
-    g_debugSearchTo = searchTo;
 
     const int rowHeight =
         std::max(
@@ -669,8 +648,6 @@ void GLRenderer::writeStrip(
         if (c0 > c1)
             continue;
 
-        ++g_debugWrittenNotes;
-
         const int rowCenter =
             static_cast<int>(std::lround(
                 (double(note.pitch) / 127.0) *
@@ -685,14 +662,6 @@ void GLRenderer::writeStrip(
             std::min(
                 textureHeight_ - 1,
                 rowTop + rowHeight - 1);
-
-        if (rowBottom >= rowTop && c1 >= c0) {
-            g_debugWrittenPixels +=
-                static_cast<std::size_t>(rowBottom - rowTop + 1) *
-                static_cast<std::size_t>(c1 - c0 + 1);
-            g_debugEverWrittenPixels =
-                std::max(g_debugEverWrittenPixels, g_debugWrittenPixels);
-        }
 
         const uint8_t colorIndex =
             colorIndexFor(
@@ -768,25 +737,6 @@ void GLRenderer::renderFullTexture(
         0,
         textureWidth_,
         currentTick);
-
-    // Temporary texture-path marker: a small magenta block at the upper-right.
-    // It goes through the same GL texture + fullscreen blit path as MIDI notes.
-    if (textureWidth_ >= 8 && textureHeight_ >= 8) {
-        const int markerW = std::min(8, textureWidth_);
-        const int markerH = std::min(8, textureHeight_);
-        for (int y = textureHeight_ - markerH; y < textureHeight_; ++y) {
-            for (int x = textureWidth_ - markerW; x < textureWidth_; ++x) {
-                const std::size_t base =
-                    (static_cast<std::size_t>(y) *
-                         static_cast<std::size_t>(textureWidth_) +
-                     static_cast<std::size_t>(x)) * 4u;
-                fullBuffer_[base] = 255;
-                fullBuffer_[base + 1] = 0;
-                fullBuffer_[base + 2] = 255;
-                fullBuffer_[base + 3] = 255;
-            }
-        }
-    }
 
     glBindTexture(
         GL_TEXTURE_2D,
@@ -994,68 +944,6 @@ void GLRenderer::renderRoll()
     }
 
     drawFrontTexture(targetFramebuffer);
-
-    // Visible diagnostic square bypasses the texture path:
-    //   RED     = private FBO incomplete
-    //   YELLOW  = notes are loaded but writeStrip has never produced pixels
-    //   GREEN   = writeStrip has produced real MIDI pixels
-    //
-    // This lets us separate "data/window" failures from "texture/blit" failures
-    // without relying on DevTools.
-    float dr = 1.0f, dg = 0.0f, db = 0.0f;
-    if (g_debugFboStatus == GL_FRAMEBUFFER_COMPLETE) {
-        if (g_debugEverWrittenPixels > 0) {
-            dr = 0.10f; dg = 1.0f; db = 0.25f;
-        } else {
-            dr = 1.0f; dg = 0.72f; db = 0.05f;
-        }
-    }
-
-    glBindFramebuffer(
-        GL_FRAMEBUFFER,
-        static_cast<GLuint>(targetFramebuffer));
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(
-        5,
-        std::max(0, height_ - 17),
-        12,
-        12);
-    glClearColor(dr, dg, db, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_SCISSOR_TEST);
-
-    static unsigned debugFrame = 0;
-    if ((++debugFrame % 60u) == 0u) {
-        const unsigned firstTick =
-            notes_.empty() ? 0u : notes_.front().startTick;
-        const unsigned lastTick =
-            notes_.empty() ? 0u : notes_.back().startTick;
-
-        std::fprintf(
-            stderr,
-            "[WASMIDI-ROLL] notes=%zu firstTick=%u lastTick=%u "
-            "currentTime=%.3f currentTick=%.3f windowTicks=%.3f "
-            "postTicks=%.3f tpc=%.3f search=%zu..%zu "
-            "writtenNotes=%zu writtenPixels=%zu everPixels=%zu "
-            "tex=%dx%d fbo=0x%x\\n",
-            notes_.size(),
-            firstTick,
-            lastTick,
-            currentTime_,
-            g_debugCurrentTick,
-            windowTicks_,
-            postTicks_,
-            g_debugTicksPerColumn,
-            g_debugSearchFrom,
-            g_debugSearchTo,
-            g_debugWrittenNotes,
-            g_debugWrittenPixels,
-            g_debugEverWrittenPixels,
-            textureWidth_,
-            textureHeight_,
-            static_cast<unsigned>(g_debugFboStatus));
-        std::fflush(stderr);
-    }
 }
 
 } // namespace wasmidi
