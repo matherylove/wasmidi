@@ -31,9 +31,9 @@ void main(){ vec3 c=vBlack>0.5?vec3(.055,.047,.105):vec3(.78,.79,.86); if(vActiv
     GLuint p=glCreateProgram(); glAttachShader(p,v); glAttachShader(p,f); glLinkProgram(p); glDeleteShader(v); glDeleteShader(f); return p;
 }
 
-class Renderer final : public QQuickFramebufferObject::Renderer {
+class KeyboardRenderer final : public QQuickFramebufferObject::Renderer {
 public:
-    ~Renderer() override {
+    ~KeyboardRenderer() override {
         if(vbo_) glDeleteBuffers(1,&vbo_); if(inst_) glDeleteBuffers(1,&inst_); if(vao_) glDeleteVertexArrays(1,&vao_); if(prog_) glDeleteProgram(prog_);
     }
     QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override { return new QOpenGLFramebufferObject(size); }
@@ -66,4 +66,4 @@ private:
 
 Keyboard::Keyboard(QQuickItem* parent):QQuickFramebufferObject(parent){}
 void Keyboard::setController(QObject* c){ if(controller_==c)return; controller_=c; emit controllerChanged(); update(); }
-QQuickFramebufferObject::Renderer* Keyboard::createRenderer() const { return new Renderer(); }
+QQuickFramebufferObject::Renderer* Keyboard::createRenderer() const { return new KeyboardRenderer(); }
