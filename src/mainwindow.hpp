@@ -8,8 +8,8 @@
 #include <QVariantList>
 #include <QVector>
 
-#include <vector>
 #include <array>
+#include <vector>
 
 #include "midi/midi_parser.hpp"
 #include "midi/scheduler.hpp"
@@ -40,9 +40,11 @@ class MainWindow : public QObject {
     Q_PROPERTY(int tempoChangeCount READ tempoChangeCount NOTIFY tempoChangeCountChanged)
     Q_PROPERTY(int controlEventCount READ controlEventCount NOTIFY controlEventCountChanged)
     Q_PROPERTY(int peakNps READ peakNps NOTIFY peakNpsChanged)
+    Q_PROPERTY(float peakNpsTime READ peakNpsTime NOTIFY timelineChanged)
     Q_PROPERTY(int peakPolyphony READ peakPolyphony NOTIFY peakPolyphonyChanged)
     Q_PROPERTY(QString pitchRange READ pitchRange NOTIFY pitchRangeChanged)
     Q_PROPERTY(int skippedVelocity READ skippedVelocity NOTIFY skippedVelocityChanged)
+    Q_PROPERTY(QVariantList npsTimeline READ npsTimeline NOTIFY timelineChanged)
     Q_PROPERTY(quint64 documentRevision READ documentRevision NOTIFY documentRevisionChanged)
     Q_PROPERTY(QString outputMode READ outputMode WRITE setOutputMode NOTIFY outputModeChanged)
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
@@ -73,9 +75,11 @@ public:
     int tempoChangeCount() const { return tempoChangeCount_; }
     int controlEventCount() const { return controlEventCount_; }
     int peakNps() const { return peakNps_; }
+    float peakNpsTime() const { return peakNpsTime_; }
     int peakPolyphony() const { return peakPolyphony_; }
     QString pitchRange() const { return pitchRange_; }
     int skippedVelocity() const { return skippedVelocity_; }
+    QVariantList npsTimeline() const { return npsTimeline_; }
     quint64 documentRevision() const { return documentRevision_; }
     QString outputMode() const { return outputMode_; }
     QVariantList channelColorList() const;
@@ -127,6 +131,7 @@ signals:
     void peakPolyphonyChanged();
     void pitchRangeChanged();
     void skippedVelocityChanged();
+    void timelineChanged();
     void documentRevisionChanged();
     void outputModeChanged();
     void channelColorsChanged();
@@ -138,6 +143,7 @@ private:
     void rebuildDerivedStats();
     void updateLiveStats();
     void updateCurrentTime();
+    void dispatchScheduler();
     void publishDocumentMetadata();
 
     wasmidi::MidiParser parser_;
@@ -165,9 +171,11 @@ private:
     int tempoChangeCount_ = 0;
     int controlEventCount_ = 0;
     int peakNps_ = 0;
+    float peakNpsTime_ = 0.0f;
     int peakPolyphony_ = 0;
     QString pitchRange_ = QStringLiteral("—");
     int skippedVelocity_ = 0;
+    QVariantList npsTimeline_;
     quint64 documentRevision_ = 0;
     QString outputMode_ = QStringLiteral("native");
 
@@ -177,8 +185,9 @@ private:
 
     std::vector<float> noteStarts_;
     std::vector<float> noteEnds_;
-    std::vector<int> npsBuckets_;
-    std::vector<int> ccBuckets_;
+    std::vector<float> controlTimes_;
+    std::vector<float> tempoTimes_;
+    std::vector<float> tempoBpms_;
     std::array<std::vector<float>, 128> pitchStarts_;
     std::array<std::vector<float>, 128> pitchEnds_;
 };

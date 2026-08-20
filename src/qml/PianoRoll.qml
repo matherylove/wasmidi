@@ -120,7 +120,7 @@ Item {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            anchors.bottomMargin: parent.height * 0.075
+            anchors.bottomMargin: parent.height * 0.015
             height: 1
             color: "#a78bfa"
             opacity: root.mainWindow.hasMidi ? 0.34 : 0

@@ -52,10 +52,10 @@ GLuint linkProgram(const char* vertexSource, const char* fragmentSource)
 GLRenderer::GLRenderer()
 {
     const float defaults[16][3] = {
-        {0.506f,0.549f,0.973f},{0.655f,0.545f,0.980f},{0.753f,0.518f,0.988f},{0.910f,0.475f,0.976f},
-        {0.957f,0.447f,0.714f},{0.984f,0.443f,0.522f},{0.984f,0.573f,0.235f},{0.980f,0.800f,0.082f},
-        {0.639f,0.902f,0.208f},{0.290f,0.871f,0.502f},{0.204f,0.827f,0.600f},{0.176f,0.831f,0.749f},
-        {0.133f,0.827f,0.933f},{0.220f,0.741f,0.973f},{0.376f,0.647f,0.980f},{0.545f,0.361f,0.965f}
+        {0.506f,0.549f,0.973f},{0.655f,0.545f,0.980f},{0.769f,0.710f,0.992f},{0.984f,0.573f,0.235f},
+        {0.290f,0.871f,0.502f},{0.220f,0.741f,0.973f},{0.957f,0.447f,0.714f},{0.980f,0.800f,0.082f},
+        {0.973f,0.443f,0.443f},{0.204f,0.827f,0.600f},{0.376f,0.647f,0.980f},{0.910f,0.475f,0.976f},
+        {0.984f,0.443f,0.522f},{0.639f,0.902f,0.208f},{0.133f,0.827f,0.933f},{0.984f,0.749f,0.141f}
     };
     std::memcpy(channelColors_.data(), defaults, sizeof(defaults));
 }
@@ -142,33 +142,94 @@ precision highp float;
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 aNote;      // start, end, pitch, channel
 layout(location=2) in vec2 aExtra;     // track, velocity
+
 uniform float uCurrentTime;
 uniform float uWindowSeconds;
 uniform float uPostBuffer;
 uniform bool uPerTrack;
 uniform vec3 uColors[16];
+
 out vec3 vColor;
 out float vActive;
 out float vVelocity;
+out vec2 vUv;
+
+bool isBlackKey(int pc) {
+    return pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
+}
+
+int whiteOffsetInOctave(int pc) {
+    if (pc <= 0) return 0;   // C
+    if (pc <= 2) return 1;   // D / C#
+    if (pc <= 4) return 2;   // E / D#
+    if (pc <= 5) return 3;   // F
+    if (pc <= 7) return 4;   // G / F#
+    if (pc <= 9) return 5;   // A / G#
+    return 6;                // B / A#
+}
+
+int leftWhiteOffsetForBlack(int pc) {
+    if (pc == 1) return 0;   // C# between C and D
+    if (pc == 3) return 1;   // D# between D and E
+    if (pc == 6) return 3;   // F# between F and G
+    if (pc == 8) return 4;   // G# between G and A
+    return 5;                // A# between A and B
+}
+
 void main() {
     float start = aNote.x;
     float end = max(aNote.y, start + 0.001);
-    float pitch = clamp(aNote.z, 0.0, 127.0);
+    int pitch = int(clamp(floor(aNote.z + 0.5), 0.0, 127.0));
+    int pc = pitch % 12;
+    int octave = pitch / 12;
+
+    // Vertical falling-note model: time is Y, pitch is X. Future notes start
+    // above the keyboard and move downward as uCurrentTime advances.
     float relStart = start - uCurrentTime;
     float relEnd = end - uCurrentTime;
-    float hitLine = 0.075;
-    float y0 = hitLine + ((relStart + uPostBuffer) / uWindowSeconds) * (1.0 - hitLine);
-    float y1 = hitLine + ((relEnd + uPostBuffer) / uWindowSeconds) * (1.0 - hitLine);
-    float keyW = 1.0 / 128.0;
-    float x0 = pitch * keyW;
-    float x1 = x0 + keyW * 0.94;
+    float hitLine = 0.015;
+    float usable = 1.0 - hitLine;
+    float y0 = hitLine + ((relStart + uPostBuffer) / uWindowSeconds) * usable;
+    float y1 = hitLine + ((relEnd + uPostBuffer) / uWindowSeconds) * usable;
+
+    // Cull notes that are completely outside the visible time window.
+    if (y1 < -0.02 || y0 > 1.02) {
+        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+        vColor = vec3(0.0);
+        vActive = 0.0;
+        vVelocity = 0.0;
+        vUv = aCorner;
+        return;
+    }
+
+    const float whiteCount = 75.0;
+    float whiteWidth = 1.0 / whiteCount;
+    float x0;
+    float x1;
+
+    if (isBlackKey(pc)) {
+        int leftWhite = octave * 7 + leftWhiteOffsetForBlack(pc);
+        float center = (float(leftWhite) + 1.0) * whiteWidth;
+        float width = whiteWidth * 0.58 * 0.88;
+        x0 = center - width * 0.5;
+        x1 = center + width * 0.5;
+    } else {
+        int whiteIndex = octave * 7 + whiteOffsetInOctave(pc);
+        x0 = float(whiteIndex) * whiteWidth + whiteWidth * 0.07;
+        x1 = float(whiteIndex + 1) * whiteWidth - whiteWidth * 0.07;
+    }
+
     float x = mix(x0, x1, aCorner.x);
     float y = mix(y0, y1, aCorner.y);
     gl_Position = vec4(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
-    int colorIndex = uPerTrack ? int(mod(aExtra.x, 16.0)) : int(clamp(aNote.w, 0.0, 15.0));
+
+    int colorIndex = uPerTrack
+        ? int(mod(aExtra.x, 16.0))
+        : int(clamp(aNote.w, 0.0, 15.0));
     vColor = uColors[colorIndex];
     vActive = float(start <= uCurrentTime && end >= uCurrentTime);
     vVelocity = clamp(aExtra.y, 0.0, 1.0);
+    vUv = aCorner;
 }
 )GLSL";
 
@@ -177,13 +238,26 @@ precision mediump float;
 in vec3 vColor;
 in float vActive;
 in float vVelocity;
+in vec2 vUv;
 out vec4 fragColor;
+
 void main() {
-    float velocityGain = mix(0.58, 1.0, vVelocity);
+    float velocityGain = mix(0.55, 1.0, vVelocity);
     vec3 color = vColor * velocityGain;
+
+    // Bright leading edge like the legacy renderer's first texture column.
+    if (vUv.y < 0.035)
+        color = min(vec3(1.0), color + vec3(0.20));
+
+    // Subtle horizontal edge shading makes long falling bars readable.
+    float edge = min(vUv.x, 1.0 - vUv.x);
+    if (edge < 0.06)
+        color *= 0.82;
+
     if (vActive > 0.5)
-        color = min(vec3(1.0), color * 1.35 + vec3(0.08));
-    fragColor = vec4(color, 0.94);
+        color = min(vec3(1.0), color * 1.55 + vec3(0.12));
+
+    fragColor = vec4(color, 0.96);
 }
 )GLSL";
 
@@ -220,7 +294,7 @@ void GLRenderer::renderRoll()
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClearColor(0.027f, 0.027f, 0.102f, 1.0f);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (notes_.empty())

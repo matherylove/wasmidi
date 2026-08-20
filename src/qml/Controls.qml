@@ -117,48 +117,98 @@ Item {
         id: chartBox
         property string title: "NPS"
         property real value: 0
-        property color accent: "#8b6ce8"
+        property color accent: "#a78bfa"
+        property int historyLength: 280
         property var samples: []
+        property int sampleIndex: 0
+        property var revision: root.mainWindow.documentRevision
         implicitHeight: 56
         radius: 6
         color: "#0b0a18"
         border.color: "#211a35"
         border.width: 1
 
+        function resetHistory() {
+            var arr = []
+            for (var i = 0; i < historyLength; ++i)
+                arr.push(0)
+            samples = arr
+            sampleIndex = 0
+            spark.requestPaint()
+        }
+
+        Component.onCompleted: resetHistory()
+        onRevisionChanged: resetHistory()
+
+        // MPWGL2 uses _HIST_RATE = 1000/30. Keep the same 30 Hz sample
+        // cadence while repainting on the display cadence below.
         Timer {
-            interval: 250
-            running: true
+            interval: 33
+            running: chartBox.visible && root.mainWindow.hasMidi
             repeat: true
             onTriggered: {
-                var copy = chartBox.samples.slice(Math.max(0, chartBox.samples.length - 54))
-                copy.push(Number(chartBox.value))
-                chartBox.samples = copy
-                spark.requestPaint()
+                if (chartBox.samples.length !== chartBox.historyLength)
+                    chartBox.resetHistory()
+                chartBox.samples[chartBox.sampleIndex] = Number(chartBox.value)
+                chartBox.sampleIndex = (chartBox.sampleIndex + 1) % chartBox.historyLength
             }
+        }
+
+        // The legacy _glLoop draws the charts every requestAnimationFrame.
+        Timer {
+            interval: 16
+            running: chartBox.visible
+            repeat: true
+            onTriggered: spark.requestPaint()
         }
 
         Canvas {
             id: spark
             anchors.fill: parent
-            anchors.margins: 4
-            opacity: 0.6
+            opacity: 0.92
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.clearRect(0, 0, width, height)
                 var values = chartBox.samples
-                if (!values || values.length < 2)
+                var count = values.length
+                if (!count)
                     return
+
                 var maxValue = 1
-                for (var i = 0; i < values.length; ++i)
-                    maxValue = Math.max(maxValue, values[i])
+                for (var i = 0; i < count; ++i)
+                    maxValue = Math.max(maxValue, Number(values[i]) || 0)
+
+                var topPad = 7
+                var bottomPad = 3
+                var graphHeight = Math.max(1, height - topPad - bottomPad)
+
+                // Filled area exactly like _drawMiniChart in MPWGL2.
                 ctx.beginPath()
-                ctx.lineWidth = 1
-                ctx.strokeStyle = chartBox.accent
-                for (var j = 0; j < values.length; ++j) {
-                    var px = (j / Math.max(1, values.length - 1)) * width
-                    var py = height - 5 - (values[j] / maxValue) * (height - 13)
-                    if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py)
+                for (var x = 0; x < Math.max(2, width); ++x) {
+                    var logical = Math.floor(x * count / Math.max(1, width))
+                    var idx = (chartBox.sampleIndex + logical) % count
+                    var v = Number(values[idx]) || 0
+                    var y = height - bottomPad - (v / maxValue) * graphHeight
+                    if (x === 0) ctx.moveTo(0, y); else ctx.lineTo(x, y)
                 }
+                ctx.lineTo(width, height)
+                ctx.lineTo(0, height)
+                ctx.closePath()
+                ctx.globalAlpha = 0.20
+                ctx.fillStyle = chartBox.accent
+                ctx.fill()
+                ctx.globalAlpha = 1.0
+
+                ctx.beginPath()
+                for (var x2 = 0; x2 < Math.max(2, width); ++x2) {
+                    var logical2 = Math.floor(x2 * count / Math.max(1, width))
+                    var idx2 = (chartBox.sampleIndex + logical2) % count
+                    var v2 = Number(values[idx2]) || 0
+                    var y2 = height - bottomPad - (v2 / maxValue) * graphHeight
+                    if (x2 === 0) ctx.moveTo(0, y2); else ctx.lineTo(x2, y2)
+                }
+                ctx.strokeStyle = chartBox.accent
+                ctx.lineWidth = 1.5
                 ctx.stroke()
             }
         }
@@ -178,8 +228,107 @@ Item {
             anchors.top: parent.top
             anchors.rightMargin: 7
             anchors.topMargin: 4
-            text: chartBox.value
-            color: chartBox.title === "Skipped vel" ? "#f07188" : "#c4b5fd"
+            text: Math.round(chartBox.value).toLocaleString()
+            color: chartBox.title === "Skipped vel" ? "#fb7185" : chartBox.accent
+            font.pixelSize: 9
+            font.bold: true
+        }
+    }
+
+    component TimelineChart: Rectangle {
+        id: timelineBox
+        property var values: root.mainWindow.npsTimeline
+        implicitHeight: 52
+        radius: 6
+        color: "#0b0a18"
+        border.color: "#211a35"
+        border.width: 1
+
+        Timer {
+            interval: 16
+            running: timelineBox.visible
+            repeat: true
+            onTriggered: timeline.requestPaint()
+        }
+
+        Canvas {
+            id: timeline
+            anchors.fill: parent
+            anchors.margins: 2
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                var data = timelineBox.values
+                if (!data || data.length === 0)
+                    return
+
+                var maxValue = 1
+                for (var i = 0; i < data.length; ++i)
+                    maxValue = Math.max(maxValue, Number(data[i]) || 0)
+
+                ctx.beginPath()
+                ctx.moveTo(0, height)
+                for (var x = 0; x < width; ++x) {
+                    var sample = Math.min(data.length - 1, Math.floor(x / Math.max(1, width) * data.length))
+                    var y = height - ((Number(data[sample]) || 0) / maxValue) * (height - 4) - 1
+                    ctx.lineTo(x, y)
+                }
+                ctx.lineTo(width, height)
+                ctx.closePath()
+                ctx.globalAlpha = 0.32
+                ctx.fillStyle = "#818cf8"
+                ctx.fill()
+                ctx.globalAlpha = 1.0
+
+                ctx.beginPath()
+                for (var x2 = 0; x2 < width; ++x2) {
+                    var sample2 = Math.min(data.length - 1, Math.floor(x2 / Math.max(1, width) * data.length))
+                    var y2 = height - ((Number(data[sample2]) || 0) / maxValue) * (height - 4) - 1
+                    if (x2 === 0) ctx.moveTo(0, y2); else ctx.lineTo(x2, y2)
+                }
+                ctx.strokeStyle = "#818cf8"
+                ctx.lineWidth = 1.4
+                ctx.stroke()
+
+                if (root.mainWindow.duration > 0) {
+                    var playX = Math.max(0, Math.min(width, root.mainWindow.currentTime / root.mainWindow.duration * width))
+                    ctx.beginPath()
+                    ctx.moveTo(playX, 0)
+                    ctx.lineTo(playX, height)
+                    ctx.strokeStyle = "rgba(196,181,253,0.55)"
+                    ctx.lineWidth = 1
+                    ctx.stroke()
+
+                    if (root.mainWindow.peakNpsTime > 0) {
+                        var peakX = Math.max(0, Math.min(width, root.mainWindow.peakNpsTime / root.mainWindow.duration * width))
+                        ctx.beginPath()
+                        ctx.moveTo(peakX, 0)
+                        ctx.lineTo(peakX, height)
+                        ctx.strokeStyle = "#fb923c"
+                        ctx.lineWidth = 1.2
+                        ctx.stroke()
+                    }
+                }
+            }
+        }
+
+        Text {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.leftMargin: 7
+            anchors.topMargin: 5
+            text: "NPS TIMELINE"
+            color: "#5d5470"
+            font.pixelSize: 7
+            font.bold: true
+        }
+        Text {
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.rightMargin: 7
+            anchors.topMargin: 4
+            text: root.mainWindow.nps.toLocaleString()
+            color: "#818cf8"
             font.pixelSize: 9
             font.bold: true
         }
@@ -363,23 +512,20 @@ Item {
             }
         }
 
-        MiniChart {
+        TimelineChart {
             Layout.fillWidth: true
             visible: root.mainWindow.hasMidi
-            implicitHeight: root.mainWindow.hasMidi ? 48 : 0
-            title: "NPS Timeline"
-            value: root.mainWindow.nps
-            accent: "#7457c7"
+            implicitHeight: root.mainWindow.hasMidi ? 52 : 0
         }
 
         ColumnLayout {
             Layout.fillWidth: true
             spacing: 5
-            MiniChart { Layout.fillWidth: true; title: "NPS"; value: root.mainWindow.nps; accent: "#8b6ce8" }
-            MiniChart { Layout.fillWidth: true; title: "Polyphony"; value: root.mainWindow.activeVoices; accent: "#8063dd" }
-            MiniChart { Layout.fillWidth: true; title: "BPM"; value: root.mainWindow.hasMidi ? Math.round(root.mainWindow.bpm) : 0; accent: "#9a78e9" }
-            MiniChart { Layout.fillWidth: true; title: "CC/s"; value: root.mainWindow.ccPerSecond; accent: "#765cc9" }
-            MiniChart { Layout.fillWidth: true; title: "Skipped vel"; value: root.mainWindow.skippedVelocity; accent: "#b85770" }
+            MiniChart { Layout.fillWidth: true; title: "NPS"; value: root.mainWindow.nps; accent: "#a78bfa" }
+            MiniChart { Layout.fillWidth: true; title: "Polyphony"; value: root.mainWindow.activeVoices; accent: "#38bdf8" }
+            MiniChart { Layout.fillWidth: true; title: "BPM"; value: root.mainWindow.hasMidi ? Math.round(root.mainWindow.bpm) : 0; accent: "#fb923c" }
+            MiniChart { Layout.fillWidth: true; title: "CC/s"; value: root.mainWindow.ccPerSecond; accent: "#34d399" }
+            MiniChart { Layout.fillWidth: true; title: "Skipped vel"; value: root.mainWindow.skippedVelocity; accent: "#fb7185" }
         }
 
         RowLayout {

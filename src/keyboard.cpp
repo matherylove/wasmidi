@@ -9,325 +9,216 @@
 
 namespace {
 
-struct KeyInstance {
-    float x, y, w, h;
-    float black, active;
-};
+struct KeyInstance { float x, y, w, h, black, active; };
 
-GLuint compileShader(GLenum type, const char* source)
+GLuint shader(GLenum type, const char* src)
 {
-    const GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
-
-    GLint ok = GL_FALSE;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (ok != GL_TRUE) {
-        glDeleteShader(shader);
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        glDeleteShader(s);
         return 0;
     }
-    return shader;
+    return s;
 }
 
-GLuint createKeyboardProgram()
+GLuint program()
 {
-    static const char* vertex = R"GLSL(#version 300 es
+    static const char* vs = R"GLSL(#version 300 es
 precision highp float;
-
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 aRect;
 layout(location=2) in vec2 aState;
-
 out vec2 vUv;
 out float vBlack;
 out float vActive;
-
-void main()
-{
-    vec2 p = aRect.xy + aCorner * aRect.zw;
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-
-    vUv = aCorner;
-    vBlack = aState.x;
-    vActive = aState.y;
+void main(){
+    vec2 p=aRect.xy+aCorner*aRect.zw;
+    gl_Position=vec4(p*2.0-1.0,0,1);
+    vUv=aCorner;
+    vBlack=aState.x;
+    vActive=aState.y;
 }
 )GLSL";
 
-    static const char* fragment = R"GLSL(#version 300 es
+    static const char* fs = R"GLSL(#version 300 es
 precision mediump float;
-
 in vec2 vUv;
 in float vBlack;
 in float vActive;
-
 out vec4 fragColor;
-
-void main()
-{
-    float sideEdge = min(vUv.x, 1.0 - vUv.x);
-    float verticalEdge = min(vUv.y, 1.0 - vUv.y);
-
-    vec3 color;
-
-    if (vBlack > 0.5) {
-        // MPWGL2-style black keys: almost-black with a violet/navy top sheen.
-        color = mix(
-            vec3(0.010, 0.011, 0.023),
-            vec3(0.026, 0.028, 0.052),
-            vUv.y
-        );
-
-        if (sideEdge < 0.055)
-            color *= 0.62;
-        if (verticalEdge < 0.018)
-            color *= 0.72;
-
-        // Subtle lower lip.
-        if (vUv.y < 0.045)
-            color = mix(color, vec3(0.065, 0.058, 0.100), 0.32);
-    } else {
-        // The original "white" keys are intentionally dark blue-violet.
-        color = mix(
-            vec3(0.040, 0.047, 0.085),
-            vec3(0.070, 0.080, 0.140),
-            vUv.y
-        );
-
-        // Crisp separators between adjacent white keys.
-        if (sideEdge < 0.030)
-            color = mix(color, vec3(0.010, 0.011, 0.023), 0.78);
-
-        // Slight top rim and bottom shadow for the same dimensional feel as
-        // the legacy keysCanvas.
-        if (vUv.y > 0.975)
-            color = mix(color, vec3(0.105, 0.095, 0.150), 0.34);
-        if (vUv.y < 0.030)
-            color *= 0.70;
+void main(){
+    vec3 c;
+    if(vBlack>0.5){
+        c=mix(vec3(.008,.009,.020),vec3(.035,.037,.070),vUv.y);
+        if(vUv.y<.06)c*=.72;
+    }else{
+        c=mix(vec3(.035,.042,.076),vec3(.075,.085,.145),vUv.y);
+        float edge=min(vUv.x,1.0-vUv.x);
+        if(edge<.035)c*=.58;
+        if(vUv.y>.90)c=mix(c,vec3(.11,.10,.16),.22);
     }
-
-    if (vActive > 0.5) {
-        vec3 active = vec3(0.54, 0.34, 0.95);
-        float glow = vBlack > 0.5 ? 0.88 : 0.76;
-        color = mix(color, active, glow);
-
-        if (vUv.y > 0.90)
-            color = min(vec3(1.0), color * 1.18 + vec3(0.04));
+    if(vActive>0.5){
+        c=mix(c,vec3(.62,.46,.98),vBlack>0.5?.90:.78);
+        if(vUv.y>.86)c=min(vec3(1.0),c*1.20+vec3(.04));
     }
-
-    fragColor = vec4(color, 1.0);
+    fragColor=vec4(c,1);
 }
 )GLSL";
 
-    const GLuint vs = compileShader(GL_VERTEX_SHADER, vertex);
-    const GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragment);
-    if (!vs || !fs) {
-        if (vs) glDeleteShader(vs);
-        if (fs) glDeleteShader(fs);
+    GLuint v = shader(GL_VERTEX_SHADER, vs);
+    GLuint f = shader(GL_FRAGMENT_SHADER, fs);
+    if (!v || !f)
+        return 0;
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v);
+    glAttachShader(p, f);
+    glLinkProgram(p);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        glDeleteProgram(p);
         return 0;
     }
-
-    const GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
-    glLinkProgram(program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    GLint ok = GL_FALSE;
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (ok != GL_TRUE) {
-        glDeleteProgram(program);
-        return 0;
-    }
-
-    return program;
+    return p;
 }
 
 class KeyboardRenderer final : public QQuickFramebufferObject::Renderer {
 public:
     ~KeyboardRenderer() override
     {
-        if (instanceVbo_) glDeleteBuffers(1, &instanceVbo_);
-        if (quadVbo_) glDeleteBuffers(1, &quadVbo_);
+        if (vbo_) glDeleteBuffers(1, &vbo_);
+        if (inst_) glDeleteBuffers(1, &inst_);
         if (vao_) glDeleteVertexArrays(1, &vao_);
-        if (program_) glDeleteProgram(program_);
+        if (prog_) glDeleteProgram(prog_);
     }
 
+    // This is intentionally the same framebuffer construction used by the
+    // last known-visible keyboard implementation. The NoAttachment variant
+    // introduced in Pass 3 produced a blank FBO in Qt WASM on the deployed
+    // build even though the QML overlay remained visible.
     QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override
     {
-        QOpenGLFramebufferObjectFormat format;
-        format.setAttachment(QOpenGLFramebufferObject::NoAttachment);
-        return new QOpenGLFramebufferObject(size, format);
+        return new QOpenGLFramebufferObject(size);
     }
 
     void synchronize(QQuickFramebufferObject* item) override
     {
-        auto* keyboard = static_cast<Keyboard*>(item);
-        auto* controller = qobject_cast<MainWindow*>(keyboard->controller());
-
-        width_ = std::max(1, static_cast<int>(keyboard->width()));
-        height_ = std::max(1, static_cast<int>(keyboard->height()));
-        active_ = controller
-            ? controller->activePitchMask()
-            : std::array<uint8_t, 128>{};
-
+        auto* k = static_cast<Keyboard*>(item);
+        auto* c = qobject_cast<MainWindow*>(k->controller());
+        width_ = std::max(1, int(k->width()));
+        height_ = std::max(1, int(k->height()));
+        active_ = c ? c->activePitchMask() : std::array<uint8_t,128>{};
         dirty_ = true;
     }
 
     void render() override
     {
-        if (!program_)
-            initialize();
-        if (!program_)
+        if (!prog_)
+            init();
+        if (!prog_)
             return;
-
         if (dirty_)
-            rebuildInstances();
+            rebuild();
 
         glViewport(0, 0, width_, height_);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
-        glClearColor(0.013f, 0.013f, 0.033f, 1.0f);
+        glClearColor(.010f, .010f, .026f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-
-        glUseProgram(program_);
+        glUseProgram(prog_);
         glBindVertexArray(vao_);
-        glDrawArraysInstanced(
-            GL_TRIANGLES,
-            0,
-            6,
-            static_cast<GLsizei>(instances_.size())
-        );
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(keys_.size()));
         glBindVertexArray(0);
-
         update();
     }
 
 private:
-    void initialize()
+    void init()
     {
-        program_ = createKeyboardProgram();
-        if (!program_)
+        prog_ = program();
+        if (!prog_)
             return;
-
-        static const float quad[] = {
-            0.f, 0.f,  1.f, 0.f,  0.f, 1.f,
-            0.f, 1.f,  1.f, 0.f,  1.f, 1.f
-        };
 
         glGenVertexArrays(1, &vao_);
         glBindVertexArray(vao_);
 
-        glGenBuffers(1, &quadVbo_);
-        glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+        const float q[] = {0,0, 1,0, 0,1, 0,1, 1,0, 1,1};
+        glGenBuffers(1, &vbo_);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_STATIC_DRAW);
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(
-            0, 2, GL_FLOAT, GL_FALSE,
-            2 * sizeof(float), nullptr
-        );
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
 
-        glGenBuffers(1, &instanceVbo_);
-        glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
-
+        glGenBuffers(1, &inst_);
+        glBindBuffer(GL_ARRAY_BUFFER, inst_);
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(
-            1, 4, GL_FLOAT, GL_FALSE,
-            sizeof(KeyInstance), reinterpret_cast<void*>(0)
-        );
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(KeyInstance), reinterpret_cast<void*>(0));
         glVertexAttribDivisor(1, 1);
-
         glEnableVertexAttribArray(2);
-        glVertexAttribPointer(
-            2, 2, GL_FLOAT, GL_FALSE,
-            sizeof(KeyInstance),
-            reinterpret_cast<void*>(4 * sizeof(float))
-        );
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(KeyInstance), reinterpret_cast<void*>(4*sizeof(float)));
         glVertexAttribDivisor(2, 1);
-
         glBindVertexArray(0);
     }
 
-    void rebuildInstances()
+    void rebuild()
     {
-        static const bool blackByPitchClass[12] = {
-            false, true, false, true, false, false,
-            true, false, true, false, true, false
+        static const bool black[12] = {
+            false,true,false,true,false,false,true,false,true,false,true,false
         };
 
-        instances_.clear();
-        instances_.reserve(128);
+        keys_.clear();
+        keys_.reserve(128);
 
-        int whiteCount = 0;
-        for (int note = 0; note < 128; ++note) {
-            if (!blackByPitchClass[note % 12])
-                ++whiteCount;
-        }
+        int whiteTotal = 0;
+        for (int n = 0; n < 128; ++n)
+            if (!black[n % 12])
+                ++whiteTotal;
 
-        const float whiteWidth = 1.0f / static_cast<float>(whiteCount);
-        const float blackWidth = whiteWidth * 0.58f;
+        const float ww = 1.0f / float(whiteTotal);
+        const float bw = ww * 0.58f;
 
-        // White keys first.
-        int whiteIndex = 0;
-        for (int note = 0; note < 128; ++note) {
-            if (blackByPitchClass[note % 12])
+        int wi = 0;
+        for (int n = 0; n < 128; ++n) {
+            if (black[n % 12])
                 continue;
-
-            instances_.push_back({
-                whiteIndex * whiteWidth,
-                0.0f,
-                whiteWidth,
-                1.0f,
-                0.0f,
-                static_cast<float>(active_[note])
+            keys_.push_back({
+                wi * ww, 0.0f, ww, 1.0f,
+                0.0f, float(active_[n])
             });
-            ++whiteIndex;
+            ++wi;
         }
 
-        // Then black keys so they overlap naturally.
-        whiteIndex = 0;
-        for (int note = 0; note < 128; ++note) {
-            if (blackByPitchClass[note % 12]) {
-                const float x =
-                    whiteIndex * whiteWidth - blackWidth * 0.5f;
-
-                instances_.push_back({
-                    x,
-                    0.405f,
-                    blackWidth,
-                    0.595f,
-                    1.0f,
-                    static_cast<float>(active_[note])
+        wi = 0;
+        for (int n = 0; n < 128; ++n) {
+            if (black[n % 12]) {
+                const float x = wi * ww - bw * 0.5f;
+                keys_.push_back({
+                    x, 0.38f, bw, 0.62f,
+                    1.0f, float(active_[n])
                 });
             } else {
-                ++whiteIndex;
+                ++wi;
             }
         }
 
-        glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
-        glBufferData(
-            GL_ARRAY_BUFFER,
-            static_cast<GLsizeiptr>(
-                instances_.size() * sizeof(KeyInstance)
-            ),
-            instances_.data(),
-            GL_DYNAMIC_DRAW
-        );
-
+        glBindBuffer(GL_ARRAY_BUFFER, inst_);
+        glBufferData(GL_ARRAY_BUFFER,
+                     GLsizeiptr(keys_.size() * sizeof(KeyInstance)),
+                     keys_.data(), GL_DYNAMIC_DRAW);
         dirty_ = false;
     }
 
-    GLuint program_ = 0;
-    GLuint vao_ = 0;
-    GLuint quadVbo_ = 0;
-    GLuint instanceVbo_ = 0;
-
-    int width_ = 1;
-    int height_ = 1;
+    GLuint prog_ = 0, vao_ = 0, vbo_ = 0, inst_ = 0;
+    int width_ = 1, height_ = 1;
     bool dirty_ = true;
-
-    std::array<uint8_t, 128> active_{};
-    std::vector<KeyInstance> instances_;
+    std::array<uint8_t,128> active_{};
+    std::vector<KeyInstance> keys_;
 };
 
 } // namespace
@@ -335,14 +226,14 @@ private:
 Keyboard::Keyboard(QQuickItem* parent)
     : QQuickFramebufferObject(parent)
 {
+    setMirrorVertically(false);
 }
 
-void Keyboard::setController(QObject* controller)
+void Keyboard::setController(QObject* c)
 {
-    if (controller_ == controller)
+    if (controller_ == c)
         return;
-
-    controller_ = controller;
+    controller_ = c;
     emit controllerChanged();
     update();
 }

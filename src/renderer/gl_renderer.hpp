@@ -39,7 +39,7 @@ private:
     int width_ = 1;
     int height_ = 1;
     float currentTime_ = 0.0f;
-    float noteSpeed_ = 10.0f;
+    float noteSpeed_ = 1.0f;
     float postBuffer_ = 0.0f;
     bool perTrackColors_ = false;
     bool initialized_ = false;

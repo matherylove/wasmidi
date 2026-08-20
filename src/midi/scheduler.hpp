@@ -1,6 +1,7 @@
 #pragma once
 
 #include "midi_parser.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -32,7 +33,14 @@ public:
         uint16_t track = 0;
     };
 
-    const std::vector<ScheduledEvent>& getEventsForFrame(float horizon);
+    // MPWGL2-compatible dispatch window. The caller owns the authoritative
+    // playback clock; the scheduler only advances the event cursor through a
+    // timestamped look-ahead window. Calling this every 5 ms with horizon
+    // 0.25 reproduces the legacy scheduler cadence without making time run
+    // 50x too fast.
+    const std::vector<ScheduledEvent>& getEventsForWindow(float now,
+                                                           float horizon,
+                                                           float lookback = 0.05f);
 
 private:
     void rebuildEventStream();

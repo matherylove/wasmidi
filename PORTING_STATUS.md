@@ -1,22 +1,26 @@
-# WASMIDI GUI Pass 3
+# WASMIDI Port — Pass 4 (Playback parity + vertical roll)
 
-This overlay fixes three browser-facing parity issues from MPWGL2.html:
+This overlay is intended to be applied on top of Pass 3. `old/` remains untouched.
 
-1. Browser-native MIDI file chooser
-   - Removes use of QtQuick.Dialogs FileDialog for MIDI loading.
-   - Adds MainWindow::openMidiPicker().
-   - On WebAssembly, an Emscripten bridge creates a hidden HTML file input.
-   - The browser opens the user's native OS file chooser and copies the selected MIDI bytes directly into the C++ parser.
+## Fixed in this pass
 
-2. Horizontal keyboard fidelity
-   - Reworks the C++ WebGL keyboard shader and key geometry.
-   - Restores dark navy "white" keys, near-black raised black keys, crisp separators, subtle dimensional shading, octave labels, and active-key purple glow.
-   - Keeps all 128 MIDI notes across the renderer.
+- Restores the WebGL keyboard using the framebuffer construction that was known to render correctly in Qt/WASM.
+- Piano-roll notes now use a vertical falling-note layout: MIDI pitch maps to X and time maps to Y.
+- Falling notes are aligned to the real 75-white-key piano geometry rather than 128 equal-width columns.
+- Playback uses a wall-clock-driven ~60 Hz visual/player loop, matching the requestAnimationFrame model from MPWGL2.
+- MIDI scheduler now runs on a 5 ms precise timer with a 250 ms look-ahead and 50 ms lookback.
+- Scheduler no longer advances its clock by the entire 250 ms horizon every scheduler callback.
+- Live NPS now matches MPWGL2: starts in the previous 250 ms multiplied by 4.
+- Live polyphony matches MPWGL2: upperBound(starts,t) - lowerBound(ends,t).
+- CC/s is now a moving one-second window rather than a coarse integer-second bucket.
+- BPM follows tempo changes at the current playback time.
+- Mini-chart history now uses 280 samples at 30 Hz and repaints at ~60 Hz, matching MPWGL2's `_HIST_LEN`, `_HIST_RATE`, and RAF drawing cadence.
+- Mini charts now use the original color mapping and filled-area visual treatment.
+- NPS Timeline is a file-wide half-second limits chart with playback and peak markers.
+- Peak NPS follows the old one-second / 100 ms sampled calculation.
+- Peak polyphony keeps the old large-file sampling safeguard.
+- EOF behavior returns transport to 0 like `stopPlayback()` in MPWGL2.
 
-3. Neural background visibility
-   - Increases the node count, link range, contrast, motion and pulse visibility.
-   - Keeps a faint neural field while MIDI is loaded and a stronger version in the empty state.
-   - Keeps the render path in Qt/QML over the native WebGL piano roll.
+## Not faked
 
-No old/ files are modified.
-No CMake or GitHub Actions changes are required for this overlay.
+The 5 ms scheduler now exposes the correct timestamped event window, but Web MIDI transmission and the embedded SnappySynth/SF2 audio engine still need to be connected to that native event stream. The visual/player timing core no longer depends on those unfinished output backends.
