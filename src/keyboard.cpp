@@ -53,17 +53,17 @@ out vec4 fragColor;
 void main(){
     vec3 c;
     if(vBlack>0.5){
-        c=mix(vec3(.008,.009,.020),vec3(.035,.037,.070),vUv.y);
-        if(vUv.y<.06)c*=.72;
+        c=mix(vec3(.035,.037,.070),vec3(.008,.009,.020),vUv.y);
+        if(vUv.y>.94)c*=.72;
     }else{
-        c=mix(vec3(.035,.042,.076),vec3(.075,.085,.145),vUv.y);
+        c=mix(vec3(.075,.085,.145),vec3(.035,.042,.076),vUv.y);
         float edge=min(vUv.x,1.0-vUv.x);
         if(edge<.035)c*=.58;
-        if(vUv.y>.90)c=mix(c,vec3(.11,.10,.16),.22);
+        if(vUv.y<.10)c=mix(c,vec3(.11,.10,.16),.22);
     }
     if(vActive>0.5){
         c=mix(c,vec3(.62,.46,.98),vBlack>0.5?.90:.78);
-        if(vUv.y>.86)c=min(vec3(1.0),c*1.20+vec3(.04));
+        if(vUv.y<.14)c=min(vec3(1.0),c*1.20+vec3(.04));
     }
     fragColor=vec4(c,1);
 }
@@ -98,10 +98,6 @@ public:
         if (prog_) glDeleteProgram(prog_);
     }
 
-    // This is intentionally the same framebuffer construction used by the
-    // last known-visible keyboard implementation. The NoAttachment variant
-    // introduced in Pass 3 produced a blank FBO in Qt WASM on the deployed
-    // build even though the QML overlay remained visible.
     QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override
     {
         return new QOpenGLFramebufferObject(size);
@@ -198,8 +194,15 @@ private:
         for (int n = 0; n < 128; ++n) {
             if (black[n % 12]) {
                 const float x = wi * ww - bw * 0.5f;
+
+                /*
+                   QQuickFramebufferObject presents this FBO vertically
+                   opposite to the raw GL coordinate convention used here.
+                   y=0..0.62 therefore produces top-anchored black keys,
+                   matching the legacy keysCanvas.
+                */
                 keys_.push_back({
-                    x, 0.38f, bw, 0.62f,
+                    x, 0.0f, bw, 0.62f,
                     1.0f, float(active_[n])
                 });
             } else {

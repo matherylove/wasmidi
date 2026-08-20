@@ -139,6 +139,7 @@ bool GLRenderer::createProgram()
 {
     static const char* vertex = R"GLSL(#version 300 es
 precision highp float;
+
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 aNote;      // start, end, pitch, channel
 layout(location=2) in vec2 aExtra;     // track, velocity
@@ -154,46 +155,37 @@ out float vActive;
 out float vVelocity;
 out vec2 vUv;
 
-bool isBlackKey(int pc) {
-    return pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
-}
-
-int whiteOffsetInOctave(int pc) {
-    if (pc <= 0) return 0;   // C
-    if (pc <= 2) return 1;   // D / C#
-    if (pc <= 4) return 2;   // E / D#
-    if (pc <= 5) return 3;   // F
-    if (pc <= 7) return 4;   // G / F#
-    if (pc <= 9) return 5;   // A / G#
-    return 6;                // B / A#
-}
-
-int leftWhiteOffsetForBlack(int pc) {
-    if (pc == 1) return 0;   // C# between C and D
-    if (pc == 3) return 1;   // D# between D and E
-    if (pc == 6) return 3;   // F# between F and G
-    if (pc == 8) return 4;   // G# between G and A
-    return 5;                // A# between A and B
-}
-
-void main() {
+void main()
+{
     float start = aNote.x;
     float end = max(aNote.y, start + 0.001);
-    int pitch = int(clamp(floor(aNote.z + 0.5), 0.0, 127.0));
-    int pc = pitch % 12;
-    int octave = pitch / 12;
+    float pitch = clamp(floor(aNote.z + 0.5), 0.0, 127.0);
 
-    // Vertical falling-note model: time is Y, pitch is X. Future notes start
-    // above the keyboard and move downward as uCurrentTime advances.
-    float relStart = start - uCurrentTime;
-    float relEnd = end - uCurrentTime;
-    float hitLine = 0.015;
-    float usable = 1.0 - hitLine;
-    float y0 = hitLine + ((relStart + uPostBuffer) / uWindowSeconds) * usable;
-    float y1 = hitLine + ((relEnd + uPostBuffer) / uWindowSeconds) * usable;
+    /*
+       MPWGL2 geometry:
+         X = time
+         Y = MIDI pitch
+         current time = vertical playhead at 18% of the roll width
+         future notes are to the right and move left as time advances.
+    */
+    const float playhead = 0.18;
+    float futureWindow = max(uWindowSeconds, 0.1);
+    float pixelsPerSecond = (1.0 - playhead) / futureWindow;
 
-    // Cull notes that are completely outside the visible time window.
-    if (y1 < -0.02 || y0 > 1.02) {
+    float x0 = playhead + (start - uCurrentTime) * pixelsPerSecond;
+    float x1 = playhead + (end   - uCurrentTime) * pixelsPerSecond;
+
+    /*
+       Preserve recently-finished note tails to the left of the playhead.
+       Even when auto post-buffer is currently zero, the left 18% naturally
+       represents the same seconds/pixel scale as the future window.
+    */
+    float naturalPast = futureWindow * playhead / (1.0 - playhead);
+    float pastWindow = max(uPostBuffer, naturalPast);
+
+    if (end < uCurrentTime - pastWindow ||
+        start > uCurrentTime + futureWindow ||
+        x1 < -0.02 || x0 > 1.02) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
         vColor = vec3(0.0);
         vActive = 0.0;
@@ -202,30 +194,24 @@ void main() {
         return;
     }
 
-    const float whiteCount = 75.0;
-    float whiteWidth = 1.0 / whiteCount;
-    float x0;
-    float x1;
-
-    if (isBlackKey(pc)) {
-        int leftWhite = octave * 7 + leftWhiteOffsetForBlack(pc);
-        float center = (float(leftWhite) + 1.0) * whiteWidth;
-        float width = whiteWidth * 0.58 * 0.88;
-        x0 = center - width * 0.5;
-        x1 = center + width * 0.5;
-    } else {
-        int whiteIndex = octave * 7 + whiteOffsetInOctave(pc);
-        x0 = float(whiteIndex) * whiteWidth + whiteWidth * 0.07;
-        x1 = float(whiteIndex + 1) * whiteWidth - whiteWidth * 0.07;
-    }
+    // The legacy renderer uses one of 128 equal pitch rows.
+    float row = pitch / 128.0;
+    float rowHeight = 1.0 / 128.0;
+    float gap = rowHeight * 0.08;
+    float y0 = row + gap;
+    float y1 = row + rowHeight - gap;
 
     float x = mix(x0, x1, aCorner.x);
     float y = mix(y0, y1, aCorner.y);
-    gl_Position = vec4(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+
+    gl_Position = vec4(x * 2.0 - 1.0,
+                      y * 2.0 - 1.0,
+                      0.0, 1.0);
 
     int colorIndex = uPerTrack
         ? int(mod(aExtra.x, 16.0))
         : int(clamp(aNote.w, 0.0, 15.0));
+
     vColor = uColors[colorIndex];
     vActive = float(start <= uCurrentTime && end >= uCurrentTime);
     vVelocity = clamp(aExtra.y, 0.0, 1.0);
@@ -235,24 +221,26 @@ void main() {
 
     static const char* fragment = R"GLSL(#version 300 es
 precision mediump float;
+
 in vec3 vColor;
 in float vActive;
 in float vVelocity;
 in vec2 vUv;
+
 out vec4 fragColor;
 
-void main() {
-    float velocityGain = mix(0.55, 1.0, vVelocity);
+void main()
+{
+    float velocityGain = mix(0.58, 1.0, vVelocity);
     vec3 color = vColor * velocityGain;
 
-    // Bright leading edge like the legacy renderer's first texture column.
-    if (vUv.y < 0.035)
+    // MPWGL2 brightens the first column of each horizontal note strip.
+    if (vUv.x < 0.045)
         color = min(vec3(1.0), color + vec3(0.20));
 
-    // Subtle horizontal edge shading makes long falling bars readable.
-    float edge = min(vUv.x, 1.0 - vUv.x);
-    if (edge < 0.06)
-        color *= 0.82;
+    float rowEdge = min(vUv.y, 1.0 - vUv.y);
+    if (rowEdge < 0.08)
+        color *= 0.84;
 
     if (vActive > 0.5)
         color = min(vec3(1.0), color * 1.55 + vec3(0.12));

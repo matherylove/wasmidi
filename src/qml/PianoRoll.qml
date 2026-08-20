@@ -36,9 +36,6 @@ Item {
         border.color: "#151127"
         border.width: 1
 
-        // The original MPWGL2 page keeps a visible moving neural field
-        // behind the roll. This QML canvas intentionally stays active even
-        // when MIDI is loaded, becoming much fainter once notes are present.
         PianoRollSurface {
             id: surface
             anchors.fill: parent
@@ -58,8 +55,6 @@ Item {
                 if (!nodes || nodes.length === 0)
                     return
 
-                // Soft purple wash so the animation reads against the
-                // near-black piano-roll background like MPWGL2.html.
                 var gradient = ctx.createRadialGradient(
                     width * 0.52, height * 0.44, 0,
                     width * 0.52, height * 0.44, Math.max(width, height) * 0.72
@@ -116,14 +111,15 @@ Item {
             }
         }
 
+        // MPWGL2 playhead: vertical line at 18% of the roll width.
         Rectangle {
-            anchors.left: parent.left
-            anchors.right: parent.right
+            x: Math.round(parent.width * 0.18)
+            anchors.top: parent.top
             anchors.bottom: parent.bottom
-            anchors.bottomMargin: parent.height * 0.015
-            height: 1
+            width: 2
             color: "#a78bfa"
-            opacity: root.mainWindow.hasMidi ? 0.34 : 0
+            opacity: root.mainWindow.hasMidi ? 0.72 : 0
+            z: 5
         }
 
         Column {
