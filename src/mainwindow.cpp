@@ -14,6 +14,30 @@
 
 namespace {
 MainWindow* g_browserMainWindow = nullptr;
+
+std::size_t lowerBoundNoteStart(
+    const std::vector<wasmidi::NoteEvent>& notes, float t)
+{
+    return static_cast<std::size_t>(
+        std::lower_bound(notes.begin(), notes.end(), t,
+            [](const wasmidi::NoteEvent& n, float v){ return n.startTime < v; })
+        - notes.begin());
+}
+
+std::size_t upperBoundNoteStart(
+    const std::vector<wasmidi::NoteEvent>& notes, float t)
+{
+    return static_cast<std::size_t>(
+        std::upper_bound(notes.begin(), notes.end(), t,
+            [](float v, const wasmidi::NoteEvent& n){ return v < n.startTime; })
+        - notes.begin());
+}
+
+float colorHue(const QColor& c)
+{
+    const qreal h = c.hslHueF();
+    return h < 0 ? 230.0f : float(h * 360.0);
+}
 }
 
 #ifdef __EMSCRIPTEN__
@@ -26,12 +50,14 @@ void wasmidi_browser_file_selected(const unsigned char* data,
     if (!g_browserMainWindow || !data || dataSize <= 0)
         return;
 
-    const QByteArray midiBytes(reinterpret_cast<const char*>(data), dataSize);
     const QString name = fileName && fileNameSize > 0
         ? QString::fromUtf8(fileName, fileNameSize)
         : QStringLiteral("browser.mid");
 
-    g_browserMainWindow->loadMidiFileNamed(midiBytes, name);
+    g_browserMainWindow->loadMidiRaw(
+        data,
+        static_cast<std::size_t>(dataSize),
+        name);
 }
 
 EM_JS(void, wasmidi_browser_open_midi_picker, (), {
@@ -159,19 +185,36 @@ bool MainWindow::loadMidiUrl(const QUrl& url)
 
 bool MainWindow::loadMidiFile(const QByteArray& data)
 {
-    return loadMidiFileNamed(data, fileName_);
+    return loadMidiRaw(
+        reinterpret_cast<const uint8_t*>(data.constData()),
+        static_cast<std::size_t>(data.size()),
+        fileName_);
 }
 
-bool MainWindow::loadMidiFileNamed(const QByteArray& data, const QString& fileName)
+bool MainWindow::loadMidiFileNamed(
+    const QByteArray& data,
+    const QString& fileName)
 {
+    return loadMidiRaw(
+        reinterpret_cast<const uint8_t*>(data.constData()),
+        static_cast<std::size_t>(data.size()),
+        fileName);
+}
+
+bool MainWindow::loadMidiRaw(
+    const uint8_t* data,
+    std::size_t size,
+    const QString& fileName)
+{
+    stop();
+
     wasmidi::MidiDocument parsed;
-    if (!parser_.parse(reinterpret_cast<const uint8_t*>(data.constData()),
-                       static_cast<std::size_t>(data.size()), parsed)) {
+
+    if (!parser_.parse(data, size, parsed)) {
         emit loadFailed(QString::fromUtf8(parser_.error()));
         return false;
     }
 
-    stop();
     document_ = std::move(parsed);
     scheduler_.setDocument(&document_);
 
@@ -181,6 +224,7 @@ bool MainWindow::loadMidiFileNamed(const QByteArray& data, const QString& fileNa
     }
 
     publishDocumentMetadata();
+    rebuildColorMaps();
     rebuildDerivedStats();
 
     ++documentRevision_;
@@ -229,8 +273,6 @@ void MainWindow::clearFile()
     controlTimes_.clear();
     tempoTimes_.clear();
     tempoBpms_.clear();
-    for (auto& v : pitchStarts_) v.clear();
-    for (auto& v : pitchEnds_) v.clear();
 
     ++documentRevision_;
     emit fileNameChanged();
@@ -303,8 +345,6 @@ void MainWindow::rebuildDerivedStats()
     tempoTimes_.clear();
     tempoBpms_.clear();
     npsTimeline_.clear();
-    for (auto& v : pitchStarts_) v.clear();
-    for (auto& v : pitchEnds_) v.clear();
 
     peakNps_ = 0;
     peakNpsTime_ = 0.0f;
@@ -317,8 +357,6 @@ void MainWindow::rebuildDerivedStats()
     for (const auto& note : document_.notes) {
         noteStarts_.push_back(note.startTime);
         noteEnds_.push_back(note.endTime);
-        pitchStarts_[note.pitch].push_back(note.startTime);
-        pitchEnds_[note.pitch].push_back(note.endTime);
     }
 
     for (const auto& event : document_.controls)
@@ -327,8 +365,6 @@ void MainWindow::rebuildDerivedStats()
     std::sort(noteStarts_.begin(), noteStarts_.end());
     std::sort(noteEnds_.begin(), noteEnds_.end());
     std::sort(controlTimes_.begin(), controlTimes_.end());
-    for (auto& v : pitchStarts_) std::sort(v.begin(), v.end());
-    for (auto& v : pitchEnds_) std::sort(v.begin(), v.end());
 
     // Build the same seconds-domain tempo index used by MPWGL2.
     if (!document_.tempoMap.empty()) {
@@ -479,8 +515,6 @@ void MainWindow::stop()
         bpm_ = tempoBpms_.front();
         emit bpmChanged();
     }
-
-    updateActivePitchMask();
 }
 
 void MainWindow::seek(float seconds)
@@ -531,12 +565,121 @@ void MainWindow::setPostBufferAuto()
         emit postBufferAutoChanged();
 }
 
+void MainWindow::rebuildColorMaps()
+{
+    globalChannelColor_.fill(-1);
+    perTrackColorMap_.clear();
+
+    int count = 0;
+
+    for (uint32_t mask : document_.activeChannelMasks) {
+        for (int ch = 0; ch < 16; ++ch) {
+            if ((mask & (1u << ch)) && globalChannelColor_[ch] < 0)
+                globalChannelColor_[ch] = static_cast<int8_t>((count++) & 15);
+        }
+    }
+
+    for (int ch = 0; ch < 16; ++ch)
+        if (globalChannelColor_[ch] < 0)
+            globalChannelColor_[ch] = static_cast<int8_t>(ch);
+
+    count = 0;
+
+    for (const auto& note : document_.notes) {
+        const uint32_t key = uint32_t(note.track) * 16u + uint32_t(note.channel & 15);
+        if (perTrackColorMap_.find(key) == perTrackColorMap_.end())
+            perTrackColorMap_[key] = static_cast<uint8_t>((count++) & 15);
+    }
+}
+
+uint8_t MainWindow::colorIndexFor(uint16_t track, uint8_t channel) const
+{
+    channel &= 15;
+
+    if (!perTrackColors_) {
+        const int value = globalChannelColor_[channel];
+        return static_cast<uint8_t>(value >= 0 ? value : channel);
+    }
+
+    const uint32_t key = uint32_t(track) * 16u + uint32_t(channel);
+    const auto it = perTrackColorMap_.find(key);
+    return it == perTrackColorMap_.end() ? channel : it->second;
+}
+
+std::array<int8_t,128> MainWindow::activePitchColorIndices() const
+{
+    std::array<int8_t,128> result;
+    result.fill(-1);
+
+    const auto& notes = document_.notes;
+    if (notes.empty())
+        return result;
+
+    const float t = currentTime_;
+    const std::size_t lo = lowerBoundNoteStart(notes, t - 0.03f);
+    const std::size_t hi = std::min(notes.size(), upperBoundNoteStart(notes, t + 0.05f));
+
+    for (std::size_t i = lo; i < hi; ++i) {
+        const auto& note = notes[i];
+        if (note.endTime >= t)
+            result[note.pitch] = static_cast<int8_t>(colorIndexFor(note.track, note.channel));
+    }
+
+    return result;
+}
+
+void MainWindow::updateNeuralVisuals()
+{
+    const auto& notes = document_.notes;
+
+    float newHue = dominantHue_;
+
+    if (!notes.empty()) {
+        std::array<int,16> freq{};
+        const float t = currentTime_;
+        const std::size_t lo = lowerBoundNoteStart(notes, t - 0.05f);
+        const std::size_t hi = std::min(notes.size(), upperBoundNoteStart(notes, t + 0.15f));
+
+        for (std::size_t i = lo; i < hi; ++i) {
+            const auto& note = notes[i];
+            if (note.endTime >= t)
+                ++freq[colorIndexFor(note.track, note.channel)];
+        }
+
+        int best = -1, bestN = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (freq[i] > bestN) {
+                bestN = freq[i];
+                best = i;
+            }
+        }
+
+        if (best >= 0 && best < channelColors_.size())
+            newHue = colorHue(channelColors_[best]);
+    }
+
+    const float act = peakNps_ > 0
+        ? std::min(1.0f, float(nps_) / float(peakNps_))
+        : 0.0f;
+
+    const float newActivity = act * 0.7f + neuralActivity_ * 0.3f;
+
+    if (!qFuzzyCompare(newHue, dominantHue_) ||
+        !qFuzzyCompare(newActivity, neuralActivity_)) {
+        dominantHue_ = newHue;
+        neuralActivity_ = newActivity;
+        emit neuralVisualChanged();
+    }
+}
+
+
 void MainWindow::setPerTrackColors(bool enable)
 {
     if (perTrackColors_ == enable)
         return;
     perTrackColors_ = enable;
     emit perTrackColorsChanged();
+    updateNeuralVisuals();
 }
 
 void MainWindow::setVolume(int value)
@@ -571,6 +714,7 @@ void MainWindow::setChannelColor(int channel, const QColor& color)
         return;
     channelColors_[channel] = color;
     emit channelColorsChanged();
+    updateNeuralVisuals();
 }
 
 void MainWindow::updateLiveStats()
@@ -579,7 +723,6 @@ void MainWindow::updateLiveStats()
         if (nps_ != 0) { nps_ = 0; emit npsChanged(); }
         if (activeVoices_ != 0) { activeVoices_ = 0; emit activeVoicesChanged(); }
         if (ccPerSecond_ != 0) { ccPerSecond_ = 0; emit ccPerSecondChanged(); }
-        updateActivePitchMask();
         return;
     }
 
@@ -643,46 +786,7 @@ void MainWindow::updateLiveStats()
         emit bpmChanged();
     }
 
-    updateActivePitchMask();
-}
-
-
-void MainWindow::updateActivePitchMask()
-{
-    std::array<uint8_t, 128> next{};
-
-    if (!document_.notes.empty()) {
-        const float t = currentTime_;
-
-        for (std::size_t pitch = 0;
-             pitch < next.size();
-             ++pitch) {
-            const auto& starts = pitchStarts_[pitch];
-            const auto& ends = pitchEnds_[pitch];
-
-            const auto started =
-                std::upper_bound(
-                    starts.begin(),
-                    starts.end(),
-                    t + 0.05f) -
-                starts.begin();
-
-            const auto ended =
-                std::lower_bound(
-                    ends.begin(),
-                    ends.end(),
-                    t) -
-                ends.begin();
-
-            next[pitch] =
-                started > ended ? 1 : 0;
-        }
-    }
-
-    if (next != activePitchMaskCache_) {
-        activePitchMaskCache_ = next;
-        emit activePitchesChanged();
-    }
+    updateNeuralVisuals();
 }
 
 void MainWindow::updateCurrentTime()
@@ -716,3 +820,13 @@ void MainWindow::dispatchScheduler()
     (void)scheduled;
 }
 
+std::array<uint8_t, 128> MainWindow::activePitchMask() const
+{
+    std::array<uint8_t,128> mask{};
+    const auto colors = activePitchColorIndices();
+
+    for (std::size_t i = 0; i < mask.size(); ++i)
+        mask[i] = colors[i] >= 0 ? 1 : 0;
+
+    return mask;
+}

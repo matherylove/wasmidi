@@ -6,17 +6,9 @@
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+#include "../midi/midi_parser.hpp"
 
 namespace wasmidi {
-
-struct NoteInstance {
-    uint32_t startTick = 0;
-    uint32_t endTick = 0;
-    uint8_t pitch = 0;
-    uint8_t channel = 0;
-    uint8_t velocity = 0;
-    uint16_t track = 0;
-};
 
 struct TempoPoint {
     uint32_t tick = 0;
@@ -31,7 +23,7 @@ public:
     bool initialize();
     void resize(int width, int height);
 
-    void setNotes(const std::vector<NoteInstance>& notes);
+    void setNotesView(const std::vector<NoteEvent>* notes);
     void setTempoMap(const std::vector<TempoPoint>& tempoMap,
                      uint16_t ticksPerBeat);
     void setActiveChannelMasks(
@@ -49,8 +41,8 @@ public:
 private:
     bool createPrograms();
     void destroy();
-    void destroyTexture();
-    void initTexture(int width, int height);
+    void destroyTextures();
+    void initTextures(int width, int height);
 
     void rebuildTempoIndex();
     double secToTick(double seconds) const;
@@ -68,11 +60,8 @@ private:
                     int columnCount,
                     double currentTick);
     void renderFullTexture(double currentTick);
-    void advanceRing(double currentTick, int deltaColumns);
-    void uploadRingStrip(const std::vector<uint8_t>& buffer,
-                         int deltaColumns,
-                         int physicalStartColumn);
-    void drawTexture(GLint targetFramebuffer);
+    void scrollAndAdvance(double currentTick, int deltaColumns);
+    void drawFrontTexture(GLint targetFramebuffer);
 
     int width_ = 1;
     int height_ = 1;
@@ -87,7 +76,7 @@ private:
     bool initialized_ = false;
     bool forceFullRedraw_ = true;
 
-    std::vector<NoteInstance> notes_;
+    const std::vector<NoteEvent>* notes_ = nullptr;
     std::vector<TempoPoint> tempoMap_;
     std::vector<uint32_t> activeChannelMasks_;
 
@@ -106,16 +95,19 @@ private:
     std::unordered_map<uint32_t, uint8_t> perTrackColor_;
 
     GLuint scrollProgram_ = 0;
+    GLuint blitProgram_ = 0;
     GLuint emptyVao_ = 0;
-    GLuint texture_ = 0;
 
-    // Logical display column 0 is stored at this physical texture column.
-    int ringOriginColumn_ = 0;
+    GLuint textures_[2] = {0, 0};
+    GLuint framebuffers_[2] = {0, 0};
+    int frontIndex_ = 0;
 
     GLint scrollTexUniform_ = -1;
-    GLint ringOffsetUniform_ = -1;
     GLint playheadXUniform_ = -1;
     GLint playheadWidthUniform_ = -1;
+
+    GLint blitSourceUniform_ = -1;
+    GLint blitOffsetUniform_ = -1;
 
     std::vector<uint8_t> fullBuffer_;
     std::vector<uint8_t> stripBuffer_;

@@ -1,27 +1,23 @@
-# WASMIDI Pass 6.6 — high-FPS hot-path optimization
+# WASMIDI Pass 7 — parser/RAM and visual parity
 
-## Ring texture
-Replaces the two-texture / private-FBO scroll copy with one circular texture.
-Playback advances an integer ring origin and uploads only the newly exposed
-columns. The fullscreen scroll blit is eliminated.
+- Removes the browser-file QByteArray copy: selected file bytes are parsed
+  directly from the temporary WASM HEAP allocation.
+- Parser now follows MPWGL2's two-pass strategy, pre-counts notes/controls,
+  reserves once, and uses a fixed 65536-bucket contiguous pending hash instead
+  of unordered_map<key,deque>.
+- Repeated same-pitch NoteOns remain stacked correctly.
+- Large-note sorting is in-place to avoid another complete Black-MIDI buffer.
+- pitchStarts_/pitchEnds_ duplicate arrays are removed.
+- GLRenderer no longer clones the complete note list; it views document.notes.
+- Piano-roll raster uses CSS-pixel dimensions like MPWGL2.html.
+- Keyboard active window is t-0.03..t+0.05 and each active key uses its real
+  global/per-track channel color.
+- Dominant screen color uses t-0.05..t+0.15.
+- Neural activity follows liveNps/peakNps with 0.7/0.3 smoothing.
+- Neural background restores 95 nodes, hue interpolation, activity-controlled
+  speed, connection intensity and gradient blobs from the original.
 
-## MPWGL2 raster density
-The original rollCanvas uses CSS-pixel dimensions rather than multiplying by
-devicePixelRatio. Qt supplies a DPR-scaled FBO request, so this pass divides it
-back to CSS pixels when creating the roll and keyboard FBOs. Unlike the old
-viewport mismatch, the FBO itself and renderer texture now have the same size.
-
-## Keyboard dirty-only
-MainWindow caches the 128-key active mask and emits activePitchesChanged only
-when key state changes. Keyboard no longer renders continuously.
-
-## Neural background
-The expensive QML Canvas is frozen while MIDI is playing. It resumes at 30 Hz
-when idle/paused.
-
-## Charts
-All mini charts and the NPS timeline share one 33 ms timer.
-
-## FPS
-PianoRollRenderer measures completed C++ render() calls directly. QML samples
-that number every 500 ms without FrameAnimation or another frame-driving loop.
+This keeps the existing Qt interface and WebGL roll while removing the largest
+unnecessary data duplication. The next parser step, if required after testing,
+is restoring the separate browser Worker so parsing itself never blocks the Qt
+GUI thread.

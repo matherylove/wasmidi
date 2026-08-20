@@ -108,14 +108,11 @@ void main()
 }
 )GLSL";
 
-    static const char* fragment = R"GLSL(#version 300 es
+    static const char* scrollFragment = R"GLSL(#version 300 es
 precision mediump float;
-
 uniform sampler2D uTex;
-uniform float uRingOffset;
 uniform float uPlayheadX;
 uniform float uPlayheadWidth;
-
 out vec4 fragColor;
 
 void main()
@@ -123,8 +120,7 @@ void main()
     ivec2 sizePx = textureSize(uTex, 0);
     vec2 uv = gl_FragCoord.xy / vec2(sizePx);
 
-    // Ring-buffer scroll: no full-screen texture copy is needed.
-    uv.x = fract(uv.x + uRingOffset);
+    // Same vertical texture convention as MPWGL2.html.
     uv.y = 1.0 - uv.y;
 
     vec4 color = texture(uTex, uv);
@@ -144,46 +140,73 @@ void main()
 }
 )GLSL";
 
-    scrollProgram_ =
-        linkProgram(fullScreenVertex, fragment);
+    static const char* blitFragment = R"GLSL(#version 300 es
+precision mediump float;
+uniform sampler2D uSource;
+uniform float uOffsetU;
+out vec4 fragColor;
 
-    if (!scrollProgram_)
+void main()
+{
+    ivec2 sizePx = textureSize(uSource, 0);
+    vec2 uv = gl_FragCoord.xy / vec2(sizePx);
+    uv.x += uOffsetU;
+
+    fragColor = uv.x > 1.0
+        ? vec4(0.0)
+        : texture(uSource, uv);
+}
+)GLSL";
+
+    scrollProgram_ = linkProgram(fullScreenVertex, scrollFragment);
+    blitProgram_ = linkProgram(fullScreenVertex, blitFragment);
+
+    if (!scrollProgram_ || !blitProgram_)
         return false;
 
     scrollTexUniform_ =
         glGetUniformLocation(scrollProgram_, "uTex");
-    ringOffsetUniform_ =
-        glGetUniformLocation(scrollProgram_, "uRingOffset");
     playheadXUniform_ =
         glGetUniformLocation(scrollProgram_, "uPlayheadX");
     playheadWidthUniform_ =
         glGetUniformLocation(scrollProgram_, "uPlayheadWidth");
 
+    blitSourceUniform_ =
+        glGetUniformLocation(blitProgram_, "uSource");
+    blitOffsetUniform_ =
+        glGetUniformLocation(blitProgram_, "uOffsetU");
+
     return true;
 }
 
-void GLRenderer::destroyTexture()
+void GLRenderer::destroyTextures()
 {
-    if (texture_)
-        glDeleteTextures(1, &texture_);
+    if (textures_[0] || textures_[1])
+        glDeleteTextures(2, textures_);
+    if (framebuffers_[0] || framebuffers_[1])
+        glDeleteFramebuffers(2, framebuffers_);
 
-    texture_ = 0;
+    textures_[0] = textures_[1] = 0;
+    framebuffers_[0] = framebuffers_[1] = 0;
+
     textureWidth_ = 0;
     textureHeight_ = 0;
-    ringOriginColumn_ = 0;
 }
 
 void GLRenderer::destroy()
 {
-    destroyTexture();
+    destroyTextures();
 
     if (emptyVao_)
         glDeleteVertexArrays(1, &emptyVao_);
     if (scrollProgram_)
         glDeleteProgram(scrollProgram_);
+    if (blitProgram_)
+        glDeleteProgram(blitProgram_);
 
     emptyVao_ = 0;
     scrollProgram_ = 0;
+    blitProgram_ = 0;
     initialized_ = false;
 }
 
@@ -193,18 +216,9 @@ void GLRenderer::resize(int width, int height)
     height_ = std::max(1, height);
 }
 
-void GLRenderer::setNotes(const std::vector<NoteInstance>& notes)
+void GLRenderer::setNotesView(const std::vector<NoteEvent>* notes)
 {
     notes_ = notes;
-
-    std::stable_sort(
-        notes_.begin(), notes_.end(),
-        [](const NoteInstance& a, const NoteInstance& b) {
-            if (a.startTick != b.startTick)
-                return a.startTick < b.startTick;
-            return a.endTick < b.endTick;
-        });
-
     rebuildColorMaps();
     forceFullRedraw_ = true;
     lastRenderTick_ = -1.0;
@@ -215,7 +229,6 @@ void GLRenderer::setTempoMap(
     uint16_t ticksPerBeat)
 {
     tempoMap_ = tempoMap;
-
     if (tempoMap_.empty())
         tempoMap_.push_back({0, 500000});
 
@@ -244,7 +257,6 @@ void GLRenderer::setCurrentTime(float seconds)
 void GLRenderer::setNoteSpeed(float secondsPerWindow)
 {
     const float value = std::max(0.1f, secondsPerWindow);
-
     if (std::abs(noteSpeed_ - value) < 0.00001f)
         return;
 
@@ -257,7 +269,6 @@ void GLRenderer::setNoteSpeed(float secondsPerWindow)
 void GLRenderer::setPostBuffer(float seconds)
 {
     const float value = std::max(0.0f, seconds);
-
     if (std::abs(postBuffer_ - value) < 0.00001f)
         return;
 
@@ -284,7 +295,6 @@ void GLRenderer::setChannelColor(
         return;
 
     const std::array<uint8_t,4> value = {r,g,b,255};
-
     if (channelColors_[channel] == value)
         return;
 
@@ -313,7 +323,6 @@ void GLRenderer::rebuildTempoIndex()
             double(tempo.microsecondsPerBeat));
 
         previousTick = tempo.tick;
-
         if (tempo.microsecondsPerBeat != 0)
             usPerBeat = tempo.microsecondsPerBeat;
     }
@@ -337,14 +346,11 @@ double GLRenderer::secToTick(double seconds) const
             seconds);
 
     std::size_t index = 0;
-
-    if (upper != tempoSeconds_.begin()) {
+    if (upper != tempoSeconds_.begin())
         index = static_cast<std::size_t>(
             (upper - tempoSeconds_.begin()) - 1);
-    }
 
-    index =
-        std::min(index, tempoTicks_.size() - 1);
+    index = std::min(index, tempoTicks_.size() - 1);
 
     const double us =
         tempoUsPerBeat_[index] > 0.0
@@ -353,8 +359,7 @@ double GLRenderer::secToTick(double seconds) const
 
     return tempoTicks_[index] +
         (seconds - tempoSeconds_[index]) *
-        double(ppq_) /
-        (us / 1'000'000.0);
+        double(ppq_) / (us / 1'000'000.0);
 }
 
 void GLRenderer::recalcTickWindow()
@@ -363,13 +368,11 @@ void GLRenderer::recalcTickWindow()
 
     windowTicks_ = std::max(
         1.0,
-        std::round(
-            secToTick(noteSpeed_) - base));
+        std::round(secToTick(noteSpeed_) - base));
 
     postTicks_ = std::max(
         0.0,
-        std::round(
-            secToTick(postBuffer_) - base));
+        std::round(secToTick(postBuffer_) - base));
 }
 
 double GLRenderer::ticksPerColumn() const
@@ -382,22 +385,24 @@ double GLRenderer::ticksPerColumn() const
 
 std::size_t GLRenderer::lowerBoundTick(double tick) const
 {
+    if (!notes_) return 0;
     return static_cast<std::size_t>(
         std::lower_bound(
-            notes_.begin(), notes_.end(), tick,
+            notes_->begin(), notes_->end(), tick,
             [](const NoteInstance& note, double value) {
                 return double(note.startTick) < value;
-            }) - notes_.begin());
+            }) - notes_->begin());
 }
 
 std::size_t GLRenderer::upperBoundTick(double tick) const
 {
+    if (!notes_) return 0;
     return static_cast<std::size_t>(
         std::upper_bound(
-            notes_.begin(), notes_.end(), tick,
+            notes_->begin(), notes_->end(), tick,
             [](double value, const NoteInstance& note) {
                 return value < double(note.startTick);
-            }) - notes_.begin());
+            }) - notes_->begin());
 }
 
 void GLRenderer::rebuildColorMaps()
@@ -407,6 +412,7 @@ void GLRenderer::rebuildColorMaps()
 
     int counter = 0;
 
+    // Same global mapping algorithm as MPWGL2.
     for (const uint32_t trackMask : activeChannelMasks_) {
         for (int channel = 0; channel < 16; ++channel) {
             if ((trackMask & (1u << channel)) != 0 &&
@@ -425,14 +431,13 @@ void GLRenderer::rebuildColorMaps()
     }
 
     counter = 0;
-
-    for (const auto& note : notes_) {
+    if (!notes_) return;
+    for (const auto& note : *notes_) {
         const uint32_t key =
             uint32_t(note.track) * 16u +
             uint32_t(note.channel & 15);
 
-        if (perTrackColor_.find(key) ==
-            perTrackColor_.end()) {
+        if (perTrackColor_.find(key) == perTrackColor_.end()) {
             perTrackColor_[key] =
                 static_cast<uint8_t>(counter & 15);
             ++counter;
@@ -449,7 +454,6 @@ uint8_t GLRenderer::colorIndexFor(
     if (!perTrackColors_) {
         const int value =
             globalChannelColor_[channel];
-
         return static_cast<uint8_t>(
             value >= 0 ? value : channel);
     }
@@ -458,67 +462,96 @@ uint8_t GLRenderer::colorIndexFor(
         uint32_t(track) * 16u +
         uint32_t(channel);
 
-    const auto it =
-        perTrackColor_.find(key);
-
+    const auto it = perTrackColor_.find(key);
     return it == perTrackColor_.end()
         ? channel
         : it->second;
 }
 
-void GLRenderer::initTexture(
-    int width,
-    int height)
+void GLRenderer::initTextures(int width, int height)
 {
-    destroyTexture();
+    // QQuickFramebufferObject already has its own FBO bound when render()
+    // starts. Preserve it while creating the two MPWGL2 scroll textures.
+    GLint previousFramebuffer = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+
+    destroyTextures();
 
     textureWidth_ = std::max(1, width);
     textureHeight_ = std::max(1, height);
 
-    glGenTextures(1, &texture_);
-    glBindTexture(GL_TEXTURE_2D, texture_);
+    glGenTextures(2, textures_);
+    glGenFramebuffers(2, framebuffers_);
 
-    glTexImage2D(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGBA8,
-        textureWidth_,
-        textureHeight_,
-        0,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        nullptr);
+    for (int i = 0; i < 2; ++i) {
+        glBindTexture(GL_TEXTURE_2D, textures_[i]);
 
-    glTexParameteri(
-        GL_TEXTURE_2D,
-        GL_TEXTURE_MIN_FILTER,
-        GL_NEAREST);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA8,
+            textureWidth_,
+            textureHeight_,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr);
 
-    glTexParameteri(
-        GL_TEXTURE_2D,
-        GL_TEXTURE_MAG_FILTER,
-        GL_NEAREST);
+        glTexParameteri(
+            GL_TEXTURE_2D,
+            GL_TEXTURE_MIN_FILTER,
+            GL_NEAREST);
+        glTexParameteri(
+            GL_TEXTURE_2D,
+            GL_TEXTURE_MAG_FILTER,
+            GL_NEAREST);
+        glTexParameteri(
+            GL_TEXTURE_2D,
+            GL_TEXTURE_WRAP_S,
+            GL_CLAMP_TO_EDGE);
+        glTexParameteri(
+            GL_TEXTURE_2D,
+            GL_TEXTURE_WRAP_T,
+            GL_CLAMP_TO_EDGE);
 
-    glTexParameteri(
-        GL_TEXTURE_2D,
-        GL_TEXTURE_WRAP_S,
-        GL_REPEAT);
+        glBindFramebuffer(
+            GL_FRAMEBUFFER,
+            framebuffers_[i]);
 
-    glTexParameteri(
-        GL_TEXTURE_2D,
-        GL_TEXTURE_WRAP_T,
-        GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            textures_[i],
+            0);
+
+        glViewport(
+            0, 0,
+            textureWidth_,
+            textureHeight_);
+
+        glClearColor(0,0,0,0);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
 
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    ringOriginColumn_ = 0;
+    // Critical difference from Pass 6: do not leave our private scroll FBO
+    // bound. Restore Qt's QQuickFramebufferObject target, equivalent to the
+    // legacy renderer's gl.bindFramebuffer(..., null).
+    glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        static_cast<GLuint>(previousFramebuffer));
+
+    frontIndex_ = 0;
     forceFullRedraw_ = true;
     lastRenderTick_ = -1.0;
 
     fullBuffer_.resize(
-        static_cast<std::size_t>(textureWidth_) *
-        static_cast<std::size_t>(textureHeight_) *
-        4u);
+        static_cast<std::size_t>(
+            textureWidth_) *
+        static_cast<std::size_t>(
+            textureHeight_) * 4u);
 }
 
 void GLRenderer::writeStrip(
@@ -529,26 +562,20 @@ void GLRenderer::writeStrip(
 {
     if (columnCount <= 0 ||
         textureHeight_ <= 0 ||
-        notes_.empty()) {
+        !notes_ || notes_->empty()) {
         std::fill(
-            buffer.begin(),
-            buffer.end(),
-            0);
+            buffer.begin(), buffer.end(), 0);
         return;
     }
 
     const std::size_t required =
         static_cast<std::size_t>(columnCount) *
-        static_cast<std::size_t>(textureHeight_) *
-        4u;
+        static_cast<std::size_t>(textureHeight_) * 4u;
 
     if (buffer.size() != required)
         buffer.resize(required);
 
-    std::fill(
-        buffer.begin(),
-        buffer.end(),
-        0);
+    std::fill(buffer.begin(), buffer.end(), 0);
 
     const double tpc = ticksPerColumn();
 
@@ -574,51 +601,38 @@ void GLRenderer::writeStrip(
             1,
             static_cast<int>(
                 std::floor(
-                    double(textureHeight_) /
-                    128.0)));
+                    double(textureHeight_) / 128.0)));
 
     for (std::size_t i = searchFrom;
-         i < searchTo &&
-         i < notes_.size();
+         i < searchTo && i < notes_->size();
          ++i) {
-        const NoteInstance& note =
-            notes_[i];
+        const NoteInstance& note = (*notes_)[i];
 
         const double startTick =
             double(note.startTick);
-
         const double endTick =
             double(note.endTick);
 
         if (endTick < stripTickStart ||
-            startTick > stripTickEnd) {
+            startTick > stripTickEnd)
             continue;
-        }
 
         const bool active =
             startTick <= currentTick &&
             endTick >= currentTick;
 
         const int col0Abs =
-            static_cast<int>(
-                std::lround(
-                    (startTick -
-                     currentTick +
-                     postTicks_) /
-                    tpc));
+            static_cast<int>(std::lround(
+                (startTick - currentTick + postTicks_) /
+                tpc));
 
         const int col1Abs =
-            static_cast<int>(
-                std::lround(
-                    (endTick -
-                     currentTick +
-                     postTicks_) /
-                    tpc));
+            static_cast<int>(std::lround(
+                (endTick - currentTick + postTicks_) /
+                tpc));
 
         const int c0 =
-            std::max(
-                0,
-                col0Abs - columnStart);
+            std::max(0, col0Abs - columnStart);
 
         const int c1 =
             std::min(
@@ -629,61 +643,48 @@ void GLRenderer::writeStrip(
             continue;
 
         const int rowCenter =
-            static_cast<int>(
-                std::lround(
-                    (double(note.pitch) / 127.0) *
-                    double(textureHeight_ - 1)));
+            static_cast<int>(std::lround(
+                (double(note.pitch) / 127.0) *
+                double(textureHeight_ - 1)));
 
         const int rowTop =
             std::max(
                 0,
-                rowCenter -
-                rowHeight / 2);
+                rowCenter - rowHeight / 2);
 
         const int rowBottom =
             std::min(
                 textureHeight_ - 1,
-                rowTop +
-                rowHeight - 1);
+                rowTop + rowHeight - 1);
 
         const uint8_t colorIndex =
             colorIndexFor(
                 note.track,
                 note.channel);
 
-        int r =
-            channelColors_[colorIndex][0];
-        int g =
-            channelColors_[colorIndex][1];
-        int b =
-            channelColors_[colorIndex][2];
+        int r = channelColors_[colorIndex][0];
+        int g = channelColors_[colorIndex][1];
+        int b = channelColors_[colorIndex][2];
 
         if (active) {
             r = std::min(
                 255,
                 static_cast<int>(
-                    std::lround(
-                        r * 1.55 + 30.0)));
-
+                    std::lround(r * 1.55 + 30.0)));
             g = std::min(
                 255,
                 static_cast<int>(
-                    std::lround(
-                        g * 1.55 + 30.0)));
-
+                    std::lround(g * 1.55 + 30.0)));
             b = std::min(
                 255,
                 static_cast<int>(
-                    std::lround(
-                        b * 1.55 + 30.0)));
+                    std::lround(b * 1.55 + 30.0)));
         }
 
         const int brightR =
             std::min(255, r + 50);
-
         const int brightG =
             std::min(255, g + 50);
-
         const int brightB =
             std::min(255, b + 50);
 
@@ -698,19 +699,15 @@ void GLRenderer::writeStrip(
                          static_cast<std::size_t>(
                              columnCount) +
                      static_cast<std::size_t>(
-                         column)) *
-                    4u;
+                         column)) * 4u;
 
                 if (column == c0) {
                     buffer[base] =
-                        static_cast<uint8_t>(
-                            brightR);
+                        static_cast<uint8_t>(brightR);
                     buffer[base + 1] =
-                        static_cast<uint8_t>(
-                            brightG);
+                        static_cast<uint8_t>(brightG);
                     buffer[base + 2] =
-                        static_cast<uint8_t>(
-                            brightB);
+                        static_cast<uint8_t>(brightB);
                 } else {
                     buffer[base] =
                         static_cast<uint8_t>(r);
@@ -735,15 +732,9 @@ void GLRenderer::renderFullTexture(
         textureWidth_,
         currentTick);
 
-    ringOriginColumn_ = 0;
-
     glBindTexture(
         GL_TEXTURE_2D,
-        texture_);
-
-    glPixelStorei(
-        GL_UNPACK_ALIGNMENT,
-        1);
+        textures_[frontIndex_]);
 
     glTexSubImage2D(
         GL_TEXTURE_2D,
@@ -755,84 +746,12 @@ void GLRenderer::renderFullTexture(
         GL_UNSIGNED_BYTE,
         fullBuffer_.data());
 
-    glBindTexture(
-        GL_TEXTURE_2D,
-        0);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     forceFullRedraw_ = false;
 }
 
-void GLRenderer::uploadRingStrip(
-    const std::vector<uint8_t>& buffer,
-    int deltaColumns,
-    int physicalStartColumn)
-{
-    if (deltaColumns <= 0 ||
-        buffer.empty())
-        return;
-
-    const int firstWidth =
-        std::min(
-            deltaColumns,
-            textureWidth_ -
-                physicalStartColumn);
-
-    const int secondWidth =
-        deltaColumns - firstWidth;
-
-    glBindTexture(
-        GL_TEXTURE_2D,
-        texture_);
-
-    glPixelStorei(
-        GL_UNPACK_ALIGNMENT,
-        1);
-
-    // Buffer rows are deltaColumns pixels wide. WebGL2 / GLES3 supports
-    // UNPACK_ROW_LENGTH, so wrapped uploads do not require an extra CPU copy.
-    glPixelStorei(
-        GL_UNPACK_ROW_LENGTH,
-        deltaColumns);
-
-    if (firstWidth > 0) {
-        glTexSubImage2D(
-            GL_TEXTURE_2D,
-            0,
-            physicalStartColumn,
-            0,
-            firstWidth,
-            textureHeight_,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            buffer.data());
-    }
-
-    if (secondWidth > 0) {
-        glTexSubImage2D(
-            GL_TEXTURE_2D,
-            0,
-            0,
-            0,
-            secondWidth,
-            textureHeight_,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            buffer.data() +
-                static_cast<std::size_t>(
-                    firstWidth) *
-                4u);
-    }
-
-    glPixelStorei(
-        GL_UNPACK_ROW_LENGTH,
-        0);
-
-    glBindTexture(
-        GL_TEXTURE_2D,
-        0);
-}
-
-void GLRenderer::advanceRing(
+void GLRenderer::scrollAndAdvance(
     double currentTick,
     int deltaColumns)
 {
@@ -844,35 +763,79 @@ void GLRenderer::advanceRing(
         return;
     }
 
-    /*
-     * Advancing the origin makes all existing pixels appear delta columns
-     * farther left. No full-screen FBO blit is performed.
-     */
-    ringOriginColumn_ =
-        (ringOriginColumn_ +
-         deltaColumns) %
-        textureWidth_;
+    // Save Qt's current render target. MPWGL2 binds its private FBO for the
+    // scroll pass and explicitly unbinds it BEFORE modifying the resulting
+    // texture with texSubImage2D(). We must do the same here.
+    GLint previousFramebuffer = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+
+    const int backIndex =
+        frontIndex_ == 0 ? 1 : 0;
+
+    glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        framebuffers_[backIndex]);
+
+    glViewport(
+        0, 0,
+        textureWidth_,
+        textureHeight_);
+
+    glUseProgram(blitProgram_);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(
+        GL_TEXTURE_2D,
+        textures_[frontIndex_]);
+
+    glUniform1i(
+        blitSourceUniform_, 0);
+
+    glUniform1f(
+        blitOffsetUniform_,
+        float(deltaColumns) /
+        float(textureWidth_));
+
+    glBindVertexArray(emptyVao_);
+    glDrawArrays(
+        GL_TRIANGLE_STRIP,
+        0, 4);
+    glBindVertexArray(0);
+
+    // This restore is essential. Without it texture[backIndex] is still
+    // attached to the active framebuffer when texSubImage2D() below tries to
+    // write the newly exposed right-hand strip.
+    glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        static_cast<GLuint>(previousFramebuffer));
+
+    frontIndex_ = backIndex;
 
     writeStrip(
         stripBuffer_,
-        textureWidth_ -
-            deltaColumns,
+        textureWidth_ - deltaColumns,
         deltaColumns,
         currentTick);
 
-    const int physicalStartColumn =
-        (ringOriginColumn_ +
-         textureWidth_ -
-         deltaColumns) %
-        textureWidth_;
+    glBindTexture(
+        GL_TEXTURE_2D,
+        textures_[frontIndex_]);
 
-    uploadRingStrip(
-        stripBuffer_,
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        textureWidth_ - deltaColumns,
+        0,
         deltaColumns,
-        physicalStartColumn);
+        textureHeight_,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        stripBuffer_.data());
+
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void GLRenderer::drawTexture(
+void GLRenderer::drawFrontTexture(
     GLint targetFramebuffer)
 {
     glBindFramebuffer(
@@ -880,9 +843,7 @@ void GLRenderer::drawTexture(
         static_cast<GLuint>(
             targetFramebuffer));
 
-    glViewport(
-        0, 0,
-        width_, height_);
+    glViewport(0, 0, width_, height_);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -890,39 +851,21 @@ void GLRenderer::drawTexture(
     glClearColor(0,0,0,0);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glUseProgram(
-        scrollProgram_);
+    glUseProgram(scrollProgram_);
 
-    glActiveTexture(
-        GL_TEXTURE0);
-
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(
         GL_TEXTURE_2D,
-        texture_);
+        textures_[frontIndex_]);
 
     glUniform1i(
-        scrollTexUniform_,
-        0);
+        scrollTexUniform_, 0);
 
-    const float ringOffset =
-        textureWidth_ > 0
-            ? float(ringOriginColumn_) /
-              float(textureWidth_)
-            : 0.0f;
-
-    glUniform1f(
-        ringOffsetUniform_,
-        ringOffset);
-
-    constexpr float PlayheadFraction =
-        0.18f;
+    constexpr float PlayheadFraction = 0.18f;
 
     const float playheadWidth =
         2.0f /
-        float(
-            std::max(
-                1,
-                textureWidth_));
+        float(std::max(1, textureWidth_));
 
     glUniform1f(
         playheadXUniform_,
@@ -932,48 +875,36 @@ void GLRenderer::drawTexture(
         playheadWidthUniform_,
         playheadWidth);
 
-    glBindVertexArray(
-        emptyVao_);
-
+    glBindVertexArray(emptyVao_);
     glDrawArrays(
         GL_TRIANGLE_STRIP,
-        0,
-        4);
-
+        0, 4);
     glBindVertexArray(0);
+
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 void GLRenderer::renderRoll()
 {
-    if (!initialized_ &&
-        !initialize()) {
+    if (!initialized_ && !initialize())
         return;
-    }
 
     GLint targetFramebuffer = 0;
-
     glGetIntegerv(
         GL_FRAMEBUFFER_BINDING,
         &targetFramebuffer);
 
     if (textureWidth_ != width_ ||
         textureHeight_ != height_) {
-        initTexture(
-            width_,
-            height_);
+        initTextures(width_, height_);
     }
 
-    if (notes_.empty()) {
+    if (!notes_ || notes_->empty()) {
         glBindFramebuffer(
             GL_FRAMEBUFFER,
             static_cast<GLuint>(
                 targetFramebuffer));
-
-        glViewport(
-            0, 0,
-            width_, height_);
-
+        glViewport(0, 0, width_, height_);
         glClearColor(0,0,0,0);
         glClear(GL_COLOR_BUFFER_BIT);
         return;
@@ -984,37 +915,29 @@ void GLRenderer::renderRoll()
 
     if (forceFullRedraw_ ||
         lastRenderTick_ < 0.0) {
-        renderFullTexture(
-            currentTick);
-
-        lastRenderTick_ =
-            currentTick;
+        renderFullTexture(currentTick);
+        lastRenderTick_ = currentTick;
     } else {
         const double tpc =
             ticksPerColumn();
 
         const int delta =
-            static_cast<int>(
-                std::lround(
-                    (currentTick -
-                     lastRenderTick_) /
-                    tpc));
+            static_cast<int>(std::lround(
+                (currentTick -
+                 lastRenderTick_) / tpc));
 
         if (delta < 0) {
-            renderFullTexture(
-                currentTick);
+            renderFullTexture(currentTick);
         } else if (delta > 0) {
-            advanceRing(
+            scrollAndAdvance(
                 currentTick,
                 delta);
         }
 
-        lastRenderTick_ =
-            currentTick;
+        lastRenderTick_ = currentTick;
     }
 
-    drawTexture(
-        targetFramebuffer);
+    drawFrontTexture(targetFramebuffer);
 }
 
 } // namespace wasmidi

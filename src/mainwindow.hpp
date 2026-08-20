@@ -10,6 +10,7 @@
 
 #include <array>
 #include <vector>
+#include <unordered_map>
 
 #include "midi/midi_parser.hpp"
 #include "midi/scheduler.hpp"
@@ -48,6 +49,8 @@ class MainWindow : public QObject {
     Q_PROPERTY(quint64 documentRevision READ documentRevision NOTIFY documentRevisionChanged)
     Q_PROPERTY(QString outputMode READ outputMode WRITE setOutputMode NOTIFY outputModeChanged)
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
+    Q_PROPERTY(float dominantHue READ dominantHue NOTIFY neuralVisualChanged)
+    Q_PROPERTY(float neuralActivity READ neuralActivity NOTIFY neuralVisualChanged)
 
 public:
     explicit MainWindow(QObject *parent = nullptr);
@@ -83,13 +86,17 @@ public:
     quint64 documentRevision() const { return documentRevision_; }
     QString outputMode() const { return outputMode_; }
     QVariantList channelColorList() const;
+    float dominantHue() const { return dominantHue_; }
+    float neuralActivity() const { return neuralActivity_; }
 
     const wasmidi::MidiDocument& document() const { return document_; }
     const QVector<QColor>& channelColors() const { return channelColors_; }
-    std::array<uint8_t, 128> activePitchMask() const { return activePitchMaskCache_; }
+    std::array<uint8_t, 128> activePitchMask() const;
+    std::array<int8_t, 128> activePitchColorIndices() const;
 
     Q_INVOKABLE bool loadMidiFile(const QByteArray& data);
     Q_INVOKABLE bool loadMidiFileNamed(const QByteArray& data, const QString& fileName);
+    bool loadMidiRaw(const uint8_t* data, std::size_t size, const QString& fileName);
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
     Q_INVOKABLE void openMidiPicker();
     Q_INVOKABLE void clearFile();
@@ -135,7 +142,7 @@ signals:
     void documentRevisionChanged();
     void outputModeChanged();
     void channelColorsChanged();
-    void activePitchesChanged();
+    void neuralVisualChanged();
     void fileLoaded();
     void loadFailed(QString message);
 
@@ -144,7 +151,9 @@ private:
     void rebuildDerivedStats();
     void updateLiveStats();
     void updateCurrentTime();
-    void updateActivePitchMask();
+    void updateNeuralVisuals();
+    void rebuildColorMaps();
+    uint8_t colorIndexFor(uint16_t track, uint8_t channel) const;
     void dispatchScheduler();
     void publishDocumentMetadata();
 
@@ -190,7 +199,8 @@ private:
     std::vector<float> controlTimes_;
     std::vector<float> tempoTimes_;
     std::vector<float> tempoBpms_;
-    std::array<std::vector<float>, 128> pitchStarts_;
-    std::array<std::vector<float>, 128> pitchEnds_;
-    std::array<uint8_t, 128> activePitchMaskCache_{};
+    std::array<int8_t, 16> globalChannelColor_{};
+    std::unordered_map<uint32_t, uint8_t> perTrackColorMap_;
+    float dominantHue_ = 230.0f;
+    float neuralActivity_ = 0.0f;
 };

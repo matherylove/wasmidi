@@ -7,7 +7,6 @@
 #include <QQuickOpenGLUtils>
 #include <QQuickWindow>
 
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -19,58 +18,38 @@ namespace {
 class PianoRollRenderer final
     : public QQuickFramebufferObject::Renderer {
 public:
-    PianoRollRenderer(
-        qreal devicePixelRatio,
-        std::atomic<int>* fps)
-        : devicePixelRatio_(
-              std::max<qreal>(
-                  1.0,
-                  devicePixelRatio)),
-          fps_(fps)
-    {
-    }
+    explicit PianoRollRenderer(qreal dpr)
+        : dpr_(std::max<qreal>(1.0, dpr)) {}
 
     QOpenGLFramebufferObject*
-    createFramebufferObject(
-        const QSize& physicalSize) override
+    createFramebufferObject(const QSize& size) override
     {
+        const QSize cssSize(
+            std::max(64, qRound(size.width() / dpr_)),
+            std::max(64, qRound(size.height() / dpr_)));
         /*
-         * MPWGL2.html deliberately sets rollCanvas.width/height to the CSS
-         * bounding rectangle, without multiplying by devicePixelRatio.
-         *
-         * Qt hands us DPR-scaled physicalSize. Divide it back to CSS pixels.
-         * This avoids rendering/scrolling/compositing 2.25x-4x as many pixels
-         * on 150%-200% Windows scaling while keeping the same raster density
-         * as the original player.
+         * IMPORTANT: Qt documents that `size` already includes the device
+         * pixel ratio. Returning this exact size gives us the physical-pixel
+         * WebGL target (for example Windows 125/150% scaling).
          */
-        QSize cssSize(
-            std::max(
-                64,
-                qRound(
-                    physicalSize.width() /
-                    devicePixelRatio_)),
-            std::max(
-                64,
-                qRound(
-                    physicalSize.height() /
-                    devicePixelRatio_)));
-
-        return new QOpenGLFramebufferObject(
-            cssSize);
+        return new QOpenGLFramebufferObject(cssSize);
     }
 
-    void synchronize(
-        QQuickFramebufferObject* item) override
+    void synchronize(QQuickFramebufferObject* item) override
     {
-        auto* roll =
-            static_cast<PianoRoll*>(item);
-
+        auto* roll = static_cast<PianoRoll*>(item);
         auto* controller =
-            qobject_cast<MainWindow*>(
-                roll->controller());
+            qobject_cast<MainWindow*>(roll->controller());
 
         if (!controller)
             return;
+
+        /*
+         * Do NOT call renderer_.resize(roll->width(), roll->height()) here.
+         * Those are logical QML pixels. The QQuickFramebufferObject itself is
+         * DPR-scaled, so doing that made the private MPWGL2 textures lower
+         * resolution than the actual FBO and stretched them on presentation.
+         */
 
         renderer_.setNoteSpeed(
             controller->noteSpeed());
@@ -89,12 +68,9 @@ public:
              ++i) {
             renderer_.setChannelColor(
                 static_cast<uint8_t>(i),
-                static_cast<uint8_t>(
-                    colors[i].red()),
-                static_cast<uint8_t>(
-                    colors[i].green()),
-                static_cast<uint8_t>(
-                    colors[i].blue()));
+                static_cast<uint8_t>(colors[i].red()),
+                static_cast<uint8_t>(colors[i].green()),
+                static_cast<uint8_t>(colors[i].blue()));
         }
 
         syncedTimeSeconds_ =
@@ -114,32 +90,10 @@ public:
             const auto& document =
                 controller->document();
 
-            std::vector<wasmidi::NoteInstance>
-                notes;
+            std::vector<wasmidi::TempoPoint> tempo;
+            tempo.reserve(document.tempoMap.size());
 
-            notes.reserve(
-                document.notes.size());
-
-            for (const auto& note :
-                 document.notes) {
-                notes.push_back({
-                    note.startTick,
-                    note.endTick,
-                    note.pitch,
-                    note.channel,
-                    note.velocity,
-                    note.track
-                });
-            }
-
-            std::vector<wasmidi::TempoPoint>
-                tempo;
-
-            tempo.reserve(
-                document.tempoMap.size());
-
-            for (const auto& point :
-                 document.tempoMap) {
+            for (const auto& point : document.tempoMap) {
                 tempo.push_back({
                     point.tick,
                     point.microsecondsPerBeat
@@ -153,48 +107,47 @@ public:
             renderer_.setActiveChannelMasks(
                 document.activeChannelMasks);
 
-            renderer_.setNotes(notes);
+            renderer_.setNotesView(&document.notes);
         }
     }
 
     void render() override
     {
-        if (auto* fbo =
-                framebufferObject()) {
-            const QSize size =
-                fbo->size();
+        /*
+         * framebufferObject()->size() is the authoritative physical-pixel
+         * resolution. Qt already multiplied it by devicePixelRatio.
+         */
+        if (auto* fbo = framebufferObject()) {
+            const QSize pixelSize = fbo->size();
 
             renderer_.resize(
-                size.width(),
-                size.height());
+                pixelSize.width(),
+                pixelSize.height());
         }
 
         float renderTime =
             syncedTimeSeconds_;
 
         if (syncedPlaying_) {
-            const auto now =
-                Clock::now();
+            const auto now = Clock::now();
 
             const std::chrono::duration<float>
                 elapsed =
                     now - syncWallClock_;
 
-            renderTime +=
-                elapsed.count();
+            renderTime += elapsed.count();
         }
 
-        renderer_.setCurrentTime(
-            renderTime);
-
+        renderer_.setCurrentTime(renderTime);
         renderer_.renderRoll();
 
-        QQuickOpenGLUtils::
-            resetOpenGLState();
+        QQuickOpenGLUtils::resetOpenGLState();
 
-        updateFps();
-
-        // Single continuous scheduling source for the roll.
+        /*
+         * This is the ONE continuous scheduling path for the piano roll.
+         * GUI currentTimeChanged no longer requests another window frame every
+         * 16 ms at the same time.
+         */
         if (syncedPlaying_)
             update();
     }
@@ -203,77 +156,37 @@ private:
     using Clock =
         std::chrono::steady_clock;
 
-    void updateFps()
-    {
-        ++fpsFrames_;
-
-        const auto now =
-            Clock::now();
-
-        const std::chrono::duration<double>
-            elapsed =
-                now - fpsWindowStart_;
-
-        if (elapsed.count() >= 0.5) {
-            const int fps =
-                static_cast<int>(
-                    std::lround(
-                        double(fpsFrames_) /
-                        elapsed.count()));
-
-            if (fps_)
-                fps_->store(
-                    fps,
-                    std::memory_order_relaxed);
-
-            fpsFrames_ = 0;
-            fpsWindowStart_ = now;
-        }
-    }
-
-    qreal devicePixelRatio_ = 1.0;
-    std::atomic<int>* fps_ = nullptr;
-
+    qreal dpr_ = 1.0;
     wasmidi::GLRenderer renderer_;
 
     quint64 revision_ =
-        std::numeric_limits<
-            quint64>::max();
+        std::numeric_limits<quint64>::max();
 
     float syncedTimeSeconds_ = 0.0f;
     bool syncedPlaying_ = false;
 
     Clock::time_point syncWallClock_ =
         Clock::now();
-
-    Clock::time_point fpsWindowStart_ =
-        Clock::now();
-
-    int fpsFrames_ = 0;
 };
 
 } // namespace
 
-PianoRoll::PianoRoll(
-    QQuickItem* parent)
+PianoRoll::PianoRoll(QQuickItem* parent)
     : QQuickFramebufferObject(parent)
 {
     setMirrorVertically(false);
     setTextureFollowsItemSize(true);
 }
 
-void PianoRoll::setController(
-    QObject* controller)
+void PianoRoll::setController(QObject* controller)
 {
     if (controller_ == controller)
         return;
 
     if (controller_) {
         QObject::disconnect(
-            controller_.data(),
-            nullptr,
-            this,
-            nullptr);
+            controller_.data(), nullptr,
+            this, nullptr);
     }
 
     controller_ = controller;
@@ -281,74 +194,74 @@ void PianoRoll::setController(
     if (auto* player =
             qobject_cast<MainWindow*>(
                 controller_.data())) {
-        auto requestSync =
-            [this]() {
-                update();
-            };
 
+        auto requestSync = [this]() {
+            update();
+        };
+
+        /*
+         * Real state changes need a synchronize() pass.
+         * Normal playback frames are generated exclusively by
+         * PianoRollRenderer::update().
+         */
         connect(
             player,
-            &MainWindow::
-                documentRevisionChanged,
+            &MainWindow::documentRevisionChanged,
             this,
             requestSync);
 
         connect(
             player,
-            &MainWindow::
-                noteSpeedChanged,
+            &MainWindow::noteSpeedChanged,
             this,
             requestSync);
 
         connect(
             player,
-            &MainWindow::
-                postBufferChanged,
+            &MainWindow::postBufferChanged,
             this,
             requestSync);
 
         connect(
             player,
-            &MainWindow::
-                perTrackColorsChanged,
+            &MainWindow::perTrackColorsChanged,
             this,
             requestSync);
 
         connect(
             player,
-            &MainWindow::
-                channelColorsChanged,
+            &MainWindow::channelColorsChanged,
             this,
             requestSync);
 
         connect(
             player,
-            &MainWindow::
-                playingChanged,
+            &MainWindow::playingChanged,
             this,
             requestSync);
 
-        // Synchronize paused seeks / large discontinuities only.
-        auto lastTime =
+        /*
+         * currentTimeChanged is emitted by the 16 ms UI clock, but we must not
+         * render from every emission as well. Only synchronize a paused seek
+         * or an obvious discontinuity/jump while playing.
+         */
+        auto lastControllerTime =
             std::make_shared<float>(
                 player->currentTime());
 
         connect(
             player,
-            &MainWindow::
-                currentTimeChanged,
+            &MainWindow::currentTimeChanged,
             this,
-            [this,
-             player,
-             lastTime]() {
+            [this, player, lastControllerTime]() {
                 const float now =
                     player->currentTime();
 
                 const float delta =
                     std::fabs(
-                        now - *lastTime);
+                        now - *lastControllerTime);
 
-                *lastTime = now;
+                *lastControllerTime = now;
 
                 if (!player->isPlaying() ||
                     delta > 0.10f) {
@@ -364,13 +277,6 @@ void PianoRoll::setController(
 QQuickFramebufferObject::Renderer*
 PianoRoll::createRenderer() const
 {
-    const qreal dpr =
-        window()
-            ? window()->
-                devicePixelRatio()
-            : 1.0;
-
-    return new PianoRollRenderer(
-        dpr,
-        &renderFps_);
+    const qreal dpr = window() ? window()->devicePixelRatio() : 1.0;
+    return new PianoRollRenderer(dpr);
 }
