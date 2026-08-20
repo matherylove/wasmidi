@@ -5,10 +5,13 @@
 
 #include <QOpenGLFramebufferObject>
 #include <QQuickOpenGLUtils>
-#include <QQuickWindow>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -19,12 +22,13 @@ struct KeyInstance {
 
 GLuint shader(GLenum type, const char* src)
 {
-    GLuint s = glCreateShader(type);
+    const GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
     glCompileShader(s);
 
     GLint ok = 0;
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    glGetShaderiv(
+        s, GL_COMPILE_STATUS, &ok);
 
     if (!ok) {
         glDeleteShader(s);
@@ -48,8 +52,13 @@ out float vActive;
 
 void main()
 {
-    vec2 p = aRect.xy + aCorner * aRect.zw;
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    vec2 p =
+        aRect.xy +
+        aCorner * aRect.zw;
+
+    gl_Position =
+        vec4(p * 2.0 - 1.0, 0.0, 1.0);
+
     vUv = aCorner;
     vBlack = aState.x;
     vActive = aState.y;
@@ -74,6 +83,7 @@ void main()
             vec3(.035,.037,.070),
             vec3(.008,.009,.020),
             vUv.y);
+
         if (vUv.y > .94)
             c *= .72;
     } else {
@@ -83,43 +93,50 @@ void main()
             vUv.y);
 
         float edge =
-            min(vUv.x, 1.0 - vUv.x);
+            min(vUv.x, 1.0-vUv.x);
 
         if (edge < .035)
             c *= .58;
 
-        if (vUv.y < .10)
+        if (vUv.y < .10) {
             c = mix(
                 c,
                 vec3(.11,.10,.16),
                 .22);
+        }
     }
 
     if (vActive > 0.5) {
         c = mix(
             c,
             vec3(.62,.46,.98),
-            vBlack > 0.5 ? .90 : .78);
+            vBlack > 0.5
+                ? .90
+                : .78);
 
-        if (vUv.y < .14)
+        if (vUv.y < .14) {
             c = min(
                 vec3(1.0),
                 c * 1.20 + vec3(.04));
+        }
     }
 
     fragColor = vec4(c,1);
 }
 )GLSL";
 
-    GLuint v =
+    const GLuint v =
         shader(GL_VERTEX_SHADER, vs);
-    GLuint f =
+
+    const GLuint f =
         shader(GL_FRAGMENT_SHADER, fs);
 
     if (!v || !f)
         return 0;
 
-    GLuint p = glCreateProgram();
+    const GLuint p =
+        glCreateProgram();
+
     glAttachShader(p, v);
     glAttachShader(p, f);
     glLinkProgram(p);
@@ -146,10 +163,13 @@ public:
     {
         if (vbo_)
             glDeleteBuffers(1, &vbo_);
+
         if (inst_)
             glDeleteBuffers(1, &inst_);
+
         if (vao_)
             glDeleteVertexArrays(1, &vao_);
+
         if (prog_)
             glDeleteProgram(prog_);
     }
@@ -158,6 +178,7 @@ public:
     createFramebufferObject(
         const QSize& size) override
     {
+        // `size` is already physical pixels / DPR-corrected by Qt.
         return new QOpenGLFramebufferObject(size);
     }
 
@@ -171,21 +192,53 @@ public:
             qobject_cast<MainWindow*>(
                 keyboard->controller());
 
-        width_ =
-            std::max(
-                1,
-                int(keyboard->width()));
+        if (!controller)
+            return;
 
-        height_ =
-            std::max(
-                1,
-                int(keyboard->height()));
+        syncedTimeSeconds_ =
+            controller->currentTime();
 
-        active_ = controller
-            ? controller->activePitchMask()
-            : std::array<uint8_t,128>{};
+        syncedPlaying_ =
+            controller->isPlaying();
 
-        dirty_ = true;
+        syncWallClock_ =
+            Clock::now();
+
+        if (revision_ !=
+            controller->documentRevision()) {
+            revision_ =
+                controller->documentRevision();
+
+            for (auto& values : starts_)
+                values.clear();
+
+            for (auto& values : ends_)
+                values.clear();
+
+            const auto& document =
+                controller->document();
+
+            for (const auto& note :
+                 document.notes) {
+                starts_[note.pitch].push_back(
+                    note.startTime);
+
+                ends_[note.pitch].push_back(
+                    note.endTime);
+            }
+
+            for (int pitch = 0;
+                 pitch < 128;
+                 ++pitch) {
+                std::sort(
+                    starts_[pitch].begin(),
+                    starts_[pitch].end());
+
+                std::sort(
+                    ends_[pitch].begin(),
+                    ends_[pitch].end());
+            }
+        }
     }
 
     void render() override
@@ -196,8 +249,37 @@ public:
         if (!prog_)
             return;
 
-        if (dirty_)
-            rebuild();
+        if (auto* fbo = framebufferObject()) {
+            const QSize pixelSize =
+                fbo->size();
+
+            width_ =
+                std::max(
+                    1,
+                    pixelSize.width());
+
+            height_ =
+                std::max(
+                    1,
+                    pixelSize.height());
+        }
+
+        float renderTime =
+            syncedTimeSeconds_;
+
+        if (syncedPlaying_) {
+            const auto now =
+                Clock::now();
+
+            const std::chrono::duration<float>
+                elapsed =
+                    now - syncWallClock_;
+
+            renderTime +=
+                elapsed.count();
+        }
+
+        rebuild(renderTime);
 
         glViewport(
             0, 0,
@@ -207,7 +289,7 @@ public:
         glDisable(GL_BLEND);
 
         glClearColor(
-            .010f, .010f, .026f, 1.0f);
+            .010f,.010f,.026f,1.0f);
 
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -223,9 +305,42 @@ public:
         glBindVertexArray(0);
 
         QQuickOpenGLUtils::resetOpenGLState();
+
+        if (syncedPlaying_)
+            update();
     }
 
 private:
+    using Clock =
+        std::chrono::steady_clock;
+
+    bool pitchActive(
+        int pitch,
+        float time) const
+    {
+        const auto& starts =
+            starts_[pitch];
+
+        const auto& ends =
+            ends_[pitch];
+
+        const auto started =
+            std::upper_bound(
+                starts.begin(),
+                starts.end(),
+                time);
+
+        const auto ended =
+            std::lower_bound(
+                ends.begin(),
+                ends.end(),
+                time);
+
+        return
+            (started - starts.begin()) >
+            (ended - ends.begin());
+    }
+
     void init()
     {
         prog_ = program();
@@ -242,6 +357,7 @@ private:
         };
 
         glGenBuffers(1, &vbo_);
+
         glBindBuffer(
             GL_ARRAY_BUFFER, vbo_);
 
@@ -261,8 +377,10 @@ private:
             nullptr);
 
         glGenBuffers(1, &inst_);
+
         glBindBuffer(
-            GL_ARRAY_BUFFER, inst_);
+            GL_ARRAY_BUFFER,
+            inst_);
 
         glEnableVertexAttribArray(1);
 
@@ -283,19 +401,30 @@ private:
             GL_FALSE,
             sizeof(KeyInstance),
             reinterpret_cast<void*>(
-                4 * sizeof(float)));
+                4*sizeof(float)));
 
         glVertexAttribDivisor(2, 1);
 
         glBindVertexArray(0);
     }
 
-    void rebuild()
+    void rebuild(float renderTime)
     {
         static const bool black[12] = {
             false,true,false,true,false,false,
             true,false,true,false,true,false
         };
+
+        std::array<bool,128> active{};
+
+        for (int pitch = 0;
+             pitch < 128;
+             ++pitch) {
+            active[pitch] =
+                pitchActive(
+                    pitch,
+                    renderTime);
+        }
 
         keys_.clear();
         keys_.reserve(128);
@@ -308,14 +437,17 @@ private:
         }
 
         const float ww =
-            1.0f / float(whiteTotal);
+            1.0f /
+            float(whiteTotal);
 
         const float bw =
             ww * 0.58f;
 
         int wi = 0;
 
-        for (int n = 0; n < 128; ++n) {
+        for (int n = 0;
+             n < 128;
+             ++n) {
             if (black[n % 12])
                 continue;
 
@@ -325,7 +457,7 @@ private:
                 ww,
                 1.0f,
                 0.0f,
-                float(active_[n])
+                active[n] ? 1.0f : 0.0f
             });
 
             ++wi;
@@ -333,10 +465,13 @@ private:
 
         wi = 0;
 
-        for (int n = 0; n < 128; ++n) {
+        for (int n = 0;
+             n < 128;
+             ++n) {
             if (black[n % 12]) {
                 const float x =
-                    wi * ww - bw * 0.5f;
+                    wi * ww -
+                    bw * 0.5f;
 
                 keys_.push_back({
                     x,
@@ -344,7 +479,9 @@ private:
                     bw,
                     0.62f,
                     1.0f,
-                    float(active_[n])
+                    active[n]
+                        ? 1.0f
+                        : 0.0f
                 });
             } else {
                 ++wi;
@@ -362,8 +499,6 @@ private:
                 sizeof(KeyInstance)),
             keys_.data(),
             GL_DYNAMIC_DRAW);
-
-        dirty_ = false;
     }
 
     GLuint prog_ = 0;
@@ -374,9 +509,21 @@ private:
     int width_ = 1;
     int height_ = 1;
 
-    bool dirty_ = true;
+    quint64 revision_ =
+        std::numeric_limits<quint64>::max();
 
-    std::array<uint8_t,128> active_{};
+    float syncedTimeSeconds_ = 0.0f;
+    bool syncedPlaying_ = false;
+
+    Clock::time_point syncWallClock_ =
+        Clock::now();
+
+    std::array<std::vector<float>,128>
+        starts_;
+
+    std::array<std::vector<float>,128>
+        ends_;
+
     std::vector<KeyInstance> keys_;
 };
 
@@ -386,6 +533,7 @@ Keyboard::Keyboard(QQuickItem* parent)
     : QQuickFramebufferObject(parent)
 {
     setMirrorVertically(false);
+    setTextureFollowsItemSize(true);
 }
 
 void Keyboard::setController(QObject* controller)
@@ -405,38 +553,48 @@ void Keyboard::setController(QObject* controller)
             qobject_cast<MainWindow*>(
                 controller_.data())) {
 
-        auto requestFrame = [this]() {
-            update();
-
-            if (window())
-                window()->update();
-        };
-
-        connect(
-            player,
-            &MainWindow::currentTimeChanged,
-            this,
-            requestFrame);
+        auto requestSync =
+            [this]() { update(); };
 
         connect(
             player,
             &MainWindow::documentRevisionChanged,
             this,
-            requestFrame);
+            requestSync);
 
         connect(
             player,
             &MainWindow::playingChanged,
             this,
-            requestFrame);
+            requestSync);
+
+        auto lastControllerTime =
+            std::make_shared<float>(
+                player->currentTime());
+
+        connect(
+            player,
+            &MainWindow::currentTimeChanged,
+            this,
+            [this, player, lastControllerTime]() {
+                const float now =
+                    player->currentTime();
+
+                const float delta =
+                    std::fabs(
+                        now - *lastControllerTime);
+
+                *lastControllerTime = now;
+
+                if (!player->isPlaying() ||
+                    delta > 0.10f) {
+                    update();
+                }
+            });
     }
 
     emit controllerChanged();
-
     update();
-
-    if (window())
-        window()->update();
 }
 
 QQuickFramebufferObject::Renderer*

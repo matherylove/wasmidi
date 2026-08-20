@@ -151,15 +151,8 @@ Item {
                     chartBox.resetHistory()
                 chartBox.samples[chartBox.sampleIndex] = Number(chartBox.value)
                 chartBox.sampleIndex = (chartBox.sampleIndex + 1) % chartBox.historyLength
+                spark.requestPaint()
             }
-        }
-
-        // The legacy _glLoop draws the charts every requestAnimationFrame.
-        Timer {
-            interval: 16
-            running: chartBox.visible
-            repeat: true
-            onTriggered: spark.requestPaint()
         }
 
         Canvas {
@@ -245,7 +238,7 @@ Item {
         border.width: 1
 
         Timer {
-            interval: 16
+            interval: 33
             running: timelineBox.visible
             repeat: true
             onTriggered: timeline.requestPaint()

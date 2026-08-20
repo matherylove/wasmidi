@@ -8,7 +8,6 @@ Item {
     clip: true
 
     property bool dragActive: false
-    property int frameCounter: 0
     property int fpsValue: 0
     property real neuralPhase: 0
     property var neuralNodes: []
@@ -218,27 +217,60 @@ Item {
         }
     }
 
-    Timer {
-        interval: 16
+    FrameAnimation {
+        id: frameAnimation
         running: root.visible
-        repeat: true
+
         onTriggered: {
-            root.frameCounter++
-            root.neuralPhase += 0.035
+            root.fpsValue =
+                smoothFrameTime > 0
+                    ? Math.round(1.0 / smoothFrameTime)
+                    : 0
+
+            /*
+             * QML Canvas is significantly more expensive than the native
+             * WebGL roll. While MIDI is playing, animate the neural backdrop
+             * every second display frame (~30 Hz); its movement is time-based
+             * so it keeps the same speed.
+             */
+            if (root.mainWindow.isPlaying &&
+                (currentFrame & 1))
+                return
+
+            var scale =
+                frameTime > 0
+                    ? frameTime / (1.0 / 60.0)
+                    : 1.0
+
+            root.neuralPhase +=
+                0.035 * scale
 
             var next = []
-            for (var i = 0; i < root.neuralNodes.length; ++i) {
-                var n = root.neuralNodes[i]
-                var x = n.x + n.vx
-                var y = n.y + n.vy
+
+            for (var i = 0;
+                 i < root.neuralNodes.length;
+                 ++i) {
+                var n =
+                    root.neuralNodes[i]
+
+                var x =
+                    n.x + n.vx * scale
+
+                var y =
+                    n.y + n.vy * scale
 
                 if (x <= 0 || x >= 1) {
                     n.vx = -n.vx
-                    x = Math.max(0, Math.min(1, x))
+                    x = Math.max(
+                        0,
+                        Math.min(1, x))
                 }
+
                 if (y <= 0 || y >= 1) {
                     n.vy = -n.vy
-                    y = Math.max(0, Math.min(1, y))
+                    y = Math.max(
+                        0,
+                        Math.min(1, y))
                 }
 
                 n.x = x
@@ -248,16 +280,6 @@ Item {
 
             root.neuralNodes = next
             neural.requestPaint()
-        }
-    }
-
-    Timer {
-        interval: 1000
-        running: root.visible
-        repeat: true
-        onTriggered: {
-            root.fpsValue = root.frameCounter
-            root.frameCounter = 0
         }
     }
 }
