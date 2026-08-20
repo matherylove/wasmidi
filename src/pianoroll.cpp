@@ -4,7 +4,10 @@
 #include "renderer/gl_renderer.hpp"
 
 #include <QOpenGLFramebufferObject>
+#include <QQuickOpenGLUtils>
+#include <QQuickWindow>
 
+#include <chrono>
 #include <limits>
 #include <vector>
 
@@ -28,21 +31,9 @@ public:
         if (!controller)
             return;
 
-        /*
-         * synchronize() is the only safe place to transfer state from the
-         * Qt GUI thread into the scene-graph/render thread.
-         *
-         * Pass 6 called Renderer::update() continuously from render(), but
-         * the PianoRoll QQuickItem itself was never marked dirty when
-         * MainWindow::currentTime changed. As a result Qt kept rendering with
-         * the currentTime captured during the last resize/window event.
-         */
         renderer_.resize(
             static_cast<int>(roll->width()),
             static_cast<int>(roll->height()));
-
-        renderer_.setCurrentTime(
-            controller->currentTime());
 
         renderer_.setNoteSpeed(
             controller->noteSpeed());
@@ -66,10 +57,21 @@ public:
                 static_cast<uint8_t>(colors[i].blue()));
         }
 
-        if (revision_ !=
-            controller->documentRevision()) {
-            revision_ =
-                controller->documentRevision();
+        /*
+         * Keep a render-thread playback anchor.
+         *
+         * Qt/WASM was observed to occasionally render the same synchronized
+         * controller time repeatedly until a window expose/resize event. The
+         * old MPWGL2 renderer does not depend on DOM/state synchronization per
+         * frame: requestAnimationFrame extrapolates time from a monotonic
+         * clock. Do the same here.
+         */
+        syncedTimeSeconds_ = controller->currentTime();
+        syncedPlaying_ = controller->isPlaying();
+        syncWallClock_ = Clock::now();
+
+        if (revision_ != controller->documentRevision()) {
+            revision_ = controller->documentRevision();
 
             const auto& document =
                 controller->document();
@@ -111,21 +113,46 @@ public:
 
     void render() override
     {
+        float renderTime = syncedTimeSeconds_;
+
+        if (syncedPlaying_) {
+            const auto now = Clock::now();
+            const std::chrono::duration<float> elapsed =
+                now - syncWallClock_;
+            renderTime += elapsed.count();
+        }
+
+        renderer_.setCurrentTime(renderTime);
         renderer_.renderRoll();
 
         /*
-         * Do NOT call Renderer::update() here.
-         *
-         * Rendering is now driven from the GUI-side PianoRoll::update()
-         * connections below. That guarantees each requested frame first goes
-         * through synchronize() and receives the newest playback time.
+         * QQuickFramebufferObject shares the OpenGL context with Qt Quick.
+         * Qt explicitly recommends resetting custom GL state before returning.
+         * This is particularly important here because the MPWGL2 renderer
+         * binds private FBOs, textures, programs and VAOs every frame.
          */
+        QQuickOpenGLUtils::resetOpenGLState();
+
+        /*
+         * Match MPWGL2's requestAnimationFrame loop. The renderer advances its
+         * monotonic playback clock even if Qt/WASM delays a GUI-side
+         * synchronize() call.
+         */
+        if (syncedPlaying_)
+            update();
     }
 
 private:
+    using Clock = std::chrono::steady_clock;
+
     wasmidi::GLRenderer renderer_;
+
     quint64 revision_ =
         std::numeric_limits<quint64>::max();
+
+    float syncedTimeSeconds_ = 0.0f;
+    bool syncedPlaying_ = false;
+    Clock::time_point syncWallClock_ = Clock::now();
 };
 
 } // namespace
@@ -141,55 +168,63 @@ void PianoRoll::setController(QObject* controller)
     if (controller_ == controller)
         return;
 
-    if (controller_)
+    if (controller_) {
         QObject::disconnect(
             controller_.data(), nullptr,
             this, nullptr);
+    }
 
     controller_ = controller;
 
     if (auto* player =
             qobject_cast<MainWindow*>(
                 controller_.data())) {
-        /*
-         * QQuickFramebufferObject does not automatically become dirty when
-         * arbitrary properties of an object stored in `controller` change.
-         * Explicitly request a scene-graph frame for every state mutation that
-         * changes the roll.
-         */
+
+        auto requestFrame = [this]() {
+            /*
+             * Mark the FBO item dirty AND explicitly request a window frame.
+             * The latter removes any dependency on platform-specific Qt/WASM
+             * scene-graph update coalescing.
+             */
+            update();
+            if (window())
+                window()->update();
+        };
+
         connect(
             player, &MainWindow::currentTimeChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
 
         connect(
             player, &MainWindow::documentRevisionChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
 
         connect(
             player, &MainWindow::noteSpeedChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
 
         connect(
             player, &MainWindow::postBufferChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
 
         connect(
             player, &MainWindow::perTrackColorsChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
 
         connect(
             player, &MainWindow::channelColorsChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
 
         connect(
             player, &MainWindow::playingChanged,
-            this, [this]() { update(); });
+            this, requestFrame);
     }
 
     emit controllerChanged();
 
-    // Forces initial synchronize after assigning the controller.
     update();
+    if (window())
+        window()->update();
 }
 
 QQuickFramebufferObject::Renderer*

@@ -2,26 +2,35 @@
 #include "mainwindow.hpp"
 
 #include <GLES3/gl3.h>
+
 #include <QOpenGLFramebufferObject>
+#include <QQuickOpenGLUtils>
+#include <QQuickWindow>
+
 #include <algorithm>
 #include <array>
 #include <vector>
 
 namespace {
 
-struct KeyInstance { float x, y, w, h, black, active; };
+struct KeyInstance {
+    float x, y, w, h, black, active;
+};
 
 GLuint shader(GLenum type, const char* src)
 {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
     glCompileShader(s);
+
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+
     if (!ok) {
         glDeleteShader(s);
         return 0;
     }
+
     return s;
 }
 
@@ -32,45 +41,81 @@ precision highp float;
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 aRect;
 layout(location=2) in vec2 aState;
+
 out vec2 vUv;
 out float vBlack;
 out float vActive;
-void main(){
-    vec2 p=aRect.xy+aCorner*aRect.zw;
-    gl_Position=vec4(p*2.0-1.0,0,1);
-    vUv=aCorner;
-    vBlack=aState.x;
-    vActive=aState.y;
+
+void main()
+{
+    vec2 p = aRect.xy + aCorner * aRect.zw;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    vUv = aCorner;
+    vBlack = aState.x;
+    vActive = aState.y;
 }
 )GLSL";
 
     static const char* fs = R"GLSL(#version 300 es
 precision mediump float;
+
 in vec2 vUv;
 in float vBlack;
 in float vActive;
+
 out vec4 fragColor;
-void main(){
+
+void main()
+{
     vec3 c;
-    if(vBlack>0.5){
-        c=mix(vec3(.035,.037,.070),vec3(.008,.009,.020),vUv.y);
-        if(vUv.y>.94)c*=.72;
-    }else{
-        c=mix(vec3(.075,.085,.145),vec3(.035,.042,.076),vUv.y);
-        float edge=min(vUv.x,1.0-vUv.x);
-        if(edge<.035)c*=.58;
-        if(vUv.y<.10)c=mix(c,vec3(.11,.10,.16),.22);
+
+    if (vBlack > 0.5) {
+        c = mix(
+            vec3(.035,.037,.070),
+            vec3(.008,.009,.020),
+            vUv.y);
+        if (vUv.y > .94)
+            c *= .72;
+    } else {
+        c = mix(
+            vec3(.075,.085,.145),
+            vec3(.035,.042,.076),
+            vUv.y);
+
+        float edge =
+            min(vUv.x, 1.0 - vUv.x);
+
+        if (edge < .035)
+            c *= .58;
+
+        if (vUv.y < .10)
+            c = mix(
+                c,
+                vec3(.11,.10,.16),
+                .22);
     }
-    if(vActive>0.5){
-        c=mix(c,vec3(.62,.46,.98),vBlack>0.5?.90:.78);
-        if(vUv.y<.14)c=min(vec3(1.0),c*1.20+vec3(.04));
+
+    if (vActive > 0.5) {
+        c = mix(
+            c,
+            vec3(.62,.46,.98),
+            vBlack > 0.5 ? .90 : .78);
+
+        if (vUv.y < .14)
+            c = min(
+                vec3(1.0),
+                c * 1.20 + vec3(.04));
     }
-    fragColor=vec4(c,1);
+
+    fragColor = vec4(c,1);
 }
 )GLSL";
 
-    GLuint v = shader(GL_VERTEX_SHADER, vs);
-    GLuint f = shader(GL_FRAGMENT_SHADER, fs);
+    GLuint v =
+        shader(GL_VERTEX_SHADER, vs);
+    GLuint f =
+        shader(GL_FRAGMENT_SHADER, fs);
+
     if (!v || !f)
         return 0;
 
@@ -78,15 +123,19 @@ void main(){
     glAttachShader(p, v);
     glAttachShader(p, f);
     glLinkProgram(p);
+
     glDeleteShader(v);
     glDeleteShader(f);
 
     GLint ok = 0;
-    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    glGetProgramiv(
+        p, GL_LINK_STATUS, &ok);
+
     if (!ok) {
         glDeleteProgram(p);
         return 0;
     }
+
     return p;
 }
 
@@ -95,29 +144,42 @@ class KeyboardRenderer final
 public:
     ~KeyboardRenderer() override
     {
-        if (vbo_) glDeleteBuffers(1, &vbo_);
-        if (inst_) glDeleteBuffers(1, &inst_);
-        if (vao_) glDeleteVertexArrays(1, &vao_);
-        if (prog_) glDeleteProgram(prog_);
+        if (vbo_)
+            glDeleteBuffers(1, &vbo_);
+        if (inst_)
+            glDeleteBuffers(1, &inst_);
+        if (vao_)
+            glDeleteVertexArrays(1, &vao_);
+        if (prog_)
+            glDeleteProgram(prog_);
     }
 
     QOpenGLFramebufferObject*
-    createFramebufferObject(const QSize& size) override
+    createFramebufferObject(
+        const QSize& size) override
     {
         return new QOpenGLFramebufferObject(size);
     }
 
-    void synchronize(QQuickFramebufferObject* item) override
+    void synchronize(
+        QQuickFramebufferObject* item) override
     {
-        auto* keyboard = static_cast<Keyboard*>(item);
+        auto* keyboard =
+            static_cast<Keyboard*>(item);
+
         auto* controller =
             qobject_cast<MainWindow*>(
                 keyboard->controller());
 
         width_ =
-            std::max(1, int(keyboard->width()));
+            std::max(
+                1,
+                int(keyboard->width()));
+
         height_ =
-            std::max(1, int(keyboard->height()));
+            std::max(
+                1,
+                int(keyboard->height()));
 
         active_ = controller
             ? controller->activePitchMask()
@@ -130,18 +192,23 @@ public:
     {
         if (!prog_)
             init();
+
         if (!prog_)
             return;
 
         if (dirty_)
             rebuild();
 
-        glViewport(0, 0, width_, height_);
+        glViewport(
+            0, 0,
+            width_, height_);
+
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
 
         glClearColor(
             .010f, .010f, .026f, 1.0f);
+
         glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(prog_);
@@ -149,18 +216,20 @@ public:
 
         glDrawArraysInstanced(
             GL_TRIANGLES,
-            0, 6,
+            0,
+            6,
             GLsizei(keys_.size()));
 
         glBindVertexArray(0);
 
-        // GUI-side signals below drive the next synchronize/render.
+        QQuickOpenGLUtils::resetOpenGLState();
     }
 
 private:
     void init()
     {
         prog_ = program();
+
         if (!prog_)
             return;
 
@@ -214,7 +283,7 @@ private:
             GL_FALSE,
             sizeof(KeyInstance),
             reinterpret_cast<void*>(
-                4*sizeof(float)));
+                4 * sizeof(float)));
 
         glVertexAttribDivisor(2, 1);
 
@@ -232,12 +301,15 @@ private:
         keys_.reserve(128);
 
         int whiteTotal = 0;
-        for (int n = 0; n < 128; ++n)
+
+        for (int n = 0; n < 128; ++n) {
             if (!black[n % 12])
                 ++whiteTotal;
+        }
 
         const float ww =
             1.0f / float(whiteTotal);
+
         const float bw =
             ww * 0.58f;
 
@@ -280,7 +352,8 @@ private:
         }
 
         glBindBuffer(
-            GL_ARRAY_BUFFER, inst_);
+            GL_ARRAY_BUFFER,
+            inst_);
 
         glBufferData(
             GL_ARRAY_BUFFER,
@@ -300,6 +373,7 @@ private:
 
     int width_ = 1;
     int height_ = 1;
+
     bool dirty_ = true;
 
     std::array<uint8_t,128> active_{};
@@ -319,33 +393,50 @@ void Keyboard::setController(QObject* controller)
     if (controller_ == controller)
         return;
 
-    if (controller_)
+    if (controller_) {
         QObject::disconnect(
             controller_.data(), nullptr,
             this, nullptr);
+    }
 
     controller_ = controller;
 
     if (auto* player =
             qobject_cast<MainWindow*>(
                 controller_.data())) {
-        // activePitchMask() is time-dependent, so the keyboard must
-        // synchronize whenever playback time changes.
-        connect(
-            player, &MainWindow::currentTimeChanged,
-            this, [this]() { update(); });
+
+        auto requestFrame = [this]() {
+            update();
+
+            if (window())
+                window()->update();
+        };
 
         connect(
-            player, &MainWindow::documentRevisionChanged,
-            this, [this]() { update(); });
+            player,
+            &MainWindow::currentTimeChanged,
+            this,
+            requestFrame);
 
         connect(
-            player, &MainWindow::playingChanged,
-            this, [this]() { update(); });
+            player,
+            &MainWindow::documentRevisionChanged,
+            this,
+            requestFrame);
+
+        connect(
+            player,
+            &MainWindow::playingChanged,
+            this,
+            requestFrame);
     }
 
     emit controllerChanged();
+
     update();
+
+    if (window())
+        window()->update();
 }
 
 QQuickFramebufferObject::Renderer*

@@ -588,10 +588,25 @@ void MainWindow::updateLiveStats()
     const auto npsHi = std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
     const int newNps = static_cast<int>(std::lround((npsHi - npsLo) * 4.0));
 
-    // Same active-polyphony formula as upperBound(start,t)-lowerBound(end,t).
-    const auto started = std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
-    const auto ended = std::lower_bound(noteEnds_.begin(), noteEnds_.end(), t);
-    const int newActive = std::max(0, static_cast<int>(started - ended));
+    // Same active-polyphony formula as MPWGL2:
+    // upperBound(startArr,t) - lowerBound(endArr,t).
+    //
+    // IMPORTANT: do not subtract iterators from noteStarts_ and noteEnds_
+    // directly. They belong to different vectors; doing so is undefined
+    // behavior and produced huge ACTIVE values in the WASM build.
+    const auto startedIt =
+        std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
+    const auto endedIt =
+        std::lower_bound(noteEnds_.begin(), noteEnds_.end(), t);
+
+    const std::ptrdiff_t startedCount =
+        startedIt - noteStarts_.begin();
+    const std::ptrdiff_t endedCount =
+        endedIt - noteEnds_.begin();
+
+    const int newActive = std::max(
+        0,
+        static_cast<int>(startedCount - endedCount));
 
     // CC/s is a moving one-second window, not a coarse per-second bucket.
     const auto ccLo = std::lower_bound(controlTimes_.begin(), controlTimes_.end(), t - 1.0f);
