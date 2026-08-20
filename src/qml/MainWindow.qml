@@ -31,12 +31,6 @@ ApplicationWindow {
         }
     }
 
-    FileDialog {
-        id: fileDialog
-        title: "Open MIDI"
-        nameFilters: ["MIDI files (*.mid *.midi)", "All files (*)"]
-        onAccepted: mainWindow.loadMidiUrl(selectedFile)
-    }
 
     ColorDialog {
         id: colorDialog
@@ -158,7 +152,7 @@ ApplicationWindow {
                             Controls {
                                 width: Math.max(0, parent.width - 8)
                                 mainWindow: mainWindow
-                                onOpenMidiRequested: fileDialog.open()
+                                onOpenMidiRequested: mainWindow.openMidiPicker()
                                 onColorRequested: (channel) => {
                                     window.colorChannel = channel
                                     colorPopup.open()
@@ -184,7 +178,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 mainWindow: mainWindow
-                                onOpenRequested: fileDialog.open()
+                                onOpenRequested: mainWindow.openMidiPicker()
                             }
 
                             Keyboard {

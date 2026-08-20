@@ -85,7 +85,9 @@ public:
     std::array<uint8_t, 128> activePitchMask() const;
 
     Q_INVOKABLE bool loadMidiFile(const QByteArray& data);
+    Q_INVOKABLE bool loadMidiFileNamed(const QByteArray& data, const QString& fileName);
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
+    Q_INVOKABLE void openMidiPicker();
     Q_INVOKABLE void clearFile();
     Q_INVOKABLE void play();
     Q_INVOKABLE void pause();

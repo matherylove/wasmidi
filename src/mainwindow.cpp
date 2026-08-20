@@ -4,12 +4,99 @@
 #include <QFileInfo>
 #include <QTimer>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
+
+
+namespace {
+MainWindow* g_browserMainWindow = nullptr;
+}
+
+#ifdef __EMSCRIPTEN__
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_browser_file_selected(const unsigned char* data,
+                                   int dataSize,
+                                   const char* fileName,
+                                   int fileNameSize)
+{
+    if (!g_browserMainWindow || !data || dataSize <= 0)
+        return;
+
+    const QByteArray midiBytes(reinterpret_cast<const char*>(data), dataSize);
+    const QString name = fileName && fileNameSize > 0
+        ? QString::fromUtf8(fileName, fileNameSize)
+        : QStringLiteral("browser.mid");
+
+    g_browserMainWindow->loadMidiFileNamed(midiBytes, name);
+}
+
+EM_JS(void, wasmidi_browser_open_midi_picker, (), {
+    let input = document.getElementById('wasmidi-midi-file-input');
+    if (!input) {
+        input = document.createElement('input');
+        input.id = 'wasmidi-midi-file-input';
+        input.type = 'file';
+        input.accept = '.mid,.midi,audio/midi,audio/x-midi';
+        input.style.position = 'fixed';
+        input.style.left = '-10000px';
+        input.style.top = '-10000px';
+        input.style.width = '1px';
+        input.style.height = '1px';
+        input.style.opacity = '0';
+        document.body.appendChild(input);
+    }
+
+    input.onchange = async () => {
+        const file = input.files && input.files.length ? input.files[0] : null;
+        if (!file) {
+            input.value = '';
+            return;
+        }
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const bytes = new Uint8Array(buffer);
+            const nameBytes = new TextEncoder().encode(file.name || 'browser.mid');
+
+            const dataPtr = _malloc(Math.max(1, bytes.length));
+            const namePtr = _malloc(Math.max(1, nameBytes.length));
+
+            if (bytes.length)
+                HEAPU8.set(bytes, dataPtr);
+            if (nameBytes.length)
+                HEAPU8.set(nameBytes, namePtr);
+
+            _wasmidi_browser_file_selected(
+                dataPtr,
+                bytes.length,
+                namePtr,
+                nameBytes.length
+            );
+
+            _free(dataPtr);
+            _free(namePtr);
+        } catch (error) {
+            console.error('[WASMIDI] Could not read selected MIDI file:', error);
+        }
+
+        // Allow selecting the same file again.
+        input.value = '';
+    };
+
+    // Because this is invoked directly from the QML click handler, the
+    // browser keeps the user-activation token and opens the native OS picker.
+    input.click();
+});
+#endif
 
 MainWindow::MainWindow(QObject *parent)
     : QObject(parent)
 {
+    g_browserMainWindow = this;
     static const QColor defaults[16] = {
         QColor("#818cf8"), QColor("#a78bfa"), QColor("#c084fc"), QColor("#e879f9"),
         QColor("#f472b6"), QColor("#fb7185"), QColor("#fb923c"), QColor("#facc15"),
@@ -25,7 +112,11 @@ MainWindow::MainWindow(QObject *parent)
     timer->start(16);
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow()
+{
+    if (g_browserMainWindow == this)
+        g_browserMainWindow = nullptr;
+}
 
 QVariantList MainWindow::channelColorList() const
 {
@@ -53,12 +144,15 @@ bool MainWindow::loadMidiUrl(const QUrl& url)
         return false;
     }
 
-    fileName_ = QFileInfo(localPath).fileName();
-    emit fileNameChanged();
-    return loadMidiFile(file.readAll());
+    return loadMidiFileNamed(file.readAll(), QFileInfo(localPath).fileName());
 }
 
 bool MainWindow::loadMidiFile(const QByteArray& data)
+{
+    return loadMidiFileNamed(data, fileName_);
+}
+
+bool MainWindow::loadMidiFileNamed(const QByteArray& data, const QString& fileName)
 {
     wasmidi::MidiDocument parsed;
     if (!parser_.parse(reinterpret_cast<const uint8_t*>(data.constData()),
@@ -71,6 +165,11 @@ bool MainWindow::loadMidiFile(const QByteArray& data)
     document_ = std::move(parsed);
     scheduler_.setDocument(&document_);
 
+    if (!fileName.isEmpty()) {
+        fileName_ = fileName;
+        emit fileNameChanged();
+    }
+
     publishDocumentMetadata();
     rebuildDerivedStats();
 
@@ -78,6 +177,15 @@ bool MainWindow::loadMidiFile(const QByteArray& data)
     emit documentRevisionChanged();
     emit fileLoaded();
     return true;
+}
+
+void MainWindow::openMidiPicker()
+{
+#ifdef __EMSCRIPTEN__
+    wasmidi_browser_open_midi_picker();
+#else
+    emit loadFailed(QStringLiteral("The browser MIDI picker is available in the WebAssembly build."));
+#endif
 }
 
 void MainWindow::clearFile()
