@@ -7,18 +7,28 @@ import Wasmidi
 ApplicationWindow {
     id: window
     visible: true
-    width: 1280
-    height: 800
-    minimumWidth: 900
-    minimumHeight: 600
+    width: 1440
+    height: 900
+    minimumWidth: 840
+    minimumHeight: 560
     color: "#07071a"
     title: mainWindow.fileName.length ? "WASMIDI — " + mainWindow.fileName : "WASMIDI"
 
     property int colorChannel: 0
+    property bool sidebarCollapsed: false
+    property var presetColors: [
+        "#818cf8", "#a78bfa", "#c084fc", "#e879f9",
+        "#f472b6", "#fb7185", "#fb923c", "#facc15",
+        "#a3e635", "#4ade80", "#34d399", "#2dd4bf",
+        "#22d3ee", "#38bdf8", "#60a5fa", "#8b5cf6"
+    ]
 
     PlayerController {
         id: mainWindow
-        onLoadFailed: (message) => errorDialog.text = message
+        onLoadFailed: (message) => {
+            errorDialog.text = message
+            errorDialog.open()
+        }
     }
 
     FileDialog {
@@ -30,8 +40,11 @@ ApplicationWindow {
 
     ColorDialog {
         id: colorDialog
-        title: "Channel color"
-        onAccepted: mainWindow.setChannelColor(window.colorChannel, selectedColor)
+        title: "Custom channel color"
+        onAccepted: {
+            mainWindow.setChannelColor(window.colorChannel, selectedColor)
+            colorPopup.close()
+        }
     }
 
     MessageDialog {
@@ -49,108 +62,247 @@ ApplicationWindow {
 
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 46
-                color: "#0a0820"
-                border.color: "#241b4b"
+                Layout.preferredHeight: 38
+                color: "#09071d"
+                border.color: "#21173b"
                 border.width: 1
 
                 RowLayout {
                     anchors.fill: parent
-                    anchors.leftMargin: 14
-                    anchors.rightMargin: 14
-                    spacing: 10
+                    anchors.leftMargin: Math.max(14, (parent.width - 1140) / 2)
+                    anchors.rightMargin: Math.max(14, (parent.width - 1140) / 2)
+                    spacing: 8
 
-                    Label {
-                        text: "WASMIDI"
-                        color: "#c4b5fd"
-                        font.pixelSize: 18
-                        font.bold: true
+                    RowLayout {
+                        spacing: 7
+                        Rectangle {
+                            implicitWidth: 22
+                            implicitHeight: 22
+                            radius: 5
+                            color: "#17102e"
+                            border.color: "#6d4dd0"
+                            Text {
+                                anchors.centerIn: parent
+                                text: "◇"
+                                color: "#a78bfa"
+                                font.pixelSize: 15
+                                font.bold: true
+                            }
+                        }
+                        Text {
+                            text: "Dekxtopia"
+                            color: "#c4b5fd"
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
                     }
-                    Rectangle {
-                        implicitWidth: 47
-                        implicitHeight: 20
-                        radius: 10
-                        color: "#24154d"
-                        border.color: "#5633a8"
-                        Label { anchors.centerIn: parent; text: "WASM"; color: "#a78bfa"; font.pixelSize: 9; font.bold: true }
-                    }
+
                     Item { Layout.fillWidth: true }
-                    Label {
-                        visible: mainWindow.fileName.length > 0
-                        text: mainWindow.fileName
-                        color: "#7c7395"
-                        elide: Text.ElideMiddle
-                        Layout.maximumWidth: 380
+
+                    Text {
+                        text: "Home"
+                        color: "#756b8d"
+                        font.pixelSize: 11
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: Qt.openUrlExternally("https://matherylove.github.io/") }
                     }
-                    Button {
-                        text: "Open MIDI"
-                        onClicked: fileDialog.open()
+
+                    Rectangle {
+                        implicitWidth: 146
+                        implicitHeight: 25
+                        radius: 6
+                        color: "#1a1038"
+                        border.color: "#2b1b55"
+                        Row {
+                            anchors.centerIn: parent
+                            spacing: 7
+                            Text { text: "MIDI Player WebGL2"; color: "#c4b5fd"; font.pixelSize: 10; font.bold: true }
+                            Rectangle {
+                                width: 29; height: 14; radius: 7
+                                color: "#4b287c"
+                                Text { anchors.centerIn: parent; text: "NEW"; color: "#c4b5fd"; font.pixelSize: 7; font.bold: true }
+                            }
+                        }
                     }
                 }
             }
 
-            RowLayout {
+            Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 0
 
-                Rectangle {
-                    Layout.preferredWidth: 320
-                    Layout.minimumWidth: 280
-                    Layout.fillHeight: true
-                    color: "#0b091a"
-                    border.color: "#211a3e"
+                RowLayout {
+                    anchors.fill: parent
+                    spacing: 0
 
-                    ScrollView {
-                        anchors.fill: parent
-                        anchors.margins: 8
+                    Rectangle {
+                        id: sidebar
+                        Layout.preferredWidth: window.sidebarCollapsed ? 0 : 320
+                        Layout.minimumWidth: window.sidebarCollapsed ? 0 : 280
+                        Layout.maximumWidth: window.sidebarCollapsed ? 0 : 360
+                        Layout.fillHeight: true
+                        color: "#090817"
+                        border.color: "#1d1731"
                         clip: true
-                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-                        Controls {
-                            width: Math.max(0, parent.width - 8)
-                            mainWindow: mainWindow
-                            onOpenMidiRequested: fileDialog.open()
-                            onColorRequested: (channel) => {
-                                window.colorChannel = channel
-                                colorDialog.open()
+
+                        ScrollView {
+                            anchors.fill: parent
+                            anchors.leftMargin: 9
+                            anchors.rightMargin: 9
+                            anchors.topMargin: 7
+                            anchors.bottomMargin: 7
+                            clip: true
+                            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+                            Controls {
+                                width: Math.max(0, parent.width - 8)
+                                mainWindow: mainWindow
+                                onOpenMidiRequested: fileDialog.open()
+                                onColorRequested: (channel) => {
+                                    window.colorChannel = channel
+                                    colorPopup.open()
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        color: "#07071a"
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            anchors.topMargin: 6
+                            anchors.bottomMargin: 6
+                            spacing: 5
+
+                            PianoRoll {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                mainWindow: mainWindow
+                                onOpenRequested: fileDialog.open()
+                            }
+
+                            Keyboard {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: Math.max(105, Math.min(145, window.height * 0.16))
+                                mainWindow: mainWindow
                             }
                         }
                     }
                 }
 
                 Rectangle {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    color: "#07071a"
+                    id: sidebarFab
+                    width: 46
+                    height: 46
+                    radius: 23
+                    anchors.left: parent.left
+                    anchors.bottom: parent.bottom
+                    anchors.leftMargin: 18
+                    anchors.bottomMargin: 18
+                    color: window.sidebarCollapsed ? "#251548" : "#151526"
+                    border.color: window.sidebarCollapsed ? "#7c4dff" : "#3c3b55"
+                    border.width: 1
+                    z: 20
 
-                    ColumnLayout {
+                    Column {
+                        anchors.centerIn: parent
+                        spacing: 4
+                        Repeater {
+                            model: 3
+                            Rectangle {
+                                width: index === 1 ? 15 : 22
+                                height: 2
+                                radius: 1
+                                color: "#c8c6d3"
+                                anchors.horizontalCenter: parent.horizontalCenter
+                            }
+                        }
+                    }
+                    MouseArea {
                         anchors.fill: parent
-                        anchors.margins: 8
-                        spacing: 6
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: window.sidebarCollapsed = !window.sidebarCollapsed
+                    }
+                }
+            }
+        }
+    }
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 28
-                            Label { text: "PIANO ROLL"; color: "#746a91"; font.pixelSize: 10; font.bold: true; font.letterSpacing: 1.2 }
-                            Item { Layout.fillWidth: true }
-                            Label { text: mainWindow.noteCount.toLocaleString() + " notes"; color: "#655d78"; font.pixelSize: 10 }
-                            Label { text: mainWindow.activeVoices + " active"; color: "#a78bfa"; font.pixelSize: 10 }
-                        }
+    Popup {
+        id: colorPopup
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: 250
+        height: 195
+        modal: false
+        focus: true
+        padding: 0
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
-                        PianoRoll {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            mainWindow: mainWindow
-                        }
+        background: Rectangle {
+            radius: 10
+            color: "#0d0b1e"
+            border.color: "#38275e"
+            border.width: 1
+        }
 
-                        Keyboard {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 122
-                            mainWindow: mainWindow
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 12
+            spacing: 9
+
+            RowLayout {
+                Layout.fillWidth: true
+                Text {
+                    text: "Ch " + (window.colorChannel + 1) + " — Color"
+                    color: "#c4b5fd"
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+                Item { Layout.fillWidth: true }
+                Text { text: "✕"; color: "#766d89"; font.pixelSize: 13; MouseArea { anchors.fill: parent; onClicked: colorPopup.close() } }
+            }
+
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 4
+                rowSpacing: 6
+                columnSpacing: 6
+                Repeater {
+                    model: window.presetColors
+                    delegate: Rectangle {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 27
+                        radius: 5
+                        color: modelData
+                        border.color: "#ffffff55"
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                mainWindow.setChannelColor(window.colorChannel, parent.color)
+                                colorPopup.close()
+                            }
                         }
                     }
                 }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 31
+                radius: 6
+                color: "#17122a"
+                border.color: "#33264e"
+                Text { anchors.centerIn: parent; text: "Custom color…"; color: "#a78bfa"; font.pixelSize: 10; font.bold: true }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: colorDialog.open() }
             }
         }
     }

@@ -25,7 +25,7 @@ void main(){ vec2 p=aRect.xy+aCorner*aRect.zw; gl_Position=vec4(p*2.0-1.0,0,1); 
     static const char* fs=R"(#version 300 es
 precision mediump float;
 in float vBlack; in float vActive; out vec4 fragColor;
-void main(){ vec3 c=vBlack>0.5?vec3(.055,.047,.105):vec3(.78,.79,.86); if(vActive>0.5)c=mix(c,vec3(.65,.55,.98),.88); fragColor=vec4(c,1); }
+void main(){ vec3 c=vBlack>0.5?vec3(.025,.026,.050):vec3(.075,.082,.130); if(vActive>0.5)c=mix(c,vec3(.65,.55,.98),.90); fragColor=vec4(c,1); }
 )";
     GLuint v=shader(GL_VERTEX_SHADER,vs), f=shader(GL_FRAGMENT_SHADER,fs); if(!v||!f)return 0;
     GLuint p=glCreateProgram(); glAttachShader(p,v); glAttachShader(p,f); glLinkProgram(p); glDeleteShader(v); glDeleteShader(f); return p;
@@ -43,7 +43,7 @@ public:
     }
     void render() override {
         if(!prog_) init(); if(dirty_) rebuild();
-        glViewport(0,0,width_,height_); glClearColor(.027f,.027f,.102f,1); glClear(GL_COLOR_BUFFER_BIT);
+        glViewport(0,0,width_,height_); glClearColor(.018f,.018f,.050f,1); glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(prog_); glBindVertexArray(vao_); glDrawArraysInstanced(GL_TRIANGLES,0,6,(GLsizei)keys_.size()); glBindVertexArray(0); update();
     }
 private:

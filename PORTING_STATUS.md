@@ -36,3 +36,24 @@ No files under `old/` are modified by this overlay.
 - Pull requests build and upload a reproducible WASM artifact but do not deploy.
 - Only a successful push to `main` uploads the Pages artifact and deploys it.
 - `QQuickFramebufferObject` requires the Qt Quick OpenGL backend, so `main.cpp` forces `QSGRendererInterface::OpenGL` before creating any window.
+
+## GUI parity pass (Pass 2)
+
+Ported the remaining MPWGL2 player shell into Qt/QML while keeping `old/` untouched:
+
+- Dekxtopia navigation/header styling
+- Black MIDI Player hero badge
+- file bar with clear action
+- Active / NPS / BPM live cards
+- compact transport, seek, volume, note-speed, and auto/manual post-buffer controls
+- per-track toggle and 16 interactive channel color chips
+- NPS timeline plus NPS / polyphony / BPM / CC/s / skipped-velocity HUD charts
+- MIDI Out / MIDI In / Off / Embedded Synth tabbed panels
+- conditional File Info grid with active channels and pitch range
+- WebGL roll empty-state neural background, drop target, click-to-open, and FPS HUD
+- collapsible sidebar FAB
+- dark MPWGL2-style WebGL keyboard palette and octave labels
+
+Controller additions for real GUI metrics: active channel count, CC events per second, pitch range, channel-color list, clear-file action, output mode parity, and auto post-buffer state.
+
+The Web MIDI and SnappySynth controls are intentionally present but not falsely wired: browser MIDI enumeration and the native SF2 synth are subsequent engine-port milestones.

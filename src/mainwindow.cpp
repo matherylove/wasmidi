@@ -27,6 +27,15 @@ MainWindow::MainWindow(QObject *parent)
 
 MainWindow::~MainWindow() = default;
 
+QVariantList MainWindow::channelColorList() const
+{
+    QVariantList result;
+    result.reserve(channelColors_.size());
+    for (const auto& color : channelColors_)
+        result.push_back(color);
+    return result;
+}
+
 void MainWindow::setPlaying(bool playing)
 {
     if (isPlaying_ == playing)
@@ -71,6 +80,58 @@ bool MainWindow::loadMidiFile(const QByteArray& data)
     return true;
 }
 
+void MainWindow::clearFile()
+{
+    stop();
+    scheduler_.setDocument(nullptr);
+    document_ = wasmidi::MidiDocument{};
+    fileName_.clear();
+
+    duration_ = 0.0f;
+    noteCount_ = 0;
+    trackCount_ = 0;
+    activeVoices_ = 0;
+    activeChannelCount_ = 0;
+    nps_ = 0;
+    ccPerSecond_ = 0;
+    bpm_ = 120.0f;
+    midiFormat_ = 0;
+    ppq_ = 480;
+    tempoChangeCount_ = 0;
+    controlEventCount_ = 0;
+    peakNps_ = 0;
+    peakPolyphony_ = 0;
+    pitchRange_ = QStringLiteral("—");
+    skippedVelocity_ = 0;
+
+    noteStarts_.clear();
+    noteEnds_.clear();
+    npsBuckets_.clear();
+    ccBuckets_.clear();
+    for (auto& v : pitchStarts_) v.clear();
+    for (auto& v : pitchEnds_) v.clear();
+
+    ++documentRevision_;
+    emit fileNameChanged();
+    emit durationChanged();
+    emit noteCountChanged();
+    emit trackCountChanged();
+    emit activeVoicesChanged();
+    emit activeChannelCountChanged();
+    emit npsChanged();
+    emit ccPerSecondChanged();
+    emit bpmChanged();
+    emit midiFormatChanged();
+    emit ppqChanged();
+    emit tempoChangeCountChanged();
+    emit controlEventCountChanged();
+    emit peakNpsChanged();
+    emit peakPolyphonyChanged();
+    emit pitchRangeChanged();
+    emit skippedVelocityChanged();
+    emit documentRevisionChanged();
+}
+
 void MainWindow::publishDocumentMetadata()
 {
     duration_ = document_.durationSeconds;
@@ -80,6 +141,25 @@ void MainWindow::publishDocumentMetadata()
     ppq_ = document_.ticksPerBeat;
     tempoChangeCount_ = static_cast<int>(document_.tempoMap.size());
     controlEventCount_ = static_cast<int>(document_.controls.size());
+
+    uint32_t channelMask = 0;
+    for (const auto mask : document_.activeChannelMasks)
+        channelMask |= mask;
+    activeChannelCount_ = 0;
+    for (int channel = 0; channel < 16; ++channel)
+        activeChannelCount_ += (channelMask & (1u << channel)) ? 1 : 0;
+
+    if (!document_.notes.empty()) {
+        uint8_t minPitch = 127;
+        uint8_t maxPitch = 0;
+        for (const auto& note : document_.notes) {
+            minPitch = std::min(minPitch, note.pitch);
+            maxPitch = std::max(maxPitch, note.pitch);
+        }
+        pitchRange_ = QStringLiteral("%1–%2").arg(minPitch).arg(maxPitch);
+    } else {
+        pitchRange_ = QStringLiteral("—");
+    }
 
     if (!document_.tempoMap.empty() && document_.tempoMap.front().microsecondsPerBeat != 0)
         bpm_ = 60000000.0f / static_cast<float>(document_.tempoMap.front().microsecondsPerBeat);
@@ -93,6 +173,8 @@ void MainWindow::publishDocumentMetadata()
     emit ppqChanged();
     emit tempoChangeCountChanged();
     emit controlEventCountChanged();
+    emit activeChannelCountChanged();
+    emit pitchRangeChanged();
     emit bpmChanged();
 }
 
@@ -101,6 +183,7 @@ void MainWindow::rebuildDerivedStats()
     noteStarts_.clear();
     noteEnds_.clear();
     npsBuckets_.clear();
+    ccBuckets_.clear();
     for (auto& v : pitchStarts_) v.clear();
     for (auto& v : pitchEnds_) v.clear();
     peakNps_ = 0;
@@ -111,6 +194,7 @@ void MainWindow::rebuildDerivedStats()
 
     const auto bucketCount = static_cast<std::size_t>(std::max(1.0f, std::ceil(duration_) + 1.0f));
     npsBuckets_.assign(bucketCount, 0);
+    ccBuckets_.assign(bucketCount, 0);
 
     struct Edge { float time; int delta; };
     std::vector<Edge> edges;
@@ -126,6 +210,12 @@ void MainWindow::rebuildDerivedStats()
             peakNps_ = std::max(peakNps_, ++npsBuckets_[bucket]);
         edges.push_back({note.startTime, +1});
         edges.push_back({note.endTime, -1});
+    }
+
+    for (const auto& event : document_.controls) {
+        const auto bucket = static_cast<std::size_t>(std::max(0.0f, std::floor(event.time)));
+        if (bucket < ccBuckets_.size())
+            ++ccBuckets_[bucket];
     }
 
     std::sort(noteStarts_.begin(), noteStarts_.end());
@@ -207,10 +297,26 @@ void MainWindow::setNoteSpeed(float speed)
 void MainWindow::setPostBuffer(float buffer)
 {
     const float clamped = std::clamp(buffer, 0.0f, 10.0f);
+    const bool autoWasEnabled = postBufferAuto_;
+    postBufferAuto_ = false;
+    if (autoWasEnabled)
+        emit postBufferAutoChanged();
     if (qFuzzyCompare(postBuffer_, clamped))
         return;
     postBuffer_ = clamped;
     emit postBufferChanged();
+}
+
+void MainWindow::setPostBufferAuto()
+{
+    const bool changed = !postBufferAuto_;
+    postBufferAuto_ = true;
+    if (!qFuzzyIsNull(postBuffer_)) {
+        postBuffer_ = 0.0f;
+        emit postBufferChanged();
+    }
+    if (changed)
+        emit postBufferAutoChanged();
 }
 
 void MainWindow::setPerTrackColors(bool enable)
@@ -232,7 +338,13 @@ void MainWindow::setVolume(int value)
 
 void MainWindow::setOutputMode(const QString& mode)
 {
-    const QString normalized = mode == QStringLiteral("native") ? QStringLiteral("native") : QStringLiteral("embedded");
+    QString normalized = mode.toLower();
+    if (normalized != QStringLiteral("native") &&
+        normalized != QStringLiteral("input") &&
+        normalized != QStringLiteral("off") &&
+        normalized != QStringLiteral("embedded")) {
+        normalized = QStringLiteral("off");
+    }
     if (outputMode_ == normalized)
         return;
     outputMode_ = normalized;
@@ -254,11 +366,13 @@ void MainWindow::updateLiveStats()
     if (document_.notes.empty()) {
         if (nps_ != 0) { nps_ = 0; emit npsChanged(); }
         if (activeVoices_ != 0) { activeVoices_ = 0; emit activeVoicesChanged(); }
+        if (ccPerSecond_ != 0) { ccPerSecond_ = 0; emit ccPerSecondChanged(); }
         return;
     }
 
     const auto sec = static_cast<std::size_t>(std::max(0.0f, std::floor(currentTime_)));
     const int newNps = sec < npsBuckets_.size() ? npsBuckets_[sec] : 0;
+    const int newCc = sec < ccBuckets_.size() ? ccBuckets_[sec] : 0;
 
     const auto started = std::upper_bound(noteStarts_.begin(), noteStarts_.end(), currentTime_) - noteStarts_.begin();
     const auto ended = std::lower_bound(noteEnds_.begin(), noteEnds_.end(), currentTime_) - noteEnds_.begin();
@@ -267,6 +381,10 @@ void MainWindow::updateLiveStats()
     if (nps_ != newNps) {
         nps_ = newNps;
         emit npsChanged();
+    }
+    if (ccPerSecond_ != newCc) {
+        ccPerSecond_ = newCc;
+        emit ccPerSecondChanged();
     }
     if (activeVoices_ != newActive) {
         activeVoices_ = newActive;

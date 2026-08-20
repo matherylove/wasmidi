@@ -1,51 +1,62 @@
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 
-Rectangle {
+Item {
     id: root
     required property var mainWindow
-    implicitHeight: 148
-    color: "#0e0b20"
-    radius: 8
-    border.color: "#251b48"
+    implicitHeight: 142
 
-    GridLayout {
+    ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 9
-        columns: 3
-        rowSpacing: 5
-        columnSpacing: 8
+        spacing: 4
 
-        Repeater {
-            model: [
-                ["Notes", root.mainWindow.noteCount.toLocaleString()],
-                ["Tracks", root.mainWindow.trackCount.toString()],
-                ["Duration", formatTime(root.mainWindow.duration)],
-                ["Format", root.mainWindow.midiFormat.toString()],
-                ["PPQ", root.mainWindow.ppq.toString()],
-                ["Tempo", root.mainWindow.bpm.toFixed(1) + " BPM"],
-                ["Tempo chg", root.mainWindow.tempoChangeCount.toString()],
-                ["CC events", root.mainWindow.controlEventCount.toLocaleString()],
-                ["Peak NPS", root.mainWindow.peakNps.toLocaleString()],
-                ["Peak poly", root.mainWindow.peakPolyphony.toLocaleString()],
-                ["Live NPS", root.mainWindow.nps.toLocaleString()],
-                ["Active", root.mainWindow.activeVoices.toLocaleString()]
-            ]
+        Text {
+            text: "FILE INFO"
+            color: "#6f6685"
+            font.pixelSize: 9
+            font.bold: true
+            font.letterSpacing: 1.1
+        }
 
-            delegate: Rectangle {
-                required property var modelData
-                Layout.fillWidth: true
-                Layout.preferredHeight: 28
-                color: "#110e26"
-                radius: 5
-                Column {
-                    anchors.fill: parent
-                    anchors.leftMargin: 6
-                    anchors.topMargin: 3
-                    spacing: 0
-                    Text { text: modelData[0].toUpperCase(); color: "#554c69"; font.pixelSize: 7; font.bold: true }
-                    Text { text: modelData[1]; color: "#c4b5fd"; font.pixelSize: 11; font.bold: true }
+        GridLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            columns: 3
+            rowSpacing: 4
+            columnSpacing: 4
+
+            Repeater {
+                model: [
+                    ["Notes", root.mainWindow.noteCount.toLocaleString()],
+                    ["Tracks", root.mainWindow.trackCount.toString()],
+                    ["Dur", formatTime(root.mainWindow.duration)],
+                    ["BPM", root.mainWindow.bpm.toFixed(0)],
+                    ["Chs", root.mainWindow.activeChannelCount.toString()],
+                    ["Fmt", root.mainWindow.midiFormat.toString()],
+                    ["PPQ", root.mainWindow.ppq.toString()],
+                    ["Tmp Chg", root.mainWindow.tempoChangeCount.toString()],
+                    ["Pk NPS", root.mainWindow.peakNps.toLocaleString()],
+                    ["Pk Poly", root.mainWindow.peakPolyphony.toLocaleString()],
+                    ["CC Evts", root.mainWindow.controlEventCount.toLocaleString()],
+                    ["Pitch", root.mainWindow.pitchRange]
+                ]
+
+                delegate: Rectangle {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    radius: 4
+                    color: "#0d0b1c"
+                    border.color: "#1d172e"
+                    border.width: 1
+                    Column {
+                        anchors.fill: parent
+                        anchors.leftMargin: 6
+                        anchors.topMargin: 3
+                        spacing: 0
+                        Text { text: modelData[0].toUpperCase(); color: "#554d66"; font.pixelSize: 6; font.bold: true; font.letterSpacing: 0.4 }
+                        Text { text: modelData[1]; color: "#bdb0d5"; font.pixelSize: 9; font.bold: true; elide: Text.ElideRight; width: parent.width - 5 }
+                    }
                 }
             }
         }
