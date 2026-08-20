@@ -476,6 +476,11 @@ uint8_t GLRenderer::colorIndexFor(
 
 void GLRenderer::initTextures(int width, int height)
 {
+    // QQuickFramebufferObject already has its own FBO bound when render()
+    // starts. Preserve it while creating the two MPWGL2 scroll textures.
+    GLint previousFramebuffer = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+
     destroyTextures();
 
     textureWidth_ = std::max(1, width);
@@ -536,6 +541,13 @@ void GLRenderer::initTextures(int width, int height)
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
+
+    // Critical difference from Pass 6: do not leave our private scroll FBO
+    // bound. Restore Qt's QQuickFramebufferObject target, equivalent to the
+    // legacy renderer's gl.bindFramebuffer(..., null).
+    glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        static_cast<GLuint>(previousFramebuffer));
 
     frontIndex_ = 0;
     forceFullRedraw_ = true;
@@ -757,6 +769,12 @@ void GLRenderer::scrollAndAdvance(
         return;
     }
 
+    // Save Qt's current render target. MPWGL2 binds its private FBO for the
+    // scroll pass and explicitly unbinds it BEFORE modifying the resulting
+    // texture with texSubImage2D(). We must do the same here.
+    GLint previousFramebuffer = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+
     const int backIndex =
         frontIndex_ == 0 ? 1 : 0;
 
@@ -789,6 +807,13 @@ void GLRenderer::scrollAndAdvance(
         GL_TRIANGLE_STRIP,
         0, 4);
     glBindVertexArray(0);
+
+    // This restore is essential. Without it texture[backIndex] is still
+    // attached to the active framebuffer when texSubImage2D() below tries to
+    // write the newly exposed right-hand strip.
+    glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        static_cast<GLuint>(previousFramebuffer));
 
     frontIndex_ = backIndex;
 
