@@ -47,15 +47,12 @@ target_link_libraries(wasmidi PRIVATE
 )
 
 if(EMSCRIPTEN)
-    set_target_properties(wasmidi PROPERTIES SUFFIX ".html")
+    # Qt for WebAssembly owns the generated HTML/JS/WASM packaging.
+    # Do not force the executable suffix to .html: Qt links the modularized
+    # runtime with a custom EXPORT_NAME and generates wasmidi.html separately.
     target_link_options(wasmidi PRIVATE
-        "-sUSE_WEBGL2=1"
         "-sFULL_ES3=1"
         "-sMIN_WEBGL_VERSION=2"
         "-sMAX_WEBGL_VERSION=2"
-        "-sALLOW_MEMORY_GROWTH=1"
-        "-sINITIAL_MEMORY=134217728"
-        "-sSTACK_SIZE=5242880"
-        "-O3"
     )
 endif()
