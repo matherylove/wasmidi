@@ -53,15 +53,19 @@ jobs:
           cmake --version
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}"
           echo "QT_HOST_PATH=${QT_HOST_PATH}"
-          test -x "${QT_ROOT_DIR}/bin/qt-cmake"
+          test -f "${QT_ROOT_DIR}/lib/cmake/Qt6/qt.toolchain.cmake"
+          test -d "${QT_HOST_PATH}"
 
       - name: Configure
         run: |
-          "${QT_ROOT_DIR}/bin/qt-cmake" \
+          cmake \
             -S . \
             -B build \
             -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${QT_ROOT_DIR}/lib/cmake/Qt6/qt.toolchain.cmake" \
+            -DCMAKE_PREFIX_PATH="${QT_ROOT_DIR}" \
+            -DQT_HOST_PATH="${QT_HOST_PATH}"
 
       - name: Build
         run: cmake --build build --parallel 2
