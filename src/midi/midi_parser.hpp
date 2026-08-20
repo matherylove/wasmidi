@@ -7,6 +7,11 @@
 namespace wasmidi {
 
 struct NoteEvent {
+    // Keep the original tick domain as well as seconds. MPWGL2's optimized
+    // renderer scrolls in ticks and only converts the authoritative playback
+    // clock from seconds -> ticks.
+    uint32_t startTick = 0;
+    uint32_t endTick = 0;
     float startTime = 0.0f;
     float endTime = 0.0f;
     uint8_t pitch = 0;
