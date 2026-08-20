@@ -389,7 +389,7 @@ std::size_t GLRenderer::lowerBoundTick(double tick) const
     return static_cast<std::size_t>(
         std::lower_bound(
             notes_->begin(), notes_->end(), tick,
-            [](const NoteInstance& note, double value) {
+            [](const NoteEvent& note, double value) {
                 return double(note.startTick) < value;
             }) - notes_->begin());
 }
@@ -400,7 +400,7 @@ std::size_t GLRenderer::upperBoundTick(double tick) const
     return static_cast<std::size_t>(
         std::upper_bound(
             notes_->begin(), notes_->end(), tick,
-            [](double value, const NoteInstance& note) {
+            [](double value, const NoteEvent& note) {
                 return value < double(note.startTick);
             }) - notes_->begin());
 }
@@ -606,7 +606,7 @@ void GLRenderer::writeStrip(
     for (std::size_t i = searchFrom;
          i < searchTo && i < notes_->size();
          ++i) {
-        const NoteInstance& note = (*notes_)[i];
+        const NoteEvent& note = (*notes_)[i];
 
         const double startTick =
             double(note.startTick);

@@ -79,7 +79,7 @@ EM_JS(void, wasmidi_browser_open_midi_picker, (), {
     input.onchange = async () => {
         const file = input.files && input.files.length ? input.files[0] : null;
         if (!file) {
-            input.value = '';
+            input.value = null;
             return;
         }
 
@@ -109,7 +109,7 @@ EM_JS(void, wasmidi_browser_open_midi_picker, (), {
             console.error('[WASMIDI] Could not read selected MIDI file:', error);
         }
 
-        input.value = '';
+        input.value = null;
     };
 
     input.click();
