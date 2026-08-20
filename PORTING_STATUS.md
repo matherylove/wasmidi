@@ -1,39 +1,27 @@
-# WASMIDI Pass 6.5 — DPR resolution + single frame scheduling
+# WASMIDI Pass 6.6 — high-FPS hot-path optimization
 
-## Resolution fix
-Qt's QQuickFramebufferObject::Renderer::createFramebufferObject(size) receives
-a size that already includes devicePixelRatio. Pass 6.4 ignored that physical
-size and resized GLRenderer using QML item's logical width/height.
+## Ring texture
+Replaces the two-texture / private-FBO scroll copy with one circular texture.
+Playback advances an integer ring origin and uploads only the newly exposed
+columns. The fullscreen scroll blit is eliminated.
 
-The roll and keyboard now use framebufferObject()->size() as their OpenGL
-viewport/private-texture resolution. No manual DPR multiplication is done.
+## MPWGL2 raster density
+The original rollCanvas uses CSS-pixel dimensions rather than multiplying by
+devicePixelRatio. Qt supplies a DPR-scaled FBO request, so this pass divides it
+back to CSS pixels when creating the roll and keyboard FBOs. Unlike the old
+viewport mismatch, the FBO itself and renderer texture now have the same size.
 
-## Frame scheduling
-The piano roll no longer gets normal-playback frame requests from both:
-- MainWindow::currentTimeChanged -> item/window update
-- Renderer::update()
+## Keyboard dirty-only
+MainWindow caches the 128-key active mask and emits activePitchesChanged only
+when key state changes. Keyboard no longer renders continuously.
 
-Renderer::update() is now the single continuous roll loop while playing.
-GUI-side synchronization only happens for document/config/play state and
-paused/large position jumps.
+## Neural background
+The expensive QML Canvas is frozen while MIDI is playing. It resumes at 30 Hz
+when idle/paused.
 
-The keyboard also uses a render-thread monotonic clock and binary-searches
-per-pitch note intervals, avoiding a GUI update on every 16 ms clock tick.
+## Charts
+All mini charts and the NPS timeline share one 33 ms timer.
 
-## QML performance
-- Replaced the 16 ms neural-background Timer and fake timer-count FPS meter
-  with Qt Quick FrameAnimation.
-- FPS now uses FrameAnimation.smoothFrameTime.
-- Neural background runs at display cadence while idle and every other frame
-  while MIDI playback is active.
-- Mini charts retain MPWGL2's 30 Hz sample rate but no longer have an extra
-  60 Hz repaint Timer per chart.
-- Timeline repaint reduced to 30 Hz.
-
-Files:
-- src/mainwindow.cpp
-- src/pianoroll.cpp
-- src/keyboard.cpp
-- src/renderer/gl_renderer.cpp
-- src/qml/PianoRoll.qml
-- src/qml/Controls.qml
+## FPS
+PianoRollRenderer measures completed C++ render() calls directly. QML samples
+that number every 500 ms without FrameAnimation or another frame-driving loop.

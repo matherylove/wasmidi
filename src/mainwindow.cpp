@@ -479,6 +479,8 @@ void MainWindow::stop()
         bpm_ = tempoBpms_.front();
         emit bpmChanged();
     }
+
+    updateActivePitchMask();
 }
 
 void MainWindow::seek(float seconds)
@@ -577,6 +579,7 @@ void MainWindow::updateLiveStats()
         if (nps_ != 0) { nps_ = 0; emit npsChanged(); }
         if (activeVoices_ != 0) { activeVoices_ = 0; emit activeVoicesChanged(); }
         if (ccPerSecond_ != 0) { ccPerSecond_ = 0; emit ccPerSecondChanged(); }
+        updateActivePitchMask();
         return;
     }
 
@@ -639,6 +642,47 @@ void MainWindow::updateLiveStats()
         bpm_ = newBpm;
         emit bpmChanged();
     }
+
+    updateActivePitchMask();
+}
+
+
+void MainWindow::updateActivePitchMask()
+{
+    std::array<uint8_t, 128> next{};
+
+    if (!document_.notes.empty()) {
+        const float t = currentTime_;
+
+        for (std::size_t pitch = 0;
+             pitch < next.size();
+             ++pitch) {
+            const auto& starts = pitchStarts_[pitch];
+            const auto& ends = pitchEnds_[pitch];
+
+            const auto started =
+                std::upper_bound(
+                    starts.begin(),
+                    starts.end(),
+                    t + 0.05f) -
+                starts.begin();
+
+            const auto ended =
+                std::lower_bound(
+                    ends.begin(),
+                    ends.end(),
+                    t) -
+                ends.begin();
+
+            next[pitch] =
+                started > ended ? 1 : 0;
+        }
+    }
+
+    if (next != activePitchMaskCache_) {
+        activePitchMaskCache_ = next;
+        emit activePitchesChanged();
+    }
 }
 
 void MainWindow::updateCurrentTime()
@@ -672,17 +716,3 @@ void MainWindow::dispatchScheduler()
     (void)scheduled;
 }
 
-std::array<uint8_t, 128> MainWindow::activePitchMask() const
-{
-    std::array<uint8_t, 128> mask{};
-
-    for (std::size_t pitch = 0; pitch < mask.size(); ++pitch) {
-        const auto& starts = pitchStarts_[pitch];
-        const auto& ends = pitchEnds_[pitch];
-        const auto started = std::upper_bound(starts.begin(), starts.end(), currentTime_ + 0.05f) - starts.begin();
-        const auto ended = std::lower_bound(ends.begin(), ends.end(), currentTime_) - ends.begin();
-        mask[pitch] = started > ended ? 1 : 0;
-    }
-
-    return mask;
-}

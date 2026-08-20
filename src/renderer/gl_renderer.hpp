@@ -49,8 +49,8 @@ public:
 private:
     bool createPrograms();
     void destroy();
-    void destroyTextures();
-    void initTextures(int width, int height);
+    void destroyTexture();
+    void initTexture(int width, int height);
 
     void rebuildTempoIndex();
     double secToTick(double seconds) const;
@@ -68,8 +68,11 @@ private:
                     int columnCount,
                     double currentTick);
     void renderFullTexture(double currentTick);
-    void scrollAndAdvance(double currentTick, int deltaColumns);
-    void drawFrontTexture(GLint targetFramebuffer);
+    void advanceRing(double currentTick, int deltaColumns);
+    void uploadRingStrip(const std::vector<uint8_t>& buffer,
+                         int deltaColumns,
+                         int physicalStartColumn);
+    void drawTexture(GLint targetFramebuffer);
 
     int width_ = 1;
     int height_ = 1;
@@ -103,19 +106,16 @@ private:
     std::unordered_map<uint32_t, uint8_t> perTrackColor_;
 
     GLuint scrollProgram_ = 0;
-    GLuint blitProgram_ = 0;
     GLuint emptyVao_ = 0;
+    GLuint texture_ = 0;
 
-    GLuint textures_[2] = {0, 0};
-    GLuint framebuffers_[2] = {0, 0};
-    int frontIndex_ = 0;
+    // Logical display column 0 is stored at this physical texture column.
+    int ringOriginColumn_ = 0;
 
     GLint scrollTexUniform_ = -1;
+    GLint ringOffsetUniform_ = -1;
     GLint playheadXUniform_ = -1;
     GLint playheadWidthUniform_ = -1;
-
-    GLint blitSourceUniform_ = -1;
-    GLint blitOffsetUniform_ = -1;
 
     std::vector<uint8_t> fullBuffer_;
     std::vector<uint8_t> stripBuffer_;

@@ -86,7 +86,7 @@ public:
 
     const wasmidi::MidiDocument& document() const { return document_; }
     const QVector<QColor>& channelColors() const { return channelColors_; }
-    std::array<uint8_t, 128> activePitchMask() const;
+    std::array<uint8_t, 128> activePitchMask() const { return activePitchMaskCache_; }
 
     Q_INVOKABLE bool loadMidiFile(const QByteArray& data);
     Q_INVOKABLE bool loadMidiFileNamed(const QByteArray& data, const QString& fileName);
@@ -135,6 +135,7 @@ signals:
     void documentRevisionChanged();
     void outputModeChanged();
     void channelColorsChanged();
+    void activePitchesChanged();
     void fileLoaded();
     void loadFailed(QString message);
 
@@ -143,6 +144,7 @@ private:
     void rebuildDerivedStats();
     void updateLiveStats();
     void updateCurrentTime();
+    void updateActivePitchMask();
     void dispatchScheduler();
     void publishDocumentMetadata();
 
@@ -190,4 +192,5 @@ private:
     std::vector<float> tempoBpms_;
     std::array<std::vector<float>, 128> pitchStarts_;
     std::array<std::vector<float>, 128> pitchEnds_;
+    std::array<uint8_t, 128> activePitchMaskCache_{};
 };

@@ -10,6 +10,14 @@ Item {
     signal colorRequested(int channel)
 
     property var postValues: [-1, 0.0, 0.1, 0.5, 1.0, 2.0]
+    property int chartTick: 0
+
+    Timer {
+        interval: 33
+        running: root.visible && root.mainWindow.hasMidi
+        repeat: true
+        onTriggered: root.chartTick++
+    }
 
     component SectionLabel: Text {
         color: "#6f6685"
@@ -140,19 +148,23 @@ Item {
         Component.onCompleted: resetHistory()
         onRevisionChanged: resetHistory()
 
-        // MPWGL2 uses _HIST_RATE = 1000/30. Keep the same 30 Hz sample
-        // cadence while repainting on the display cadence below.
-        Timer {
-            interval: 33
-            running: chartBox.visible && root.mainWindow.hasMidi
-            repeat: true
-            onTriggered: {
-                if (chartBox.samples.length !== chartBox.historyLength)
-                    chartBox.resetHistory()
-                chartBox.samples[chartBox.sampleIndex] = Number(chartBox.value)
-                chartBox.sampleIndex = (chartBox.sampleIndex + 1) % chartBox.historyLength
-                spark.requestPaint()
-            }
+        property int sharedTick: root.chartTick
+
+        onSharedTickChanged: {
+            if (!chartBox.visible || !root.mainWindow.hasMidi)
+                return
+
+            if (chartBox.samples.length !== chartBox.historyLength)
+                chartBox.resetHistory()
+
+            chartBox.samples[chartBox.sampleIndex] =
+                Number(chartBox.value)
+
+            chartBox.sampleIndex =
+                (chartBox.sampleIndex + 1) %
+                chartBox.historyLength
+
+            spark.requestPaint()
         }
 
         Canvas {
@@ -237,11 +249,10 @@ Item {
         border.color: "#211a35"
         border.width: 1
 
-        Timer {
-            interval: 33
-            running: timelineBox.visible
-            repeat: true
-            onTriggered: timeline.requestPaint()
+        property int sharedTick: root.chartTick
+        onSharedTickChanged: {
+            if (timelineBox.visible)
+                timeline.requestPaint()
         }
 
         Canvas {

@@ -110,17 +110,6 @@ Item {
             }
         }
 
-        // MPWGL2 playhead: vertical line at 18% of the roll width.
-        Rectangle {
-            x: Math.round(parent.width * 0.18)
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            width: 2
-            color: "#a78bfa"
-            opacity: root.mainWindow.hasMidi ? 0.72 : 0
-            z: 5
-        }
-
         Column {
             anchors.centerIn: parent
             spacing: 7
@@ -217,60 +206,32 @@ Item {
         }
     }
 
-    FrameAnimation {
-        id: frameAnimation
-        running: root.visible
+    // QML Canvas is frozen during playback; it is far more expensive than
+    // the native WebGL roll under Qt/WASM. The last painted neural frame stays
+    // visible at low opacity behind the notes.
+    Timer {
+        interval: 33
+        running: root.visible && !root.mainWindow.isPlaying
+        repeat: true
 
         onTriggered: {
-            root.fpsValue =
-                smoothFrameTime > 0
-                    ? Math.round(1.0 / smoothFrameTime)
-                    : 0
-
-            /*
-             * QML Canvas is significantly more expensive than the native
-             * WebGL roll. While MIDI is playing, animate the neural backdrop
-             * every second display frame (~30 Hz); its movement is time-based
-             * so it keeps the same speed.
-             */
-            if (root.mainWindow.isPlaying &&
-                (currentFrame & 1))
-                return
-
-            var scale =
-                frameTime > 0
-                    ? frameTime / (1.0 / 60.0)
-                    : 1.0
-
-            root.neuralPhase +=
-                0.035 * scale
+            root.neuralPhase += 0.07
 
             var next = []
 
-            for (var i = 0;
-                 i < root.neuralNodes.length;
-                 ++i) {
-                var n =
-                    root.neuralNodes[i]
-
-                var x =
-                    n.x + n.vx * scale
-
-                var y =
-                    n.y + n.vy * scale
+            for (var i = 0; i < root.neuralNodes.length; ++i) {
+                var n = root.neuralNodes[i]
+                var x = n.x + n.vx * 2.0
+                var y = n.y + n.vy * 2.0
 
                 if (x <= 0 || x >= 1) {
                     n.vx = -n.vx
-                    x = Math.max(
-                        0,
-                        Math.min(1, x))
+                    x = Math.max(0, Math.min(1, x))
                 }
 
                 if (y <= 0 || y >= 1) {
                     n.vy = -n.vy
-                    y = Math.max(
-                        0,
-                        Math.min(1, y))
+                    y = Math.max(0, Math.min(1, y))
                 }
 
                 n.x = x
@@ -281,5 +242,14 @@ Item {
             root.neuralNodes = next
             neural.requestPaint()
         }
+    }
+
+    // Samples the real completed C++ roll render rate. This does not drive
+    // scene-graph frames and therefore cannot create a duplicate render loop.
+    Timer {
+        interval: 500
+        running: root.visible
+        repeat: true
+        onTriggered: root.fpsValue = surface.renderFps
     }
 }
