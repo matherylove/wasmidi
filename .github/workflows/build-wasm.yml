@@ -1,0 +1,68 @@
+name: Build WASM and Deploy to Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Compile midi_parser.c to WASM
+        run: |
+          emcc midi_parser.c -O3 -o midi_parser.wasm \
+            -s WASM=1 \
+            -s EXPORTED_FUNCTIONS='["_midi_parse","_get_result_ptr","_get_note_count","_get_cc_count","_malloc","_free"]' \
+            -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' \
+            -s ALLOW_MEMORY_GROWTH=1 \
+            -s INITIAL_MEMORY=67108864 \
+            --no-entry
+
+      - name: Commit WASM file
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add midi_parser.wasm
+          git commit -m "Auto-build: midi_parser.wasm from C source" || echo "No changes to commit"
+          git push
+
+  deploy-pages:
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v1
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
