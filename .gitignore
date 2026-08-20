@@ -1,0 +1,45 @@
+# Qt/WASM build output
+build/
+*.wasm
+*.js
+*.data
+*.html
+
+# Emscripten cache
+.emscripten_cache*
+.emscripten_sanity*
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# Qt Creator
+.idea/
+*.pro.user
+*.qmlproject.user
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
