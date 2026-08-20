@@ -1,438 +1,241 @@
 #include "gl_renderer.hpp"
+
+#include <algorithm>
 #include <cstring>
-#include <cmath>
 
 namespace wasmidi {
-
 namespace {
 
-GLuint compileShader(GLenum type, const char* source) {
+GLuint compileShader(GLenum type, const char* source)
+{
     const GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
     glCompileShader(shader);
-    
-    GLint success = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char log[512];
-        glGetShaderInfoLog(shader, 512, nullptr, log);
+
+    GLint ok = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        glDeleteShader(shader);
         return 0;
     }
-    
     return shader;
 }
 
-GLuint createProgram(const char* vertSource, const char* fragSource) {
-    const GLuint vert = compileShader(GL_VERTEX_SHADER, vertSource);
-    const GLuint frag = compileShader(GL_FRAGMENT_SHADER, fragSource);
-    
-    const GLuint program = glCreateProgram();
-    glAttachShader(program, vert);
-    glAttachShader(program, frag);
-    glLinkProgram(program);
-    
-    glDeleteShader(vert);
-    glDeleteShader(frag);
-    
-    GLint success = 0;
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char log[512];
-        glGetProgramInfoLog(program, 512, nullptr, log);
+GLuint linkProgram(const char* vertexSource, const char* fragmentSource)
+{
+    const GLuint vertex = compileShader(GL_VERTEX_SHADER, vertexSource);
+    const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
+    if (!vertex || !fragment) {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
         return 0;
     }
-    
+
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+
+    GLint ok = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        glDeleteProgram(program);
+        return 0;
+    }
     return program;
 }
 
+} // namespace
+
+GLRenderer::GLRenderer()
+{
+    const float defaults[16][3] = {
+        {0.506f,0.549f,0.973f},{0.655f,0.545f,0.980f},{0.753f,0.518f,0.988f},{0.910f,0.475f,0.976f},
+        {0.957f,0.447f,0.714f},{0.984f,0.443f,0.522f},{0.984f,0.573f,0.235f},{0.980f,0.800f,0.082f},
+        {0.639f,0.902f,0.208f},{0.290f,0.871f,0.502f},{0.204f,0.827f,0.600f},{0.176f,0.831f,0.749f},
+        {0.133f,0.827f,0.933f},{0.220f,0.741f,0.973f},{0.376f,0.647f,0.980f},{0.545f,0.361f,0.965f}
+    };
+    std::memcpy(channelColors_.data(), defaults, sizeof(defaults));
 }
 
-GLRenderer::GLRenderer() {
-    memset(channelColors_, 0, sizeof(channelColors_));
+GLRenderer::~GLRenderer()
+{
+    destroy();
 }
 
-GLRenderer::~GLRenderer() {
-    if (rollProgram_) glDeleteProgram(rollProgram_);
-    if (keyboardProgram_) glDeleteProgram(keyboardProgram_);
-    if (rollVAO_) glDeleteVertexArrays(1, &rollVAO_);
-    if (rollVBO_) glDeleteBuffers(1, &rollVBO_);
-    if (rollInstanceVBO_) glDeleteBuffers(1, &rollInstanceVBO_);
-    if (keyboardVAO_) glDeleteVertexArrays(1, &keyboardVAO_);
-    if (keyboardVBO_) glDeleteBuffers(1, &keyboardVBO_);
-    if (keyboardInstanceVBO_) glDeleteBuffers(1, &keyboardInstanceVBO_);
-}
-
-bool GLRenderer::initialize(
-    int rollWidth, int rollHeight,
-    int keyboardWidth, int keyboardHeight
-) {
-    rollWidth_ = rollWidth;
-    rollHeight_ = rollHeight;
-    keyboardWidth_ = keyboardWidth;
-    keyboardHeight_ = keyboardHeight;
-    
-    if (!createRollProgram()) {
+bool GLRenderer::initialize()
+{
+    if (initialized_)
+        return true;
+    if (!createProgram())
         return false;
-    }
-    
-    if (!createKeyboardProgram()) {
-        return false;
-    }
-    
-    glGenVertexArrays(1, &rollVAO_);
-    glGenBuffers(1, &rollVBO_);
-    glGenBuffers(1, &rollInstanceVBO_);
-    
-    glGenVertexArrays(1, &keyboardVAO_);
-    glGenBuffers(1, &keyboardVBO_);
-    glGenBuffers(1, &keyboardInstanceVBO_);
-    
-    generateKeyboardLayout();
-    
+
+    glGenVertexArrays(1, &vao_);
+    glBindVertexArray(vao_);
+
+    static const float quad[] = {
+        0.f, 0.f,  1.f, 0.f,  0.f, 1.f,
+        0.f, 1.f,  1.f, 0.f,  1.f, 1.f
+    };
+
+    glGenBuffers(1, &quadVbo_);
+    glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+
+    glGenBuffers(1, &instanceVbo_);
+    glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(NoteInstance), reinterpret_cast<void*>(0));
+    glVertexAttribDivisor(1, 1);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(NoteInstance), reinterpret_cast<void*>(4 * sizeof(float)));
+    glVertexAttribDivisor(2, 1);
+
+    glBindVertexArray(0);
+    initialized_ = true;
+    notesDirty_ = true;
     return true;
 }
 
-void GLRenderer::resize(
-    int rollWidth, int rollHeight,
-    int keyboardWidth, int keyboardHeight
-) {
-    rollWidth_ = rollWidth;
-    rollHeight_ = rollHeight;
-    keyboardWidth_ = keyboardWidth;
-    keyboardHeight_ = keyboardHeight;
+void GLRenderer::destroy()
+{
+    if (instanceVbo_) glDeleteBuffers(1, &instanceVbo_);
+    if (quadVbo_) glDeleteBuffers(1, &quadVbo_);
+    if (vao_) glDeleteVertexArrays(1, &vao_);
+    if (program_) glDeleteProgram(program_);
+    instanceVbo_ = quadVbo_ = vao_ = program_ = 0;
+    initialized_ = false;
 }
 
-void GLRenderer::setNotes(const std::vector<NoteInstance>& notes) {
+void GLRenderer::resize(int width, int height)
+{
+    width_ = std::max(1, width);
+    height_ = std::max(1, height);
+}
+
+void GLRenderer::setNotes(const std::vector<NoteInstance>& notes)
+{
     notes_ = notes;
-    uploadNotes();
+    notesDirty_ = true;
 }
 
-void GLRenderer::setCurrentTime(float seconds) {
-    currentTime_ = seconds;
-}
+void GLRenderer::setCurrentTime(float seconds) { currentTime_ = seconds; }
+void GLRenderer::setNoteSpeed(float secondsPerWindow) { noteSpeed_ = std::max(0.1f, secondsPerWindow); }
+void GLRenderer::setPostBuffer(float seconds) { postBuffer_ = std::max(0.0f, seconds); }
+void GLRenderer::setPerTrackColors(bool enabled) { perTrackColors_ = enabled; }
 
-void GLRenderer::setNoteSpeed(float secondsPerWindow) {
-    noteSpeed_ = secondsPerWindow;
-}
-
-void GLRenderer::setPostBuffer(float seconds) {
-    postBuffer_ = seconds;
-}
-
-void GLRenderer::setChannelColor(uint8_t channel, uint8_t r, uint8_t g, uint8_t b) {
-    if (channel < 16) {
-        channelColors_[channel][0] = r;
-        channelColors_[channel][1] = g;
-        channelColors_[channel][2] = b;
-    }
-}
-
-void GLRenderer::setActiveNotes(const std::vector<uint8_t>& activePitches) {
-    activePitches_ = activePitches;
-}
-
-void GLRenderer::renderRoll() {
-    glViewport(0, keyboardHeight_, rollWidth_, rollHeight_);
-    glClearColor(0.027f, 0.027f, 0.102f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    
-    if (notes_.empty()) {
+void GLRenderer::setChannelColor(uint8_t channel, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (channel >= channelColors_.size())
         return;
-    }
-    
-    glUseProgram(rollProgram_);
-    glBindVertexArray(rollVAO_);
-    
-    glUniform1f(rollTimeUniform_, currentTime_);
-    glUniform1f(rollWindowUniform_, noteSpeed_);
-    glUniform1f(rollPostBufferUniform_, postBuffer_);
-    glUniform2f(rollResolutionUniform_, static_cast<float>(rollWidth_), static_cast<float>(rollHeight_));
-    
-    float activeMultiplier = 1.5f;
-    glUniform1f(rollActiveMultUniform_, activeMultiplier);
-    
-    float noteColor[3] = {0.65f, 0.55f, 0.98f};
-    glUniform3fv(rollColorUniform_, 1, noteColor);
-    
-    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, static_cast<GLsizei>(notes_.size()));
-    
-    glBindVertexArray(0);
+    channelColors_[channel] = {r / 255.0f, g / 255.0f, b / 255.0f};
 }
 
-void GLRenderer::renderKeyboard() {
-    glViewport(0, 0, keyboardWidth_, keyboardHeight_);
-    glClearColor(0.027f, 0.027f, 0.102f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    
-    glUseProgram(keyboardProgram_);
-    glBindVertexArray(keyboardVAO_);
-    
-    float hue = 230.0f;
-    glUniform1f(keyboardHueUniform_, hue);
-    
-    float activeColor[3] = {0.65f, 0.55f, 0.98f};
-    glUniform3fv(keyboardActiveColorUniform_, 1, activeColor);
-    
-    float isActive = activePitches_.empty() ? 0.0f : 1.0f;
-    glUniform1f(keyboardIsActiveUniform_, isActive);
-    
-    glUniform2f(keyboardResolutionUniform_, static_cast<float>(keyboardWidth_), static_cast<float>(keyboardHeight_));
-    
-    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, 
-        static_cast<GLsizei>(whiteKeys_.size() + blackKeys_.size()));
-    
-    glBindVertexArray(0);
+bool GLRenderer::createProgram()
+{
+    static const char* vertex = R"GLSL(#version 300 es
+precision highp float;
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 aNote;      // start, end, pitch, channel
+layout(location=2) in vec2 aExtra;     // track, velocity
+uniform float uCurrentTime;
+uniform float uWindowSeconds;
+uniform float uPostBuffer;
+uniform bool uPerTrack;
+uniform vec3 uColors[16];
+out vec3 vColor;
+out float vActive;
+out float vVelocity;
+void main() {
+    float start = aNote.x;
+    float end = max(aNote.y, start + 0.001);
+    float pitch = clamp(aNote.z, 0.0, 127.0);
+    float relStart = start - uCurrentTime;
+    float relEnd = end - uCurrentTime;
+    float hitLine = 0.075;
+    float y0 = hitLine + ((relStart + uPostBuffer) / uWindowSeconds) * (1.0 - hitLine);
+    float y1 = hitLine + ((relEnd + uPostBuffer) / uWindowSeconds) * (1.0 - hitLine);
+    float keyW = 1.0 / 128.0;
+    float x0 = pitch * keyW;
+    float x1 = x0 + keyW * 0.94;
+    float x = mix(x0, x1, aCorner.x);
+    float y = mix(y0, y1, aCorner.y);
+    gl_Position = vec4(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+    int colorIndex = uPerTrack ? int(mod(aExtra.x, 16.0)) : int(clamp(aNote.w, 0.0, 15.0));
+    vColor = uColors[colorIndex];
+    vActive = float(start <= uCurrentTime && end >= uCurrentTime);
+    vVelocity = clamp(aExtra.y, 0.0, 1.0);
 }
+)GLSL";
 
-bool GLRenderer::createRollProgram() {
-    static const char* vertSource = R"(
-        #version 300 es
-        precision highp float;
-        
-        layout(location = 0) in vec2 vertexPosition;
-        layout(location = 1) in vec4 noteData;
-        
-        uniform float uCurrentTime;
-        uniform float uWindowSeconds;
-        uniform float uPostBuffer;
-        uniform vec2 uResolution;
-        
-        out vec4 vColor;
-        out float vActive;
-        
-        void main() {
-            float noteStart = noteData.x;
-            float noteEnd = noteData.y;
-            float pitch = noteData.z;
-            float channel = noteData.w;
-            
-            float relativeStart = noteStart - uCurrentTime;
-            float relativeEnd = noteEnd - uCurrentTime;
-            
-            float xMin = (relativeStart - uPostBuffer) / uWindowSeconds;
-            float xMax = (relativeEnd - uPostBuffer) / uWindowSeconds;
-            
-            float x = mix(xMin, xMax, vertexPosition.x);
-            float y = pitch / 127.0;
-            
-            vec2 pos = vec2(
-                x * 2.0 - 1.0,
-                y * 2.0 - 1.0
-            );
-            
-            gl_Position = vec4(pos, 0.0, 1.0);
-            
-            vActive = float(relativeStart < 0.0 && relativeEnd > 0.0);
-            vColor = vec4(1.0, 1.0, 1.0, 1.0);
-        }
-    )";
-    
-    static const char* fragSource = R"(
-        #version 300 es
-        precision mediump float;
-        
-        in vec4 vColor;
-        in float vActive;
-        
-        uniform vec3 uNoteColor;
-        uniform float uActiveMultiplier;
-        
-        out vec4 fragColor;
-        
-        void main() {
-            float multiplier = vActive > 0.5 ? uActiveMultiplier : 1.0;
-            vec3 color = uNoteColor * multiplier;
-            fragColor = vec4(color, 0.9);
-        }
-    )";
-    
-    rollProgram_ = createProgram(vertSource, fragSource);
-    
-    if (!rollProgram_) {
+    static const char* fragment = R"GLSL(#version 300 es
+precision mediump float;
+in vec3 vColor;
+in float vActive;
+in float vVelocity;
+out vec4 fragColor;
+void main() {
+    float velocityGain = mix(0.58, 1.0, vVelocity);
+    vec3 color = vColor * velocityGain;
+    if (vActive > 0.5)
+        color = min(vec3(1.0), color * 1.35 + vec3(0.08));
+    fragColor = vec4(color, 0.94);
+}
+)GLSL";
+
+    program_ = linkProgram(vertex, fragment);
+    if (!program_)
         return false;
-    }
-    
-    rollTimeUniform_ = glGetUniformLocation(rollProgram_, "uCurrentTime");
-    rollWindowUniform_ = glGetUniformLocation(rollProgram_, "uWindowSeconds");
-    rollPostBufferUniform_ = glGetUniformLocation(rollProgram_, "uPostBuffer");
-    rollColorUniform_ = glGetUniformLocation(rollProgram_, "uNoteColor");
-    rollActiveMultUniform_ = glGetUniformLocation(rollProgram_, "uActiveMultiplier");
-    rollResolutionUniform_ = glGetUniformLocation(rollProgram_, "uResolution");
-    
+
+    currentTimeUniform_ = glGetUniformLocation(program_, "uCurrentTime");
+    windowUniform_ = glGetUniformLocation(program_, "uWindowSeconds");
+    postBufferUniform_ = glGetUniformLocation(program_, "uPostBuffer");
+    perTrackUniform_ = glGetUniformLocation(program_, "uPerTrack");
+    colorsUniform_ = glGetUniformLocation(program_, "uColors[0]");
     return true;
 }
 
-bool GLRenderer::createKeyboardProgram() {
-    static const char* vertSource = R"(
-        #version 300 es
-        precision highp float;
-        
-        layout(location = 0) in vec2 vertexPosition;
-        layout(location = 1) in vec4 keyData;
-        
-        uniform vec2 uResolution;
-        
-        out vec4 vColor;
-        out float vIsBlack;
-        
-        void main() {
-            float x = keyData.x;
-            float y = keyData.y;
-            float w = keyData.z;
-            float h = keyData.w;
-            
-            vec2 pos = vec2(
-                x + vertexPosition.x * w,
-                y + vertexPosition.y * h
-            );
-            
-            pos = pos * 2.0 - 1.0;
-            
-            gl_Position = vec4(pos, 0.0, 1.0);
-            
-            vIsBlack = keyData.z < 0.02 ? 1.0 : 0.0;
-            vColor = vec4(1.0, 1.0, 1.0, 1.0);
-        }
-    )";
-    
-    static const char* fragSource = R"(
-        #version 300 es
-        precision mediump float;
-        
-        in vec4 vColor;
-        in float vIsBlack;
-        
-        uniform float uHue;
-        uniform vec3 uActiveColor;
-        uniform float uIsActive;
-        
-        out vec4 fragColor;
-        
-        vec3 hsl2rgb(vec3 c) {
-            vec3 rgb = clamp(abs(mod(c.x * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
-            return c.z + c.y * (rgb - 0.5) * (1.0 - abs(2.0 * c.z - 1.0));
-        }
-        
-        void main() {
-            float lightness = vIsBlack > 0.5 ? 0.15 : 0.5;
-            float saturation = 0.3;
-            
-            vec3 baseColor = hsl2rgb(vec3(uHue / 360.0, saturation, lightness));
-            
-            if (uIsActive > 0.5) {
-                baseColor = mix(baseColor, uActiveColor, 0.7);
-            }
-            
-            fragColor = vec4(baseColor, 1.0);
-        }
-    )";
-    
-    keyboardProgram_ = createProgram(vertSource, fragSource);
-    
-    if (!keyboardProgram_) {
-        return false;
-    }
-    
-    keyboardHueUniform_ = glGetUniformLocation(keyboardProgram_, "uHue");
-    keyboardActiveColorUniform_ = glGetUniformLocation(keyboardProgram_, "uActiveColor");
-    keyboardIsActiveUniform_ = glGetUniformLocation(keyboardProgram_, "uIsActive");
-    keyboardResolutionUniform_ = glGetUniformLocation(keyboardProgram_, "uResolution");
-    
-    return true;
-}
-
-void GLRenderer::uploadNotes() {
-    if (notes_.empty()) {
-        return;
-    }
-    
-    glBindVertexArray(rollVAO_);
-    
-    glBindBuffer(GL_ARRAY_BUFFER, rollVBO_);
-    static const float quadVertices[] = {
-        0.0f, 0.0f,
-        1.0f, 0.0f,
-        0.0f, 1.0f,
-        0.0f, 1.0f,
-        1.0f, 0.0f,
-        1.0f, 1.0f
-    };
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    glEnableVertexAttribArray(0);
-    
-    glBindBuffer(GL_ARRAY_BUFFER, rollInstanceVBO_);
-    glBufferData(GL_ARRAY_BUFFER, 
-        static_cast<GLsizeiptr>(notes_.size() * sizeof(NoteInstance)),
-        notes_.data(), GL_DYNAMIC_DRAW);
-    
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(NoteInstance), nullptr);
-    glEnableVertexAttribArray(1);
-    glVertexAttribDivisor(1, 1);
-    
-    glBindVertexArray(0);
-}
-
-void GLRenderer::uploadKeyboard() {
-    glBindVertexArray(keyboardVAO_);
-    
-    glBindBuffer(GL_ARRAY_BUFFER, keyboardVBO_);
-    static const float quadVertices[] = {
-        0.0f, 0.0f,
-        1.0f, 0.0f,
-        0.0f, 1.0f,
-        0.0f, 1.0f,
-        1.0f, 0.0f,
-        1.0f, 1.0f
-    };
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    glEnableVertexAttribArray(0);
-    
-    std::vector<KeyInstance> allKeys = whiteKeys_;
-    allKeys.insert(allKeys.end(), blackKeys_.begin(), blackKeys.end());
-    
-    glBindBuffer(GL_ARRAY_BUFFER, keyboardInstanceVBO_);
+void GLRenderer::uploadNotes()
+{
+    glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
     glBufferData(GL_ARRAY_BUFFER,
-        static_cast<GLsizeiptr>(allKeys.size() * sizeof(KeyInstance)),
-        allKeys.data(), GL_STATIC_DRAW);
-    
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(KeyInstance), nullptr);
-    glEnableVertexAttribArray(1);
-    glVertexAttribDivisor(1, 1);
-    
+                 static_cast<GLsizeiptr>(notes_.size() * sizeof(NoteInstance)),
+                 notes_.empty() ? nullptr : notes_.data(),
+                 GL_STATIC_DRAW);
+    notesDirty_ = false;
+}
+
+void GLRenderer::renderRoll()
+{
+    if (!initialized_ && !initialize())
+        return;
+    if (notesDirty_)
+        uploadNotes();
+
+    glViewport(0, 0, width_, height_);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glClearColor(0.027f, 0.027f, 0.102f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (notes_.empty())
+        return;
+
+    glUseProgram(program_);
+    glUniform1f(currentTimeUniform_, currentTime_);
+    glUniform1f(windowUniform_, noteSpeed_);
+    glUniform1f(postBufferUniform_, postBuffer_);
+    glUniform1i(perTrackUniform_, perTrackColors_ ? 1 : 0);
+    glUniform3fv(colorsUniform_, 16, channelColors_[0].data());
+
+    glBindVertexArray(vao_);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, static_cast<GLsizei>(notes_.size()));
     glBindVertexArray(0);
 }
 
-void GLRenderer::generateKeyboardLayout() {
-    const int whiteCount = 0;
-    const float whiteKeyWidth = 1.0f / 52.0f;
-    const float blackKeyWidth = whiteKeyWidth * 0.58f;
-    const float whiteKeyHeight = 1.0f;
-    const float blackKeyHeight = 0.62f;
-    
-    const int isBlack[] = {0,1,0,1,0,0,1,0,1,0,1,0};
-    int whiteIndex = 0;
-    
-    for (int octave = 0; octave < 10; ++octave) {
-        for (int i = 0; i < 12; ++i) {
-            const int note = octave * 12 + i;
-            const bool isBlackKey = isBlack[i] != 0;
-            
-            if (!isBlackKey) {
-                const float x = whiteIndex * whiteKeyWidth;
-                const float y = 0.0f;
-                whiteKeys_.push_back({x, y, whiteKeyWidth, whiteKeyHeight});
-                ++whiteIndex;
-            } else {
-                const float x = (whiteIndex - 1) * whiteKeyWidth + whiteKeyWidth * 0.5f - blackKeyWidth * 0.5f;
-                const float y = 1.0f - blackKeyHeight;
-                blackKeys_.push_back({x, y, blackKeyWidth, blackKeyHeight});
-            }
-        }
-    }
-    
-    uploadKeyboard();
-}
-
-}
+} // namespace wasmidi

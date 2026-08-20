@@ -1,32 +1,31 @@
 #pragma once
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
-#include <string>
 
 namespace wasmidi {
 
 struct NoteEvent {
-    float startTime;
-    float endTime;
-    uint8_t pitch;
-    uint8_t channel;
-    uint8_t velocity;
-    uint16_t track;
+    float startTime = 0.0f;
+    float endTime = 0.0f;
+    uint8_t pitch = 0;
+    uint8_t channel = 0;
+    uint8_t velocity = 0;
+    uint16_t track = 0;
 };
 
 struct ControlEvent {
-    float time;
-    uint8_t type;
-    uint8_t channel;
-    uint8_t data1;
-    uint8_t data2;
+    float time = 0.0f;
+    uint8_t type = 0;
+    uint8_t channel = 0;
+    uint8_t data1 = 0;
+    uint8_t data2 = 0;
 };
 
 struct TempoChange {
-    uint32_t tick;
-    uint32_t microsecondsPerBeat;
+    uint32_t tick = 0;
+    uint32_t microsecondsPerBeat = 500000;
 };
 
 struct MidiDocument {
@@ -34,7 +33,7 @@ struct MidiDocument {
     uint16_t trackCount = 0;
     uint16_t ticksPerBeat = 480;
     float durationSeconds = 0.0f;
-    
+
     std::vector<NoteEvent> notes;
     std::vector<ControlEvent> controls;
     std::vector<TempoChange> tempoMap;
@@ -48,31 +47,10 @@ public:
 
 private:
     const char* errorMessage_ = "Unknown error";
-    
-    bool parseHeader(
-        const uint8_t*& cursor,
-        const uint8_t* end,
-        MidiDocument& output
-    );
-    
-    bool parseTracks(
-        const uint8_t*& cursor,
-        const uint8_t* end,
-        MidiDocument& output
-    );
-    
-    bool readTrack(
-        const uint8_t* data,
-        std::size_t size,
-        std::uint16_t trackIndex,
-        MidiDocument& output
-    );
-    
-    double tickToSeconds(
-        uint32_t tick,
-        const std::vector<TempoChange>& tempoMap,
-        uint16_t ppq
-    ) const;
+
+    double tickToSeconds(uint32_t tick,
+                         const std::vector<TempoChange>& tempoMap,
+                         uint16_t ppq) const;
 };
 
-}
+} // namespace wasmidi

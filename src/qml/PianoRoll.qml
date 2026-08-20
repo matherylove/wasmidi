@@ -1,93 +1,40 @@
 import QtQuick
-import QtQuick.Scene3D
+import Wasmidi
 
 Item {
     id: root
-    property var mainWindow
-    
+    required property var mainWindow
+    clip: true
+
     Rectangle {
         anchors.fill: parent
+        radius: 8
         color: "#07071a"
-        
-        // Piano roll canvas (WebGL)
-        Canvas {
-            id: pianoRollCanvas
+        border.color: "#211a3e"
+
+        PianoRollSurface {
             anchors.fill: parent
-            antialiasing: false
-            
-            property var gl
-            property var program
-            property var vao
-            property var vbo
-            
-            onAvailableChanged: {
-                if (available) {
-                    initializeGL()
-                }
-            }
-            
-            function initializeGL() {
-                gl = getContext("webgl2", {
-                    alpha: false,
-                    antialias: false,
-                    powerPreference: "high-performance"
-                })
-                
-                if (!gl) {
-                    console.log("WebGL2 not available")
-                    return
-                }
-                
-                // Inicializar shaders, buffers, etc.
-            }
-            
-            onPaint: {
-                if (!gl) return
-                
-                gl.viewport(0, 0, width, height)
-                gl.clearColor(0.027, 0.027, 0.102, 1.0)
-                gl.clear(gl.COLOR_BUFFER_BIT)
-                
-                // Renderizar notas
-                renderNotes()
-            }
-            
-            function renderNotes() {
-                // Lógica de renderizado WebGL
-            }
+            anchors.margins: 1
+            controller: root.mainWindow
         }
-        
-        // Overlay de carga
+
         Rectangle {
-            visible: !mainWindow || mainWindow.noteCount === 0
-            anchors.fill: parent
-            color: "#07071a"
-            opacity: 0.9
-            
-            Column {
-                anchors.centerIn: parent
-                spacing: 15
-                
-                Text {
-                    text: "🎵"
-                    font.pixelSize: 48
-                    anchors.horizontalCenter: parent.horizontalCenter
-                }
-                
-                Text {
-                    text: "Drop a MIDI file here or click to open"
-                    font.pixelSize: 16
-                    color: "#c4b5fd"
-                    anchors.horizontalCenter: parent.horizontalCenter
-                }
-                
-                Text {
-                    text: ".mid / .midi · Format 0 & 1 · Black MIDI ready"
-                    font.pixelSize: 12
-                    color: "#94a3b8"
-                    anchors.horizontalCenter: parent.horizontalCenter
-                }
-            }
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: parent.height * 0.075
+            height: 1
+            color: "#a78bfa"
+            opacity: root.mainWindow.noteCount > 0 ? 0.35 : 0
+        }
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 7
+            visible: root.mainWindow.noteCount === 0
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "♪"; color: "#4c4168"; font.pixelSize: 44 }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Open a MIDI file to begin"; color: "#7c7395"; font.pixelSize: 14 }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Format 0 / 1 · high-density renderer"; color: "#514960"; font.pixelSize: 10 }
         }
     }
 }

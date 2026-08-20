@@ -1,53 +1,24 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
-#include <QQmlContext>
-#include <QQuickStyle>
-#include <QtWebEngineWidgets/QWebEngineView>
+#include <QQuickWindow>
+#include <QSGRendererInterface>
 
-#include "mainwindow.hpp"
-#include "pianoroll.hpp"
-#include "keyboard.hpp"
+int main(int argc, char *argv[])
+{
+    // QQuickFramebufferObject is OpenGL-only in Qt 6. Force the scene graph
+    // backend before constructing any QQuickWindow so WebAssembly maps this
+    // path to WebGL/OpenGL ES consistently.
+    QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
 
-#ifdef __EMSCRIPTEN__
-#include <emscripten/emscripten.h>
-#include <emscripten/html5.h>
-#endif
-
-int main(int argc, char *argv[]) {
-#ifdef __EMSCRIPTEN__
-    QGuiApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
-#endif
-    
     QGuiApplication app(argc, argv);
-    app.setApplicationName("WASMIDI Player");
-    app.setOrganizationName("Dekxtopia");
-    
-    qmlRegisterType<PianoRoll>("Wasmidi");
-    qmlRegisterType<Keyboard>("Wasmidi");
-    qmlRegisterType<MainWindow>("Wasmidi");
-    
+    app.setApplicationName(QStringLiteral("WASMIDI Player"));
+    app.setOrganizationName(QStringLiteral("Dekxtopia"));
+
     QQmlApplicationEngine engine;
-    
-    const QUrl url(QStringLiteral("qrc:/wasmidi/qml/MainWindow.qml"));
-    
-    QObject::connect(
-        &engine,
-        &QQmlApplicationEngine::objectCreated,
-        &app,
-        [url](QObject *obj, const QUrl &objUrl) {
-            if (!obj && url == objUrl)
-                QCoreApplication::exit(-1);
-        },
-        Qt::QueuedConnection
-    );
-    
-    engine.load(url);
-    
-#ifdef __EMSCRIPTEN__
-    emscripten_set_main_loop([]() {
-        QCoreApplication::processEvents();
-    }, 0, 1);
-#endif
-    
+    QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
+                     &app, [] { QCoreApplication::exit(-1); },
+                     Qt::QueuedConnection);
+    engine.loadFromModule(QStringLiteral("Wasmidi"), QStringLiteral("MainWindow"));
+
     return app.exec();
 }
