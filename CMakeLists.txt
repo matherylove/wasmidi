@@ -70,6 +70,10 @@ if(EMSCRIPTEN)
         -O3
         -flto
         -fexceptions
+        # Chrome 133+ ships WebAssembly Memory64. The MIDI parser is isolated
+        # from Qt, so it can use 64-bit pointers without changing the Qt wasm32
+        # renderer/player ABI. This removes the artificial 4 GiB parser heap.
+        "-sMEMORY64=1"
     )
     target_link_options(midi_parser_core PRIVATE
         -O3
@@ -90,16 +94,25 @@ if(EMSCRIPTEN)
         # classic browser Worker in production and is executed in Node during
         # CI so a startup abort cannot reach Pages unnoticed again.
         "-sENVIRONMENT=worker,node"
+        # Full wasm64 parser. Memory is committed only as allocations require it;
+        # the browser/OS may refuse growth earlier under real memory pressure.
+        # Current Chromium/V8 Memory64 has a 16 GiB per-memory hard ceiling, so
+        # this is the highest useful declaration rather than an app-imposed RAM
+        # budget.
+        "-sMEMORY64=1"
         "-sALLOW_MEMORY_GROWTH=1"
         "-sINITIAL_MEMORY=67108864"
-        "-sMAXIMUM_MEMORY=2147483648"
+        "-sMAXIMUM_MEMORY=17179869184"
+        # Do not reserve Emscripten's default +20% geometric slack while growing
+        # gigantic black MIDIs. Request only the pages actually needed.
+        "-sMEMORY_GROWTH_GEOMETRIC_STEP=0"
         "-sSTACK_SIZE=4194304"
         "-sFILESYSTEM=0"
         # Parser-only assertions keep fatal startup/runtime diagnostics useful;
         # they do not affect the real-time renderer or SnappySynth hot paths.
         "-sASSERTIONS=1"
         "-sINCOMING_MODULE_JS_API=['noInitialRun','noExitRuntime','onAbort','print','printErr']"
-        "-sEXPORTED_FUNCTIONS=['_wmp_parse','_wmp_result_ptr','_wmp_result_size','_wmp_error_ptr','_malloc','_free']"
+        "-sEXPORTED_FUNCTIONS=['_wmp_parse','_wmp_pack','_wmp_result_ptr','_wmp_result_size','_wmp_release_result','_wmp_error_ptr','_wmp_pointer_bits','_malloc','_free']"
         "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
     )
 
@@ -159,6 +172,12 @@ if(EMSCRIPTEN)
 
     # Qt for WebAssembly owns the generated HTML/JS/WASM packaging.
     target_link_options(wasmidi PRIVATE
+        # Qt remains wasm32, but remove its historical 2 GiB default ceiling.
+        # Parsed-document installation can therefore use the full 4 GiB wasm32
+        # address space when the browser has enough memory.
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sMAXIMUM_MEMORY=4294967296"
+        "-sMEMORY_GROWTH_GEOMETRIC_STEP=0"
         "-sFULL_ES3=1"
         "-sMIN_WEBGL_VERSION=2"
         "-sMAX_WEBGL_VERSION=2"

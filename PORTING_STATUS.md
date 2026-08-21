@@ -118,3 +118,47 @@ The dedicated MIDI parser no longer deploys separate generated `.js` and
 cache-versioned Worker bootstrap, inert entry point, persistent runtime, and
 parser-only exception/assertion diagnostics. GitHub Actions now loads the exact
 generated module and parses a minimal MIDI before Pages deployment.
+
+## Pass 12.4 — large black-MIDI parser memory hotfix
+
+The background parser no longer creates one temporary 64-bit end-sort key for
+every visual note while building the keyboard timeline. NoteOff counts are now
+aggregated while `buildVisualNotes()` pairs the source event stream, and only
+the final compressed `VisualKeyEvent` records are sorted/coalesced. This removes
+an O(noteCount) 8-byte temporary that could push dense files past wasm32 memory
+near the end of parsing.
+
+Parser packing is now a second explicit phase (`wmp_pack`). The Worker frees the
+raw MIDI allocation after `wmp_parse` succeeds and before the serialized wire
+image is created. The serialized result is also explicitly released immediately
+after JS copies it, so a previously loaded giant MIDI cannot retain its old
+capacity into the next load.
+
+The isolated MIDI parser Worker keeps a 64 MiB initial memory but can grow to the
+4 GiB wasm32 ceiling on desktop browsers. Qt and SnappySynth memory limits are
+unchanged.
+
+## Pass 12.5 — adaptive Memory64 parser budget
+
+The dedicated background MIDI parser is now built as full WebAssembly Memory64
+while the Qt renderer/player remains wasm32. The parser starts at 64 MiB and has
+no WASMIDI-specific runtime RAM budget below the browser engine's Memory64
+ceiling. `ALLOW_MEMORY_GROWTH` commits pages only as allocations need them and
+geometric overgrowth is disabled, so an allocation fails when the browser/OS can
+no longer supply memory rather than because WASMIDI chose an arbitrary 2/4 GiB
+limit.
+
+Current Chromium/V8 implements a 16 GiB hard ceiling for one Memory64 linear
+memory. That browser-engine ceiling cannot be raised by application JavaScript,
+and browsers do not expose exact free system RAM. For Chrome 133+ this still
+raises the isolated parser from wasm32's 4 GiB maximum to 16 GiB and lets real
+machine/process pressure decide any lower effective limit.
+
+The file picker no longer builds a second full-size JavaScript copy of the MIDI.
+The selected `File` is streamed directly into the already-grown parser heap.
+Likewise, the packed document is transferred to the Qt module in 16 MiB chunks,
+removing the previous full result-sized JS staging allocation.
+
+Qt remains wasm32 but is explicitly allowed to grow to its 4 GiB address-space
+ceiling. A parsed wire image larger than that is reported as requiring segmented
+player residency rather than being silently truncated through a 32-bit ABI.

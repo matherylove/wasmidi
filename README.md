@@ -225,3 +225,14 @@ Proyecto personal de Dekxtopia. Todos los derechos reservados.
 - UI inspirada en `MPWGL2.html`
 - Qt para WebAssembly - The Qt Company
 - Emscripten - Emscripten contributors
+
+### Large-MIDI memory model (Pass 12.5)
+
+On modern Chromium/Firefox the background parser uses WebAssembly Memory64 and
+grows on demand instead of stopping at the old wasm32 2/4 GiB parser ceiling.
+WASMIDI does not attempt to guess "free RAM" (the browser does not expose an
+exact value); allocation continues until the browser/OS refuses additional
+pages, up to the current 16 GiB Memory64 per-memory engine limit. File input and
+parser-result transport are streamed/chunked to avoid duplicate file-sized JS
+buffers. The Qt UI module is still wasm32 and can use up to its 4 GiB address
+space; documents larger than that require the future segmented-residency path.

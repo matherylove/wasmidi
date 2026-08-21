@@ -94,13 +94,16 @@ void wasmidi_browser_loading_failed(
 extern "C" EMSCRIPTEN_KEEPALIVE
 void wasmidi_browser_parsed_midi_selected(
     const unsigned char* data,
-    int dataSize,
+    double dataSize,
     const char* fileName,
     int fileNameSize)
 {
     if (!g_browserMainWindow ||
         !data ||
-        dataSize <= 0) {
+        !std::isfinite(dataSize) ||
+        dataSize <= 0.0 ||
+        dataSize > static_cast<double>(
+            std::numeric_limits<std::size_t>::max())) {
         return;
     }
 
@@ -276,8 +279,25 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                     stage || 'Loading MIDI');
             };
 
+        let worker = null;
+        let parsedInstallPtr = 0;
+        let parsedInstallSize = 0;
+        let parsedInstallOffset = 0;
+        let parsedInstallName = '';
+
+        const releaseParsedInstall = () => {
+            if (parsedInstallPtr) {
+                try { _free(parsedInstallPtr); } catch (_) {}
+            }
+            parsedInstallPtr = 0;
+            parsedInstallSize = 0;
+            parsedInstallOffset = 0;
+            parsedInstallName = '';
+        };
+
         const failLoading =
             (text) => {
+                releaseParsedInstall();
                 const bytes =
                     new TextEncoder().encode(
                         String(text || 'Could not parse MIDI'));
@@ -295,8 +315,6 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                 }
             };
 
-        let worker = null;
-
         try {
             if (typeof Worker !== 'function') {
                 throw new Error(
@@ -307,7 +325,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             worker =
                 new Worker(
-                    './midi-parser-worker.js?v=12.2');
+                    './midi-parser-worker.js?v=12.5');
 
             worker.onmessage =
                 (event) => {
@@ -333,21 +351,86 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         return;
                     }
 
-                    if (message.type !== 'result' ||
-                        !(message.data instanceof ArrayBuffer)) {
+                    if (message.type === 'result-begin') {
+                        releaseParsedInstall();
+
+                        const total = Number(message.size);
+                        if (!Number.isSafeInteger(total) || total <= 0) {
+                            failLoading('Parser returned an invalid document size.');
+                            if (worker) worker.terminate();
+                            worker = null;
+                            cleanup();
+                            return;
+                        }
+
+                        // Qt itself is still wasm32. Give it the full 4 GiB
+                        // address space instead of the historical 2 GiB default,
+                        // but never allow JS -> i32 truncation for a >4 GiB wire
+                        // image. The Memory64 parser can be much larger because
+                        // it no longer shares this heap.
+                        if (total > 0xffffffff) {
+                            failLoading(
+                                'Parsed MIDI document is larger than the 4 GiB Qt wasm32 address space. ' +
+                                'The Memory64 parser accepted it, but this file requires segmented player residency.');
+                            if (worker) worker.terminate();
+                            worker = null;
+                            cleanup();
+                            return;
+                        }
+
+                        parsedInstallPtr =
+                            _malloc(Math.max(1, total)) >>> 0;
+                        if (!parsedInstallPtr) {
+                            failLoading(
+                                'The browser/OS could not commit enough memory to install the parsed MIDI in the player.');
+                            if (worker) worker.terminate();
+                            worker = null;
+                            cleanup();
+                            return;
+                        }
+
+                        parsedInstallSize = total;
+                        parsedInstallOffset = 0;
+                        parsedInstallName =
+                            String(message.name || file.name || 'browser.mid');
+                        setProgress(95, 'Streaming parsed MIDI into player memory');
                         return;
                     }
 
-                    const bytes =
-                        new Uint8Array(message.data);
+                    if (message.type === 'result-chunk') {
+                        if (!parsedInstallPtr ||
+                            !(message.data instanceof ArrayBuffer)) {
+                            failLoading('Unexpected parsed-MIDI chunk.');
+                            if (worker) worker.terminate();
+                            worker = null;
+                            cleanup();
+                            return;
+                        }
 
-                    const dataPtr =
-                        _malloc(
-                            Math.max(1, bytes.length));
+                        const offset = Number(message.offset);
+                        const bytes = new Uint8Array(message.data);
+                        if (!Number.isSafeInteger(offset) ||
+                            offset !== parsedInstallOffset ||
+                            offset + bytes.length > parsedInstallSize) {
+                            failLoading('Parsed-MIDI transfer became out of order.');
+                            if (worker) worker.terminate();
+                            worker = null;
+                            cleanup();
+                            return;
+                        }
 
-                    if (!dataPtr) {
-                        failLoading(
-                            'Could not allocate WASM memory for parsed MIDI.');
+                        HEAPU8.set(bytes, parsedInstallPtr + offset);
+                        parsedInstallOffset += bytes.length;
+                        return;
+                    }
+
+                    if (message.type !== 'result-end')
+                        return;
+
+                    if (!parsedInstallPtr ||
+                        parsedInstallOffset !== parsedInstallSize ||
+                        Number(message.size) !== parsedInstallSize) {
+                        failLoading('Parsed-MIDI transfer ended before all bytes arrived.');
                         if (worker) worker.terminate();
                         worker = null;
                         cleanup();
@@ -356,23 +439,18 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
                     const nameBytes =
                         new TextEncoder().encode(
-                            message.name || file.name || 'browser.mid');
-
+                            parsedInstallName || file.name || 'browser.mid');
                     const namePtr =
-                        _malloc(
-                            Math.max(1, nameBytes.length));
+                        _malloc(Math.max(1, nameBytes.length));
 
                     if (!namePtr) {
-                        _free(dataPtr);
-                        failLoading(
-                            'Could not allocate MIDI filename memory.');
+                        failLoading('Could not allocate MIDI filename memory.');
                         if (worker) worker.terminate();
                         worker = null;
                         cleanup();
                         return;
                     }
 
-                    HEAPU8.set(bytes, dataPtr);
                     if (nameBytes.length)
                         HEAPU8.set(nameBytes, namePtr);
 
@@ -380,13 +458,13 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
                     try {
                         _wasmidi_browser_parsed_midi_selected(
-                            dataPtr,
-                            bytes.length,
+                            parsedInstallPtr,
+                            parsedInstallSize,
                             namePtr,
                             nameBytes.length);
                     } finally {
                         _free(namePtr);
-                        _free(dataPtr);
+                        releaseParsedInstall();
                         if (worker) worker.terminate();
                         worker = null;
                         cleanup();

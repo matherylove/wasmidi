@@ -73,3 +73,38 @@ and catches C++ allocation/standard exceptions around the complete parse and
 serialization operation. Parser-only Emscripten assertions remain enabled so a
 future fatal runtime error reports its actual reason and stage instead of only
 `Aborted()`.
+
+## Pass 12.4 memory regression validation
+
+- Compared the old and new keyboard-index algorithms on randomized multi-track
+  MIDIs, zero-length notes, orphan NoteOns, overlapping FIFO notes, and a
+  200,000-note crashpoint. `visualNotes`, `visualKeyStarts`, `visualKeyEnds`, and
+  `visualKeyOwners` were byte-identical.
+- A native 2,000,000-note identical crashpoint produced the same document hashes
+  while peak RSS fell from about 82,008 KiB to 73,084 KiB. The removed temporary
+  saves approximately 8 bytes per raw visual note, so the benefit scales
+  linearly on the giant files that triggered the 2 GiB failure.
+- The generated-module CI smoke test now requires the phased `_wmp_parse` / raw
+  input free / `_wmp_pack` API and parses an additional 250,000-note dense
+  zero-length crashpoint before deployment.
+- Parser result capacity is explicitly released after transfer and before the
+  next load.
+
+## Pass 12.5 Memory64 / adaptive-RAM validation
+
+- Parser compile+link flags select `MEMORY64=1`, keep a 64 MiB initial heap, set
+  the current Chromium/V8 Memory64 ceiling (16 GiB), and disable geometric heap
+  over-allocation.
+- `_wmp_pointer_bits()` is part of the generated ABI; the Worker and CI smoke
+  test require 64-bit pointers so an accidental wasm32 build cannot deploy.
+- The Worker uses BigInt for wasm64 pointer/`size_t` calls and converts addresses
+  to JavaScript numbers only after verifying they are exact safe integers.
+- Raw MIDI bytes are streamed directly from `File.stream()` into the parser heap;
+  no file-sized JavaScript `Uint8Array` is retained.
+- Packed documents are transferred in 16 MiB transferable chunks instead of one
+  result-sized JavaScript buffer.
+- GitHub Actions selects Node 24 for the generated-module smoke test because that
+  runtime supports WebAssembly Memory64.
+- Local syntax/native checks do not substitute for the authoritative Emscripten
+  Memory64 link; CI must compile and execute the generated parser module before
+  deployment.
