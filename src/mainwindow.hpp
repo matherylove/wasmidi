@@ -231,6 +231,13 @@ private:
     std::array<int8_t, 128> visualPitchColor_{};
     std::array<uint32_t, 16> visualColorVoices_{};
 
+    // Incremental +150 ms neural-color lookahead. This replaces rescanning
+    // the same dense future event window on every UI frame.
+    bool neuralWindowValid_ = false;
+    std::size_t neuralFutureLo_ = 0;
+    std::size_t neuralFutureHi_ = 0;
+    std::array<uint64_t, 16> neuralFutureColors_{};
+
     float dominantHue_ = 230.0f;
     float neuralActivity_ = 0.0f;
 };

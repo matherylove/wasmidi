@@ -4,10 +4,12 @@
 #include "renderer/gl_renderer.hpp"
 
 #include <QOpenGLFramebufferObject>
+#include <QOpenGLFramebufferObjectFormat>
 #include <QQuickOpenGLUtils>
 #include <QQuickWindow>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -18,35 +20,56 @@ namespace {
 class PianoRollRenderer final
     : public QQuickFramebufferObject::Renderer {
 public:
-    explicit PianoRollRenderer(qreal dpr)
-        : dpr_(std::max<qreal>(1.0, dpr))
+    PianoRollRenderer(
+        qreal dpr,
+        std::atomic<int>* fps)
+        : dpr_(
+            std::max<qreal>(
+                1.0,
+                dpr)),
+          fps_(fps)
     {
     }
 
     QOpenGLFramebufferObject*
-    createFramebufferObject(const QSize& size) override
+    createFramebufferObject(
+        const QSize& size) override
     {
-        // Match the original HTML canvas raster density. Qt supplies a
-        // DPR-scaled requested size, so divide once when creating the FBO.
         const QSize cssSize(
             std::max(
                 64,
                 qRound(
-                    size.width() / dpr_)),
+                    size.width() /
+                    dpr_)),
             std::max(
                 64,
                 qRound(
-                    size.height() / dpr_)));
+                    size.height() /
+                    dpr_)));
+
+        // Pass 8 disabled depth entirely. Dense same-pitch notes therefore
+        // incurred full fragment overdraw. SharpMIDI relies on depth testing,
+        // so give the Qt FBO an actual depth/stencil attachment.
+        QOpenGLFramebufferObjectFormat
+            format;
+
+        format.setAttachment(
+            QOpenGLFramebufferObject::
+                CombinedDepthStencil);
+
+        format.setSamples(0);
 
         return new QOpenGLFramebufferObject(
-            cssSize);
+            cssSize,
+            format);
     }
 
     void synchronize(
         QQuickFramebufferObject* item) override
     {
         auto* roll =
-            static_cast<PianoRoll*>(item);
+            static_cast<PianoRoll*>(
+                item);
 
         auto* controller =
             qobject_cast<MainWindow*>(
@@ -62,13 +85,19 @@ public:
             controller->postBuffer());
 
         renderer_.setPerTrackColors(
-            controller->perTrackColors());
+            controller->
+                perTrackColors());
+
+        renderer_.setNeuralVisual(
+            controller->dominantHue(),
+            controller->neuralActivity());
 
         const auto& colors =
             controller->channelColors();
 
         for (int i = 0;
-             i < colors.size() && i < 16;
+             i < colors.size() &&
+             i < 16;
              ++i) {
             renderer_.setChannelColor(
                 static_cast<uint8_t>(i),
@@ -90,12 +119,15 @@ public:
             Clock::now();
 
         if (revision_ !=
-            controller->documentRevision()) {
+            controller->
+                documentRevision()) {
             revision_ =
-                controller->documentRevision();
+                controller->
+                    documentRevision();
 
             renderer_.setDocument(
-                &controller->document());
+                &controller->
+                    document());
         }
     }
 
@@ -103,24 +135,19 @@ public:
     {
         if (auto* fbo =
                 framebufferObject()) {
-            const QSize size =
-                fbo->size();
-
             renderer_.resize(
-                size.width(),
-                size.height());
+                fbo->size().width(),
+                fbo->size().height());
         }
 
         float renderTime =
             syncedTimeSeconds_;
 
         if (syncedPlaying_) {
-            const auto now =
-                Clock::now();
-
             const std::chrono::duration<float>
                 elapsed =
-                    now - syncWallClock_;
+                    Clock::now() -
+                    syncWallClock_;
 
             renderTime +=
                 elapsed.count();
@@ -134,16 +161,48 @@ public:
         QQuickOpenGLUtils::
             resetOpenGLState();
 
-        // Single animation source for the roll.
-        if (syncedPlaying_)
-            update();
+        updateFps();
+
+        // GPU neural background animates even while paused, replacing the old
+        // QML FrameAnimation/Canvas loop with this single scene-graph source.
+        update();
     }
 
 private:
     using Clock =
         std::chrono::steady_clock;
 
+    void updateFps()
+    {
+        ++fpsFrames_;
+
+        const auto now =
+            Clock::now();
+
+        const std::chrono::duration<double>
+            elapsed =
+                now -
+                fpsWindowStart_;
+
+        if (elapsed.count() >= .5) {
+            if (fps_) {
+                fps_->store(
+                    static_cast<int>(
+                        std::lround(
+                            double(
+                                fpsFrames_) /
+                            elapsed.count())),
+                    std::memory_order_relaxed);
+            }
+
+            fpsFrames_ = 0;
+            fpsWindowStart_ = now;
+        }
+    }
+
     qreal dpr_ = 1.0;
+    std::atomic<int>* fps_ = nullptr;
+
     wasmidi::GLRenderer renderer_;
 
     quint64 revision_ =
@@ -155,18 +214,26 @@ private:
 
     Clock::time_point syncWallClock_ =
         Clock::now();
+
+    Clock::time_point fpsWindowStart_ =
+        Clock::now();
+
+    int fpsFrames_ = 0;
 };
 
 } // namespace
 
-PianoRoll::PianoRoll(QQuickItem* parent)
-    : QQuickFramebufferObject(parent)
+PianoRoll::PianoRoll(
+    QQuickItem* parent)
+    : QQuickFramebufferObject(
+        parent)
 {
     setMirrorVertically(false);
     setTextureFollowsItemSize(true);
 }
 
-void PianoRoll::setController(QObject* controller)
+void PianoRoll::setController(
+    QObject* controller)
 {
     if (controller_ == controller)
         return;
@@ -184,74 +251,63 @@ void PianoRoll::setController(QObject* controller)
     if (auto* player =
             qobject_cast<MainWindow*>(
                 controller_.data())) {
-        auto requestSync =
+        auto request =
             [this]() {
                 update();
             };
 
         connect(
             player,
-            &MainWindow::documentRevisionChanged,
+            &MainWindow::
+                documentRevisionChanged,
             this,
-            requestSync);
+            request);
 
         connect(
             player,
-            &MainWindow::noteSpeedChanged,
+            &MainWindow::
+                noteSpeedChanged,
             this,
-            requestSync);
+            request);
 
         connect(
             player,
-            &MainWindow::postBufferChanged,
+            &MainWindow::
+                postBufferChanged,
             this,
-            requestSync);
+            request);
 
         connect(
             player,
-            &MainWindow::perTrackColorsChanged,
+            &MainWindow::
+                perTrackColorsChanged,
             this,
-            requestSync);
+            request);
 
         connect(
             player,
-            &MainWindow::channelColorsChanged,
+            &MainWindow::
+                channelColorsChanged,
             this,
-            requestSync);
+            request);
 
         connect(
             player,
-            &MainWindow::playingChanged,
+            &MainWindow::
+                playingChanged,
             this,
-            requestSync);
+            request);
 
-        // Playback frames are render-thread driven. Synchronize only paused
-        // seeks or large discontinuities so Qt does not schedule a second loop.
-        auto lastControllerTime =
-            std::make_shared<float>(
-                player->currentTime());
-
+        // Normal animation is driven exclusively by Renderer::update().
+        // Paused seeks need an immediate synchronization.
         connect(
             player,
-            &MainWindow::currentTimeChanged,
+            &MainWindow::
+                currentTimeChanged,
             this,
-            [this,
-             player,
-             lastControllerTime]() {
-                const float now =
-                    player->currentTime();
-
-                const float delta =
-                    std::fabs(
-                        now -
-                        *lastControllerTime);
-
-                *lastControllerTime = now;
-
-                if (!player->isPlaying() ||
-                    delta > 0.10f) {
+            [this, player]() {
+                if (!player->isPlaying())
                     update();
-                }
             });
     }
 
@@ -264,8 +320,11 @@ PianoRoll::createRenderer() const
 {
     const qreal dpr =
         window()
-            ? window()->devicePixelRatio()
+            ? window()->
+                devicePixelRatio()
             : 1.0;
 
-    return new PianoRollRenderer(dpr);
+    return new PianoRollRenderer(
+        dpr,
+        &renderFps_);
 }

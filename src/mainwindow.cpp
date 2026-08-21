@@ -194,16 +194,13 @@ MainWindow::MainWindow(QObject* parent)
 
     frameTimer->start(16);
 
-    auto* schedulerTimer = new QTimer(this);
-    schedulerTimer->setTimerType(Qt::PreciseTimer);
-
-    connect(
-        schedulerTimer,
-        &QTimer::timeout,
-        this,
-        &MainWindow::dispatchScheduler);
-
-    schedulerTimer->start(5);
+    /*
+     * Do NOT run the 5 ms scheduler until an actual MIDI/audio sink is
+     * connected. Pass 8 was building a 250 ms event queue 200 times/second
+     * and immediately discarding it in dispatchScheduler(), which is
+     * catastrophic on Black MIDI. The scheduler remains available for the
+     * audio-driver port and will be driven by that sink.
+     */
 }
 
 MainWindow::~MainWindow()
@@ -352,6 +349,11 @@ void MainWindow::invalidateLiveTrackers()
     liveCcLo_ = 0;
     liveNpsCount_ = 0;
     liveCcCount_ = 0;
+
+    neuralWindowValid_ = false;
+    neuralFutureLo_ = 0;
+    neuralFutureHi_ = 0;
+    neuralFutureColors_.fill(0);
 }
 
 void MainWindow::clearFile()
@@ -992,6 +994,11 @@ void MainWindow::processVisualEvent(
     const uint8_t soundingColor =
         visualStateColor_[state] & 0x0f;
 
+    // Same ownership rule used by the GPU sweep: an old track's NoteOff must
+    // not terminate a newer colored segment using the same channel+pitch.
+    if (perTrackColors_ && soundingColor != color)
+        return;
+
     --visualStateCount_[state];
 
     if (visualPitchCount_[pitch] != 0)
@@ -1128,18 +1135,11 @@ void MainWindow::updateNeuralVisuals()
 {
     float newHue = dominantHue_;
 
-    std::array<uint64_t, 16> frequency{};
-
-    for (int i = 0; i < 16; ++i)
-        frequency[i] = visualColorVoices_[i];
-
-    // Preserve MPWGL2's slight look-ahead for background color reaction.
     if (!document_.tickGroups.empty()) {
         const double futureSeconds =
             std::min<double>(
                 duration_,
-                double(currentTime_) +
-                0.15);
+                double(currentTime_) + 0.15);
 
         const uint32_t futureTick =
             static_cast<uint32_t>(
@@ -1149,63 +1149,123 @@ void MainWindow::updateNeuralVisuals()
                         document_.secondsToTick(
                             futureSeconds))));
 
-        const std::size_t futureEnd =
+        const std::size_t targetLo =
+            visualGroupCursor_;
+
+        const std::size_t targetHi =
             document_.upperBoundGroup(
                 futureTick);
 
-        for (std::size_t groupIndex =
-                 visualGroupCursor_;
-             groupIndex < futureEnd;
-             ++groupIndex) {
-            const auto& group =
-                document_.tickGroups[groupIndex];
+        const bool rebuild =
+            !neuralWindowValid_ ||
+            targetLo < neuralFutureLo_ ||
+            targetHi < neuralFutureHi_ ||
+            targetLo > targetHi;
 
-            const std::size_t begin =
-                group.eventOffset;
+        auto addGroupColors =
+            [this](std::size_t groupIndex,
+                   int direction) {
+                const auto& group =
+                    document_.tickGroups[
+                        groupIndex];
 
-            const std::size_t end =
-                begin + group.eventCount;
+                const std::size_t begin =
+                    group.eventOffset;
 
-            for (std::size_t i = begin;
-                 i < end;
-                 ++i) {
-                const auto& event =
-                    document_.events[i];
+                const std::size_t end =
+                    begin + group.eventCount;
 
-                if ((event.status & 0xf0) ==
-                        0x90 &&
-                    event.data2 != 0) {
-                    ++frequency[
+                for (std::size_t i = begin;
+                     i < end;
+                     ++i) {
+                    const auto& event =
+                        document_.events[i];
+
+                    if ((event.status & 0xf0) !=
+                            0x90 ||
+                        event.data2 == 0) {
+                        continue;
+                    }
+
+                    const uint8_t color =
                         document_.colorIndex(
                             event,
-                            perTrackColors_)];
+                            perTrackColors_);
+
+                    if (direction > 0) {
+                        ++neuralFutureColors_[
+                            color];
+                    } else if (
+                        neuralFutureColors_[
+                            color] != 0) {
+                        --neuralFutureColors_[
+                            color];
+                    }
                 }
+            };
+
+        if (rebuild) {
+            neuralFutureColors_.fill(0);
+
+            for (std::size_t groupIndex =
+                     targetLo;
+                 groupIndex < targetHi;
+                 ++groupIndex) {
+                addGroupColors(
+                    groupIndex,
+                    +1);
+            }
+        } else {
+            while (neuralFutureLo_ <
+                   targetLo) {
+                addGroupColors(
+                    neuralFutureLo_,
+                    -1);
+
+                ++neuralFutureLo_;
+            }
+
+            while (neuralFutureHi_ <
+                   targetHi) {
+                addGroupColors(
+                    neuralFutureHi_,
+                    +1);
+
+                ++neuralFutureHi_;
             }
         }
-    }
 
-    int bestColor = -1;
-    uint64_t bestCount = 0;
+        neuralFutureLo_ = targetLo;
+        neuralFutureHi_ = targetHi;
+        neuralWindowValid_ = true;
 
-    for (int color = 0;
-         color < 16;
-         ++color) {
-        if (frequency[color] >
-            bestCount) {
-            bestCount =
-                frequency[color];
+        uint64_t bestCount = 0;
+        int bestColor = -1;
 
-            bestColor = color;
+        for (int color = 0;
+             color < 16;
+             ++color) {
+            const uint64_t combined =
+                uint64_t(
+                    visualColorVoices_[
+                        color]) +
+                neuralFutureColors_[
+                    color];
+
+            if (combined > bestCount) {
+                bestCount = combined;
+                bestColor = color;
+            }
         }
-    }
 
-    if (bestColor >= 0 &&
-        bestColor <
-            channelColors_.size()) {
-        newHue =
-            colorHue(
-                channelColors_[
-                    bestColor]);
+        if (bestColor >= 0 &&
+            bestColor <
+                channelColors_.size()) {
+            newHue =
+                colorHue(
+                    channelColors_[
+                        bestColor]);
+        }
     }
 
     const float activity =
@@ -1459,17 +1519,6 @@ void MainWindow::updateCurrentTime()
 
 void MainWindow::dispatchScheduler()
 {
-    if (!isPlaying_ ||
-        !hasMidi()) {
-        return;
-    }
-
-    const auto& scheduled =
-        scheduler_.getEventsForWindow(
-            currentTime_,
-            0.25f,
-            0.05f);
-
-    // Native hand-off point for the Web MIDI / embedded synth driver.
-    (void)scheduled;
+    // Reserved for the audio-driver output sink. Do not materialize scheduler
+    // windows when no consumer exists.
 }
