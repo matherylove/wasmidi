@@ -7,11 +7,11 @@
 #include <QQuickOpenGLUtils>
 #include <QQuickWindow>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
-#include <vector>
 
 namespace {
 
@@ -19,37 +19,41 @@ class PianoRollRenderer final
     : public QQuickFramebufferObject::Renderer {
 public:
     explicit PianoRollRenderer(qreal dpr)
-        : dpr_(std::max<qreal>(1.0, dpr)) {}
+        : dpr_(std::max<qreal>(1.0, dpr))
+    {
+    }
 
     QOpenGLFramebufferObject*
     createFramebufferObject(const QSize& size) override
     {
+        // Match the original HTML canvas raster density. Qt supplies a
+        // DPR-scaled requested size, so divide once when creating the FBO.
         const QSize cssSize(
-            std::max(64, qRound(size.width() / dpr_)),
-            std::max(64, qRound(size.height() / dpr_)));
-        /*
-         * IMPORTANT: Qt documents that `size` already includes the device
-         * pixel ratio. Returning this exact size gives us the physical-pixel
-         * WebGL target (for example Windows 125/150% scaling).
-         */
-        return new QOpenGLFramebufferObject(cssSize);
+            std::max(
+                64,
+                qRound(
+                    size.width() / dpr_)),
+            std::max(
+                64,
+                qRound(
+                    size.height() / dpr_)));
+
+        return new QOpenGLFramebufferObject(
+            cssSize);
     }
 
-    void synchronize(QQuickFramebufferObject* item) override
+    void synchronize(
+        QQuickFramebufferObject* item) override
     {
-        auto* roll = static_cast<PianoRoll*>(item);
+        auto* roll =
+            static_cast<PianoRoll*>(item);
+
         auto* controller =
-            qobject_cast<MainWindow*>(roll->controller());
+            qobject_cast<MainWindow*>(
+                roll->controller());
 
         if (!controller)
             return;
-
-        /*
-         * Do NOT call renderer_.resize(roll->width(), roll->height()) here.
-         * Those are logical QML pixels. The QQuickFramebufferObject itself is
-         * DPR-scaled, so doing that made the private MPWGL2 textures lower
-         * resolution than the actual FBO and stretched them on presentation.
-         */
 
         renderer_.setNoteSpeed(
             controller->noteSpeed());
@@ -68,9 +72,12 @@ public:
              ++i) {
             renderer_.setChannelColor(
                 static_cast<uint8_t>(i),
-                static_cast<uint8_t>(colors[i].red()),
-                static_cast<uint8_t>(colors[i].green()),
-                static_cast<uint8_t>(colors[i].blue()));
+                static_cast<uint8_t>(
+                    colors[i].red()),
+                static_cast<uint8_t>(
+                    colors[i].green()),
+                static_cast<uint8_t>(
+                    colors[i].blue()));
         }
 
         syncedTimeSeconds_ =
@@ -87,67 +94,47 @@ public:
             revision_ =
                 controller->documentRevision();
 
-            const auto& document =
-                controller->document();
-
-            std::vector<wasmidi::TempoPoint> tempo;
-            tempo.reserve(document.tempoMap.size());
-
-            for (const auto& point : document.tempoMap) {
-                tempo.push_back({
-                    point.tick,
-                    point.microsecondsPerBeat
-                });
-            }
-
-            renderer_.setTempoMap(
-                tempo,
-                document.ticksPerBeat);
-
-            renderer_.setActiveChannelMasks(
-                document.activeChannelMasks);
-
-            renderer_.setNotesView(&document.notes);
+            renderer_.setDocument(
+                &controller->document());
         }
     }
 
     void render() override
     {
-        /*
-         * framebufferObject()->size() is the authoritative physical-pixel
-         * resolution. Qt already multiplied it by devicePixelRatio.
-         */
-        if (auto* fbo = framebufferObject()) {
-            const QSize pixelSize = fbo->size();
+        if (auto* fbo =
+                framebufferObject()) {
+            const QSize size =
+                fbo->size();
 
             renderer_.resize(
-                pixelSize.width(),
-                pixelSize.height());
+                size.width(),
+                size.height());
         }
 
         float renderTime =
             syncedTimeSeconds_;
 
         if (syncedPlaying_) {
-            const auto now = Clock::now();
+            const auto now =
+                Clock::now();
 
             const std::chrono::duration<float>
                 elapsed =
                     now - syncWallClock_;
 
-            renderTime += elapsed.count();
+            renderTime +=
+                elapsed.count();
         }
 
-        renderer_.setCurrentTime(renderTime);
+        renderer_.setCurrentTime(
+            renderTime);
+
         renderer_.renderRoll();
 
-        QQuickOpenGLUtils::resetOpenGLState();
+        QQuickOpenGLUtils::
+            resetOpenGLState();
 
-        /*
-         * This is the ONE continuous scheduling path for the piano roll.
-         * GUI currentTimeChanged no longer requests another window frame every
-         * 16 ms at the same time.
-         */
+        // Single animation source for the roll.
         if (syncedPlaying_)
             update();
     }
@@ -160,7 +147,8 @@ private:
     wasmidi::GLRenderer renderer_;
 
     quint64 revision_ =
-        std::numeric_limits<quint64>::max();
+        std::numeric_limits<
+            quint64>::max();
 
     float syncedTimeSeconds_ = 0.0f;
     bool syncedPlaying_ = false;
@@ -185,8 +173,10 @@ void PianoRoll::setController(QObject* controller)
 
     if (controller_) {
         QObject::disconnect(
-            controller_.data(), nullptr,
-            this, nullptr);
+            controller_.data(),
+            nullptr,
+            this,
+            nullptr);
     }
 
     controller_ = controller;
@@ -194,16 +184,11 @@ void PianoRoll::setController(QObject* controller)
     if (auto* player =
             qobject_cast<MainWindow*>(
                 controller_.data())) {
+        auto requestSync =
+            [this]() {
+                update();
+            };
 
-        auto requestSync = [this]() {
-            update();
-        };
-
-        /*
-         * Real state changes need a synchronize() pass.
-         * Normal playback frames are generated exclusively by
-         * PianoRollRenderer::update().
-         */
         connect(
             player,
             &MainWindow::documentRevisionChanged,
@@ -240,11 +225,8 @@ void PianoRoll::setController(QObject* controller)
             this,
             requestSync);
 
-        /*
-         * currentTimeChanged is emitted by the 16 ms UI clock, but we must not
-         * render from every emission as well. Only synchronize a paused seek
-         * or an obvious discontinuity/jump while playing.
-         */
+        // Playback frames are render-thread driven. Synchronize only paused
+        // seeks or large discontinuities so Qt does not schedule a second loop.
         auto lastControllerTime =
             std::make_shared<float>(
                 player->currentTime());
@@ -253,13 +235,16 @@ void PianoRoll::setController(QObject* controller)
             player,
             &MainWindow::currentTimeChanged,
             this,
-            [this, player, lastControllerTime]() {
+            [this,
+             player,
+             lastControllerTime]() {
                 const float now =
                     player->currentTime();
 
                 const float delta =
                     std::fabs(
-                        now - *lastControllerTime);
+                        now -
+                        *lastControllerTime);
 
                 *lastControllerTime = now;
 
@@ -277,6 +262,10 @@ void PianoRoll::setController(QObject* controller)
 QQuickFramebufferObject::Renderer*
 PianoRoll::createRenderer() const
 {
-    const qreal dpr = window() ? window()->devicePixelRatio() : 1.0;
+    const qreal dpr =
+        window()
+            ? window()->devicePixelRatio()
+            : 1.0;
+
     return new PianoRollRenderer(dpr);
 }

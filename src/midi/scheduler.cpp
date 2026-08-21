@@ -1,19 +1,22 @@
 #include "scheduler.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace wasmidi {
 
-MidiScheduler::MidiScheduler() = default;
+MidiScheduler::MidiScheduler()
+{
+    pendingEvents_.reserve(4096);
+}
+
 MidiScheduler::~MidiScheduler() = default;
 
 void MidiScheduler::setDocument(const MidiDocument* doc)
 {
     document_ = doc;
     currentTime_ = 0.0f;
-    noteCursor_ = 0;
-    controlCursor_ = 0;
-    soundingNotes_.clear();
+    groupCursor_ = 0;
     pendingEvents_.clear();
 }
 
@@ -29,9 +32,7 @@ void MidiScheduler::start()
 
 void MidiScheduler::pause()
 {
-    // MPWGL2 performs AllOff and clears soundingNotes when pausing.
     playing_ = false;
-    soundingNotes_.clear();
     pendingEvents_.clear();
 }
 
@@ -44,44 +45,35 @@ void MidiScheduler::stop()
 {
     playing_ = false;
     currentTime_ = 0.0f;
-    noteCursor_ = 0;
-    controlCursor_ = 0;
-    soundingNotes_.clear();
+    groupCursor_ = 0;
     pendingEvents_.clear();
 }
 
 void MidiScheduler::seek(float seconds)
 {
     currentTime_ = std::max(0.0f, seconds);
-    soundingNotes_.clear();
     pendingEvents_.clear();
 
     if (!document_) {
-        noteCursor_ = 0;
-        controlCursor_ = 0;
+        groupCursor_ = 0;
         return;
     }
 
-    // resetDispatch()/resume parity: rewind 50 ms.
-    const float from = std::max(0.0f, currentTime_ - 0.05f);
+    // Same small resume/seek rewind used by the previous MPWGL2 port, but the
+    // cursor now points into the sparse tick index instead of a NoteEvent list.
+    const double fromSeconds =
+        std::max(0.0, double(currentTime_) - 0.05);
 
-    noteCursor_ = static_cast<std::size_t>(
-        std::lower_bound(
-            document_->notes.begin(),
-            document_->notes.end(),
-            from,
-            [](const NoteEvent& note, float time) {
-                return note.startTime < time;
-            }) - document_->notes.begin());
+    const uint32_t fromTick =
+        static_cast<uint32_t>(
+            std::max(
+                0.0,
+                std::floor(
+                    document_->secondsToTick(
+                        fromSeconds))));
 
-    controlCursor_ = static_cast<std::size_t>(
-        std::lower_bound(
-            document_->controls.begin(),
-            document_->controls.end(),
-            from,
-            [](const ControlEvent& event, float time) {
-                return event.time < time;
-            }) - document_->controls.begin());
+    groupCursor_ =
+        document_->lowerBoundGroup(fromTick);
 }
 
 const std::vector<MidiScheduler::ScheduledEvent>&
@@ -93,90 +85,76 @@ MidiScheduler::getEventsForWindow(
     pendingEvents_.clear();
     currentTime_ = std::max(0.0f, now);
 
-    if (!playing_ || !document_)
+    if (!playing_ ||
+        !document_ ||
+        document_->tickGroups.empty()) {
         return pendingEvents_;
-
-    const float horizonTime =
-        currentTime_ + std::max(0.0f, horizon);
-    const float earliest =
-        currentTime_ - std::max(0.0f, lookback);
-
-    // MPWGL2: while(dispCursor < noteCount &&
-    //               startArr[dispCursor] < horizon)
-    while (noteCursor_ < document_->notes.size() &&
-           document_->notes[noteCursor_].startTime < horizonTime) {
-        const NoteEvent& note = document_->notes[noteCursor_];
-
-        if (note.startTime >= earliest) {
-            pendingEvents_.push_back({
-                note.startTime,
-                0x90,
-                note.channel,
-                note.pitch,
-                note.velocity,
-                note.track
-            });
-
-            // Same key used by the legacy Map: channel*128+pitch.
-            const uint16_t key =
-                static_cast<uint16_t>(
-                    uint16_t(note.channel) * 128u +
-                    uint16_t(note.pitch));
-
-            soundingNotes_[key] = {
-                note.endTime,
-                note.channel,
-                note.pitch,
-                note.track
-            };
-        }
-
-        ++noteCursor_;
     }
 
-    // MPWGL2 control cursor uses the same 250 ms horizon.
-    while (controlCursor_ < document_->controls.size()) {
-        const ControlEvent& event =
-            document_->controls[controlCursor_];
+    const double horizonSeconds =
+        double(currentTime_) +
+        std::max(0.0f, horizon);
 
-        if (event.time > horizonTime)
+    const double earliestSeconds =
+        std::max(
+            0.0,
+            double(currentTime_) -
+            std::max(0.0f, lookback));
+
+    const uint32_t horizonTick =
+        static_cast<uint32_t>(
+            std::min<double>(
+                document_->maxTick,
+                std::ceil(
+                    document_->secondsToTick(
+                        horizonSeconds))));
+
+    while (groupCursor_ <
+           document_->tickGroups.size()) {
+        const TickGroup& group =
+            document_->tickGroups[groupCursor_];
+
+        if (group.tick > horizonTick)
             break;
 
-        if (event.time >= earliest) {
-            pendingEvents_.push_back({
-                event.time,
-                event.type,
-                event.channel,
-                event.data1,
-                event.data2,
-                0
-            });
+        const double groupSeconds =
+            document_->tickToSeconds(
+                group.tick);
+
+        if (groupSeconds >= earliestSeconds) {
+            const std::size_t begin =
+                group.eventOffset;
+
+            const std::size_t end =
+                begin + group.eventCount;
+
+            pendingEvents_.reserve(
+                pendingEvents_.size() +
+                group.eventCount);
+
+            for (std::size_t i = begin;
+                 i < end;
+                 ++i) {
+                const CompactEvent& event =
+                    document_->events[i];
+
+                // Channel-event stream is already normalized:
+                // NoteOn velocity zero was converted to NoteOff by the parser.
+                pendingEvents_.push_back({
+                    static_cast<float>(
+                        groupSeconds),
+                    static_cast<uint8_t>(
+                        event.status & 0xf0),
+                    static_cast<uint8_t>(
+                        event.status & 0x0f),
+                    event.data1,
+                    event.data2,
+                    0
+                });
+            }
         }
 
-        ++controlCursor_;
-    }
-
-    // MPWGL2 only schedules note-off when the end is effectively due,
-    // instead of pre-queuing every NoteOff 250 ms in advance.
-    for (auto it = soundingNotes_.begin();
-         it != soundingNotes_.end();) {
-        const SoundingNote& note = it->second;
-
-        if (note.endSec <= currentTime_ + 0.008f ||
-            note.endSec < currentTime_ - 0.5f) {
-            pendingEvents_.push_back({
-                std::max(note.endSec, currentTime_),
-                0x80,
-                note.channel,
-                note.note,
-                0,
-                note.track
-            });
-
-            it = soundingNotes_.erase(it);
-        } else {
-            ++it;
-        }
+        ++groupCursor_;
     }
 
     return pendingEvents_;

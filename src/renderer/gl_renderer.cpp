@@ -15,33 +15,41 @@ GLuint compileShader(GLenum type, const char* source)
 
     GLint ok = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+
     if (ok != GL_TRUE) {
         glDeleteShader(shader);
         return 0;
     }
+
     return shader;
 }
 
-GLuint linkProgram(const char* vertexSource, const char* fragmentSource)
+GLuint linkProgram(const char* vertexSource,
+                   const char* fragmentSource)
 {
-    const GLuint vs = compileShader(GL_VERTEX_SHADER, vertexSource);
-    const GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
+    const GLuint vertex =
+        compileShader(GL_VERTEX_SHADER, vertexSource);
 
-    if (!vs || !fs) {
-        if (vs) glDeleteShader(vs);
-        if (fs) glDeleteShader(fs);
+    const GLuint fragment =
+        compileShader(GL_FRAGMENT_SHADER, fragmentSource);
+
+    if (!vertex || !fragment) {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
         return 0;
     }
 
     const GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
     glLinkProgram(program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
+
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
 
     GLint ok = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &ok);
+
     if (ok != GL_TRUE) {
         glDeleteProgram(program);
         return 0;
@@ -50,11 +58,14 @@ GLuint linkProgram(const char* vertexSource, const char* fragmentSource)
     return program;
 }
 
+constexpr std::size_t InitialRingCapacity =
+    std::size_t(1) << 18; // 262,144 visible notes ~= 3 MiB CPU + 3 MiB GPU
+
 } // namespace
 
 GLRenderer::GLRenderer()
 {
-    const uint8_t defaults[16][4] = {
+    static const uint8_t defaults[16][4] = {
         {129,140,248,255},{167,139,250,255},{196,181,253,255},{251,146, 60,255},
         { 74,222,128,255},{ 56,189,248,255},{244,114,182,255},{250,204, 21,255},
         {248,113,113,255},{ 52,211,153,255},{ 96,165,250,255},{232,121,249,255},
@@ -63,15 +74,14 @@ GLRenderer::GLRenderer()
 
     for (int i = 0; i < 16; ++i) {
         channelColors_[i] = {
-            defaults[i][0], defaults[i][1],
-            defaults[i][2], defaults[i][3]
+            defaults[i][0],
+            defaults[i][1],
+            defaults[i][2],
+            defaults[i][3]
         };
-        globalChannelColor_[i] = static_cast<int8_t>(i);
     }
 
-    tempoMap_.push_back({0, 500000});
-    rebuildTempoIndex();
-    recalcTickWindow();
+    activeNoteId_.fill(-1);
 }
 
 GLRenderer::~GLRenderer()
@@ -79,134 +89,160 @@ GLRenderer::~GLRenderer()
     destroy();
 }
 
+bool GLRenderer::createProgram()
+{
+    static const char* vertex = R"GLSL(#version 300 es
+precision highp float;
+precision highp int;
+
+layout(location=0) in int aStartTick;
+layout(location=1) in int aEndTick;
+layout(location=2) in uint aPackedData;
+
+uniform float uViewStart;
+uniform float uViewEnd;
+uniform float uCurrentTick;
+uniform vec3 uPalette[16];
+
+flat out vec3 vColor;
+flat out float vActive;
+
+void main()
+{
+    int endTick = aEndTick > 0
+        ? aEndTick
+        : int(uViewEnd);
+
+    uint vertexId = uint(gl_VertexID);
+    float useEnd = float(vertexId & 1u);
+    float useTop = float((vertexId >> 1u) & 1u);
+
+    float rangeTicks = max(1.0, uViewEnd - uViewStart);
+
+    float startX =
+        (float(aStartTick) - uViewStart) /
+        rangeTicks * 2.0 - 1.0;
+
+    float endX =
+        (float(endTick) - uViewStart) /
+        rangeTicks * 2.0 - 1.0;
+
+    float x = mix(startX, endX, useEnd);
+
+    uint pitch = (aPackedData >> 8u) & 0xffu;
+    uint colorIndex = (aPackedData >> 16u) & 0x0fu;
+
+    float yBottom =
+        -1.0 +
+        float(pitch) / 128.0 * 2.0;
+
+    float yTop =
+        -1.0 +
+        float(pitch + 1u) / 128.0 * 2.0;
+
+    float y = mix(yBottom, yTop, useTop);
+
+    vColor = uPalette[int(colorIndex)];
+
+    vActive =
+        (uCurrentTick >= float(aStartTick) &&
+         uCurrentTick <= float(endTick))
+            ? 1.0
+            : 0.0;
+
+    gl_Position = vec4(x, y, 0.0, 1.0);
+}
+)GLSL";
+
+    static const char* fragment = R"GLSL(#version 300 es
+precision mediump float;
+
+flat in vec3 vColor;
+flat in float vActive;
+
+out vec4 fragColor;
+
+void main()
+{
+    vec3 color = vColor;
+
+    if (vActive > 0.5)
+        color = min(color * 1.55 + vec3(0.12), vec3(1.0));
+
+    fragColor = vec4(color, 1.0);
+}
+)GLSL";
+
+    program_ = linkProgram(vertex, fragment);
+
+    if (!program_)
+        return false;
+
+    viewStartUniform_ =
+        glGetUniformLocation(program_, "uViewStart");
+
+    viewEndUniform_ =
+        glGetUniformLocation(program_, "uViewEnd");
+
+    currentTickUniform_ =
+        glGetUniformLocation(program_, "uCurrentTick");
+
+    paletteUniform_ =
+        glGetUniformLocation(program_, "uPalette[0]");
+
+    return true;
+}
+
 bool GLRenderer::initialize()
 {
     if (initialized_)
         return true;
 
-    if (!createPrograms())
+    if (!createProgram())
         return false;
 
-    glGenVertexArrays(1, &emptyVao_);
+    glGenVertexArrays(1, &vao_);
+    glBindVertexArray(vao_);
+
+    glGenBuffers(1, &instanceVbo_);
+    glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
+
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(2);
+
+    glVertexAttribDivisor(0, 1);
+    glVertexAttribDivisor(1, 1);
+    glVertexAttribDivisor(2, 1);
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    allocateRing(InitialRingCapacity);
 
     initialized_ = true;
-    forceFullRedraw_ = true;
     return true;
-}
-
-bool GLRenderer::createPrograms()
-{
-    static const char* fullScreenVertex = R"GLSL(#version 300 es
-precision highp float;
-void main()
-{
-    vec2 pos = vec2(
-        (gl_VertexID & 1) == 0 ? -1.0 : 1.0,
-        (gl_VertexID & 2) == 0 ? -1.0 : 1.0
-    );
-    gl_Position = vec4(pos, 0.0, 1.0);
-}
-)GLSL";
-
-    static const char* scrollFragment = R"GLSL(#version 300 es
-precision mediump float;
-uniform sampler2D uTex;
-uniform float uPlayheadX;
-uniform float uPlayheadWidth;
-out vec4 fragColor;
-
-void main()
-{
-    ivec2 sizePx = textureSize(uTex, 0);
-    vec2 uv = gl_FragCoord.xy / vec2(sizePx);
-
-    // Same vertical texture convention as MPWGL2.html.
-    uv.y = 1.0 - uv.y;
-
-    vec4 color = texture(uTex, uv);
-
-    float distanceToPlayhead =
-        abs(gl_FragCoord.x / float(sizePx.x) - uPlayheadX);
-
-    if (distanceToPlayhead < uPlayheadWidth) {
-        color = mix(
-            color,
-            vec4(0.63, 0.54, 0.98, 1.0),
-            (1.0 - distanceToPlayhead / uPlayheadWidth) * 0.92
-        );
-    }
-
-    fragColor = color;
-}
-)GLSL";
-
-    static const char* blitFragment = R"GLSL(#version 300 es
-precision mediump float;
-uniform sampler2D uSource;
-uniform float uOffsetU;
-out vec4 fragColor;
-
-void main()
-{
-    ivec2 sizePx = textureSize(uSource, 0);
-    vec2 uv = gl_FragCoord.xy / vec2(sizePx);
-    uv.x += uOffsetU;
-
-    fragColor = uv.x > 1.0
-        ? vec4(0.0)
-        : texture(uSource, uv);
-}
-)GLSL";
-
-    scrollProgram_ = linkProgram(fullScreenVertex, scrollFragment);
-    blitProgram_ = linkProgram(fullScreenVertex, blitFragment);
-
-    if (!scrollProgram_ || !blitProgram_)
-        return false;
-
-    scrollTexUniform_ =
-        glGetUniformLocation(scrollProgram_, "uTex");
-    playheadXUniform_ =
-        glGetUniformLocation(scrollProgram_, "uPlayheadX");
-    playheadWidthUniform_ =
-        glGetUniformLocation(scrollProgram_, "uPlayheadWidth");
-
-    blitSourceUniform_ =
-        glGetUniformLocation(blitProgram_, "uSource");
-    blitOffsetUniform_ =
-        glGetUniformLocation(blitProgram_, "uOffsetU");
-
-    return true;
-}
-
-void GLRenderer::destroyTextures()
-{
-    if (textures_[0] || textures_[1])
-        glDeleteTextures(2, textures_);
-    if (framebuffers_[0] || framebuffers_[1])
-        glDeleteFramebuffers(2, framebuffers_);
-
-    textures_[0] = textures_[1] = 0;
-    framebuffers_[0] = framebuffers_[1] = 0;
-
-    textureWidth_ = 0;
-    textureHeight_ = 0;
 }
 
 void GLRenderer::destroy()
 {
-    destroyTextures();
+    if (instanceVbo_)
+        glDeleteBuffers(1, &instanceVbo_);
 
-    if (emptyVao_)
-        glDeleteVertexArrays(1, &emptyVao_);
-    if (scrollProgram_)
-        glDeleteProgram(scrollProgram_);
-    if (blitProgram_)
-        glDeleteProgram(blitProgram_);
+    if (vao_)
+        glDeleteVertexArrays(1, &vao_);
 
-    emptyVao_ = 0;
-    scrollProgram_ = 0;
-    blitProgram_ = 0;
+    if (program_)
+        glDeleteProgram(program_);
+
+    instanceVbo_ = 0;
+    vao_ = 0;
+    program_ = 0;
+
+    ring_.clear();
+    ringCapacity_ = 0;
+    ringMask_ = 0;
+
     initialized_ = false;
 }
 
@@ -216,37 +252,12 @@ void GLRenderer::resize(int width, int height)
     height_ = std::max(1, height);
 }
 
-void GLRenderer::setNotesView(const std::vector<NoteEvent>* notes)
+void GLRenderer::setDocument(const MidiDocument* document)
 {
-    notes_ = notes;
-    rebuildColorMaps();
-    forceFullRedraw_ = true;
-    lastRenderTick_ = -1.0;
-}
-
-void GLRenderer::setTempoMap(
-    const std::vector<TempoPoint>& tempoMap,
-    uint16_t ticksPerBeat)
-{
-    tempoMap_ = tempoMap;
-    if (tempoMap_.empty())
-        tempoMap_.push_back({0, 500000});
-
-    ppq_ = std::max<uint16_t>(1, ticksPerBeat);
-
-    rebuildTempoIndex();
-    recalcTickWindow();
-
-    forceFullRedraw_ = true;
-    lastRenderTick_ = -1.0;
-}
-
-void GLRenderer::setActiveChannelMasks(
-    const std::vector<uint32_t>& activeChannelMasks)
-{
-    activeChannelMasks_ = activeChannelMasks;
-    rebuildColorMaps();
-    forceFullRedraw_ = true;
+    // MainWindow owns one stable MidiDocument object and move-assigns new
+    // parses into it, so pointer equality does NOT mean the MIDI is unchanged.
+    document_ = document;
+    resetSweep();
 }
 
 void GLRenderer::setCurrentTime(float seconds)
@@ -256,26 +267,26 @@ void GLRenderer::setCurrentTime(float seconds)
 
 void GLRenderer::setNoteSpeed(float secondsPerWindow)
 {
-    const float value = std::max(0.1f, secondsPerWindow);
+    const float value =
+        std::clamp(secondsPerWindow, 0.1f, 60.0f);
+
     if (std::abs(noteSpeed_ - value) < 0.00001f)
         return;
 
     noteSpeed_ = value;
-    recalcTickWindow();
-    forceFullRedraw_ = true;
-    lastRenderTick_ = -1.0;
+    forceSweepReset_ = true;
 }
 
 void GLRenderer::setPostBuffer(float seconds)
 {
-    const float value = std::max(0.0f, seconds);
+    const float value =
+        std::clamp(seconds, 0.0f, 10.0f);
+
     if (std::abs(postBuffer_ - value) < 0.00001f)
         return;
 
     postBuffer_ = value;
-    recalcTickWindow();
-    forceFullRedraw_ = true;
-    lastRenderTick_ = -1.0;
+    forceSweepReset_ = true;
 }
 
 void GLRenderer::setPerTrackColors(bool enabled)
@@ -284,660 +295,799 @@ void GLRenderer::setPerTrackColors(bool enabled)
         return;
 
     perTrackColors_ = enabled;
-    forceFullRedraw_ = true;
+    forceSweepReset_ = true;
 }
 
 void GLRenderer::setChannelColor(
     uint8_t channel,
-    uint8_t r, uint8_t g, uint8_t b)
+    uint8_t r,
+    uint8_t g,
+    uint8_t b)
 {
     if (channel >= channelColors_.size())
         return;
 
-    const std::array<uint8_t,4> value = {r,g,b,255};
+    const std::array<uint8_t, 4> value =
+        {r, g, b, 255};
+
     if (channelColors_[channel] == value)
         return;
 
     channelColors_[channel] = value;
-    forceFullRedraw_ = true;
+    paletteDirty_ = true;
 }
 
-void GLRenderer::rebuildTempoIndex()
+void GLRenderer::allocateRing(std::size_t capacity)
 {
-    tempoTicks_.clear();
-    tempoSeconds_.clear();
-    tempoUsPerBeat_.clear();
+    // Capacity must be a power of two.
+    std::size_t rounded = 1;
 
-    double seconds = 0.0;
-    uint32_t previousTick = 0;
-    uint32_t usPerBeat = 500000;
+    while (rounded < capacity)
+        rounded <<= 1;
 
-    for (const auto& tempo : tempoMap_) {
-        seconds +=
-            (double(tempo.tick - previousTick) / double(ppq_)) *
-            (double(usPerBeat) / 1'000'000.0);
+    const std::size_t oldCapacity =
+        ringCapacity_;
 
-        tempoTicks_.push_back(double(tempo.tick));
-        tempoSeconds_.push_back(seconds);
-        tempoUsPerBeat_.push_back(
-            double(tempo.microsecondsPerBeat));
+    const std::size_t oldMask =
+        ringMask_;
 
-        previousTick = tempo.tick;
-        if (tempo.microsecondsPerBeat != 0)
-            usPerBeat = tempo.microsecondsPerBeat;
-    }
+    std::vector<RenderNote> oldRing;
+    oldRing.swap(ring_);
 
-    if (tempoTicks_.empty()) {
-        tempoTicks_.push_back(0.0);
-        tempoSeconds_.push_back(0.0);
-        tempoUsPerBeat_.push_back(500000.0);
-    }
-}
+    ringCapacity_ = rounded;
+    ringMask_ = ringCapacity_ - 1;
+    ring_.resize(ringCapacity_);
 
-double GLRenderer::secToTick(double seconds) const
-{
-    if (tempoSeconds_.empty())
-        return seconds * double(ppq_) * 2.0;
-
-    const auto upper =
-        std::upper_bound(
-            tempoSeconds_.begin(),
-            tempoSeconds_.end(),
-            seconds);
-
-    std::size_t index = 0;
-    if (upper != tempoSeconds_.begin())
-        index = static_cast<std::size_t>(
-            (upper - tempoSeconds_.begin()) - 1);
-
-    index = std::min(index, tempoTicks_.size() - 1);
-
-    const double us =
-        tempoUsPerBeat_[index] > 0.0
-            ? tempoUsPerBeat_[index]
-            : 500000.0;
-
-    return tempoTicks_[index] +
-        (seconds - tempoSeconds_[index]) *
-        double(ppq_) / (us / 1'000'000.0);
-}
-
-void GLRenderer::recalcTickWindow()
-{
-    const double base = secToTick(0.0);
-
-    windowTicks_ = std::max(
-        1.0,
-        std::round(secToTick(noteSpeed_) - base));
-
-    postTicks_ = std::max(
-        0.0,
-        std::round(secToTick(postBuffer_) - base));
-}
-
-double GLRenderer::ticksPerColumn() const
-{
-    return std::max(
-        1.0,
-        (windowTicks_ + postTicks_) /
-        double(std::max(1, textureWidth_)));
-}
-
-std::size_t GLRenderer::lowerBoundTick(double tick) const
-{
-    if (!notes_) return 0;
-    return static_cast<std::size_t>(
-        std::lower_bound(
-            notes_->begin(), notes_->end(), tick,
-            [](const NoteEvent& note, double value) {
-                return double(note.startTick) < value;
-            }) - notes_->begin());
-}
-
-std::size_t GLRenderer::upperBoundTick(double tick) const
-{
-    if (!notes_) return 0;
-    return static_cast<std::size_t>(
-        std::upper_bound(
-            notes_->begin(), notes_->end(), tick,
-            [](double value, const NoteEvent& note) {
-                return value < double(note.startTick);
-            }) - notes_->begin());
-}
-
-void GLRenderer::rebuildColorMaps()
-{
-    globalChannelColor_.fill(-1);
-    perTrackColor_.clear();
-
-    int counter = 0;
-
-    // Same global mapping algorithm as MPWGL2.
-    for (const uint32_t trackMask : activeChannelMasks_) {
-        for (int channel = 0; channel < 16; ++channel) {
-            if ((trackMask & (1u << channel)) != 0 &&
-                globalChannelColor_[channel] < 0) {
-                globalChannelColor_[channel] =
-                    static_cast<int8_t>(counter & 15);
-                ++counter;
-            }
+    if (!oldRing.empty() && oldCapacity != 0) {
+        for (int64_t id = tail_;
+             id < head_;
+             ++id) {
+            ring_[static_cast<std::size_t>(id) & ringMask_] =
+                oldRing[
+                    static_cast<std::size_t>(id) & oldMask];
         }
     }
 
-    for (int channel = 0; channel < 16; ++channel) {
-        if (globalChannelColor_[channel] < 0)
-            globalChannelColor_[channel] =
-                static_cast<int8_t>(channel);
-    }
+    glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
 
-    counter = 0;
-    if (!notes_) return;
-    for (const auto& note : *notes_) {
-        const uint32_t key =
-            uint32_t(note.track) * 16u +
-            uint32_t(note.channel & 15);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(
+            ringCapacity_ * sizeof(RenderNote)),
+        nullptr,
+        GL_DYNAMIC_DRAW);
 
-        if (perTrackColor_.find(key) == perTrackColor_.end()) {
-            perTrackColor_[key] =
-                static_cast<uint8_t>(counter & 15);
-            ++counter;
-        }
-    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    if (head_ > tail_)
+        uploadAbsoluteRange(tail_, head_);
+
+    // A resize remaps every absolute ID to a new physical slot and the full
+    // active range above already contains all EndTick edits made so far.
+    dirtyEndIndices_.clear();
 }
 
-uint8_t GLRenderer::colorIndexFor(
-    uint16_t track,
-    uint8_t channel) const
+void GLRenderer::ensureRingSpace()
 {
-    channel &= 15;
-
-    if (!perTrackColors_) {
-        const int value =
-            globalChannelColor_[channel];
-        return static_cast<uint8_t>(
-            value >= 0 ? value : channel);
-    }
-
-    const uint32_t key =
-        uint32_t(track) * 16u +
-        uint32_t(channel);
-
-    const auto it = perTrackColor_.find(key);
-    return it == perTrackColor_.end()
-        ? channel
-        : it->second;
-}
-
-void GLRenderer::initTextures(int width, int height)
-{
-    // QQuickFramebufferObject already has its own FBO bound when render()
-    // starts. Preserve it while creating the two MPWGL2 scroll textures.
-    GLint previousFramebuffer = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
-
-    destroyTextures();
-
-    textureWidth_ = std::max(1, width);
-    textureHeight_ = std::max(1, height);
-
-    glGenTextures(2, textures_);
-    glGenFramebuffers(2, framebuffers_);
-
-    for (int i = 0; i < 2; ++i) {
-        glBindTexture(GL_TEXTURE_2D, textures_[i]);
-
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA8,
-            textureWidth_,
-            textureHeight_,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            nullptr);
-
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_MIN_FILTER,
-            GL_NEAREST);
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_MAG_FILTER,
-            GL_NEAREST);
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_WRAP_S,
-            GL_CLAMP_TO_EDGE);
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_WRAP_T,
-            GL_CLAMP_TO_EDGE);
-
-        glBindFramebuffer(
-            GL_FRAMEBUFFER,
-            framebuffers_[i]);
-
-        glFramebufferTexture2D(
-            GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D,
-            textures_[i],
-            0);
-
-        glViewport(
-            0, 0,
-            textureWidth_,
-            textureHeight_);
-
-        glClearColor(0,0,0,0);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    // Critical difference from Pass 6: do not leave our private scroll FBO
-    // bound. Restore Qt's QQuickFramebufferObject target, equivalent to the
-    // legacy renderer's gl.bindFramebuffer(..., null).
-    glBindFramebuffer(
-        GL_FRAMEBUFFER,
-        static_cast<GLuint>(previousFramebuffer));
-
-    frontIndex_ = 0;
-    forceFullRedraw_ = true;
-    lastRenderTick_ = -1.0;
-
-    fullBuffer_.resize(
-        static_cast<std::size_t>(
-            textureWidth_) *
-        static_cast<std::size_t>(
-            textureHeight_) * 4u);
-}
-
-void GLRenderer::writeStrip(
-    std::vector<uint8_t>& buffer,
-    int columnStart,
-    int columnCount,
-    double currentTick)
-{
-    if (columnCount <= 0 ||
-        textureHeight_ <= 0 ||
-        !notes_ || notes_->empty()) {
-        std::fill(
-            buffer.begin(), buffer.end(), 0);
+    if (ringCapacity_ == 0) {
+        allocateRing(InitialRingCapacity);
         return;
     }
 
-    const std::size_t required =
-        static_cast<std::size_t>(columnCount) *
-        static_cast<std::size_t>(textureHeight_) * 4u;
+    if (head_ - tail_ <
+        static_cast<int64_t>(ringCapacity_ - 1)) {
+        return;
+    }
 
-    if (buffer.size() != required)
-        buffer.resize(required);
+    allocateRing(ringCapacity_ * 2);
+}
 
-    std::fill(buffer.begin(), buffer.end(), 0);
+void GLRenderer::resetSweep()
+{
+    head_ = 0;
+    tail_ = 0;
 
-    const double tpc = ticksPerColumn();
+    activeCount_.fill(0);
+    activeColor_.fill(0);
+    activeNoteId_.fill(-1);
 
-    const double stripTickStart =
-        currentTick - postTicks_ +
-        double(columnStart) * tpc;
+    dirtyEndIndices_.clear();
 
-    const double stripTickEnd =
-        currentTick - postTicks_ +
-        double(columnStart + columnCount) * tpc;
+    lastSweepEnd_ = -1;
+    lastViewSpan_ = 0;
+    forceSweepReset_ = true;
+}
 
-    const std::size_t searchFrom =
-        lowerBoundTick(
-            stripTickStart -
-            windowTicks_ -
-            postTicks_);
+uint8_t GLRenderer::eventColor(
+    const CompactEvent& event) const
+{
+    if (!document_)
+        return 0;
 
-    const std::size_t searchTo =
-        upperBoundTick(stripTickEnd);
+    return document_->colorIndex(
+        event,
+        perTrackColors_);
+}
 
-    const int rowHeight =
-        std::max(
-            1,
-            static_cast<int>(
+void GLRenderer::appendNote(
+    uint32_t tick,
+    uint8_t pitch,
+    uint8_t velocity,
+    uint8_t color)
+{
+    ensureRingSpace();
+
+    const std::size_t physical =
+        static_cast<std::size_t>(head_) &
+        ringMask_;
+
+    ring_[physical] = {
+        static_cast<int32_t>(
+            std::min<uint32_t>(
+                tick,
+                uint32_t(
+                    std::numeric_limits<int32_t>::max()))),
+        0,
+        uint32_t(velocity) |
+        (uint32_t(pitch) << 8) |
+        (uint32_t(color & 0x0f) << 16)
+    };
+
+    ++head_;
+}
+
+void GLRenderer::closeActiveNote(
+    std::size_t stateIndex,
+    uint32_t tick)
+{
+    const int64_t id =
+        activeNoteId_[stateIndex];
+
+    if (id < tail_ || id >= head_)
+        return;
+
+    const std::size_t physical =
+        static_cast<std::size_t>(id) &
+        ringMask_;
+
+    ring_[physical].endTick =
+        static_cast<int32_t>(
+            std::min<uint32_t>(
+                tick,
+                uint32_t(
+                    std::numeric_limits<int32_t>::max())));
+
+    dirtyEndIndices_.push_back(
+        static_cast<uint32_t>(physical));
+}
+
+void GLRenderer::processEvent(
+    const CompactEvent& event,
+    uint32_t tick)
+{
+    const uint8_t command =
+        event.status & 0xf0;
+
+    if (command != 0x90 &&
+        command != 0x80) {
+        return;
+    }
+
+    const uint8_t channel =
+        event.status & 0x0f;
+
+    const uint8_t pitch =
+        event.data1 & 0x7f;
+
+    const std::size_t stateIndex =
+        std::size_t(channel) * 128u +
+        std::size_t(pitch);
+
+    const uint8_t color =
+        eventColor(event);
+
+    if (command == 0x90 &&
+        event.data2 != 0) {
+        uint32_t& count =
+            activeCount_[stateIndex];
+
+        // SharpMIDI-style color ownership: when a different track/color begins
+        // the same channel+pitch while it is held, close the old visual segment
+        // and start a new colored segment instead of creating ambiguous layers.
+        if (count != 0 &&
+            activeColor_[stateIndex] != color) {
+            closeActiveNote(
+                stateIndex,
+                tick);
+
+            count = 0;
+        }
+
+        if (count == 0) {
+            activeNoteId_[stateIndex] =
+                head_;
+
+            appendNote(
+                tick,
+                pitch,
+                event.data2,
+                color);
+
+            activeColor_[stateIndex] =
+                color;
+        }
+
+        ++count;
+        return;
+    }
+
+    uint32_t& count =
+        activeCount_[stateIndex];
+
+    if (count == 0)
+        return;
+
+    // In per-track color mode an older track's NoteOff must not terminate a
+    // newer colored segment that reused the same channel+pitch.
+    if (activeColor_[stateIndex] != color)
+        return;
+
+    --count;
+
+    if (count == 0) {
+        closeActiveNote(
+            stateIndex,
+            tick);
+
+        activeNoteId_[stateIndex] = -1;
+    }
+}
+
+void GLRenderer::uploadAbsoluteRange(
+    int64_t begin,
+    int64_t end)
+{
+    if (end <= begin ||
+        ringCapacity_ == 0)
+        return;
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        instanceVbo_);
+
+    int64_t cursor = begin;
+
+    while (cursor < end) {
+        const std::size_t physical =
+            static_cast<std::size_t>(cursor) &
+            ringMask_;
+
+        const std::size_t available =
+            ringCapacity_ - physical;
+
+        const std::size_t count =
+            static_cast<std::size_t>(
+                std::min<int64_t>(
+                    end - cursor,
+                    static_cast<int64_t>(available)));
+
+        glBufferSubData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLintptr>(
+                physical *
+                sizeof(RenderNote)),
+            static_cast<GLsizeiptr>(
+                count *
+                sizeof(RenderNote)),
+            ring_.data() + physical);
+
+        cursor +=
+            static_cast<int64_t>(count);
+    }
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        0);
+}
+
+void GLRenderer::flushEndTickUpdates()
+{
+    if (dirtyEndIndices_.empty())
+        return;
+
+    std::sort(
+        dirtyEndIndices_.begin(),
+        dirtyEndIndices_.end());
+
+    dirtyEndIndices_.erase(
+        std::unique(
+            dirtyEndIndices_.begin(),
+            dirtyEndIndices_.end()),
+        dirtyEndIndices_.end());
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        instanceVbo_);
+
+    std::size_t i = 0;
+
+    while (i < dirtyEndIndices_.size()) {
+        std::size_t first =
+            dirtyEndIndices_[i];
+
+        std::size_t last = first;
+        ++i;
+
+        // Small gaps are cheaper to upload than issuing another WebGL call.
+        while (i < dirtyEndIndices_.size() &&
+               dirtyEndIndices_[i] <= last + 16) {
+            last = dirtyEndIndices_[i];
+            ++i;
+        }
+
+        const std::size_t count =
+            last - first + 1;
+
+        glBufferSubData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLintptr>(
+                first *
+                sizeof(RenderNote)),
+            static_cast<GLsizeiptr>(
+                count *
+                sizeof(RenderNote)),
+            ring_.data() + first);
+    }
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        0);
+
+    dirtyEndIndices_.clear();
+}
+
+void GLRenderer::sweepRange(
+    uint32_t fromTick,
+    uint32_t toTick)
+{
+    if (!document_ ||
+        document_->tickGroups.empty() ||
+        fromTick > toTick) {
+        return;
+    }
+
+    const std::size_t firstGroup =
+        document_->lowerBoundGroup(fromTick);
+
+    const std::size_t lastGroup =
+        document_->upperBoundGroup(toTick);
+
+    const int64_t appendBegin =
+        head_;
+
+    for (std::size_t groupIndex = firstGroup;
+         groupIndex < lastGroup;
+         ++groupIndex) {
+        const TickGroup& group =
+            document_->tickGroups[groupIndex];
+
+        const std::size_t begin =
+            group.eventOffset;
+
+        const std::size_t end =
+            begin + group.eventCount;
+
+        for (std::size_t eventIndex = begin;
+             eventIndex < end;
+             ++eventIndex) {
+            processEvent(
+                document_->events[eventIndex],
+                group.tick);
+        }
+    }
+
+    // New notes are contiguous in absolute ring ID space and therefore need
+    // at most two WebGL uploads when the physical ring wraps.
+    uploadAbsoluteRange(
+        appendBegin,
+        head_);
+
+    // NoteOffs modify older instances. Batch/coalesce those edits.
+    flushEndTickUpdates();
+}
+
+void GLRenderer::advanceTail(uint32_t viewStart)
+{
+    if (ringCapacity_ == 0)
+        return;
+
+    const int64_t safeTail =
+        head_ -
+        static_cast<int64_t>(ringCapacity_);
+
+    if (tail_ < safeTail)
+        tail_ = safeTail;
+
+    while (tail_ < head_) {
+        const RenderNote& note =
+            ring_[
+                static_cast<std::size_t>(tail_) &
+                ringMask_];
+
+        const bool open =
+            note.endTick == 0;
+
+        if (!open &&
+            note.endTick <
+                static_cast<int32_t>(viewStart)) {
+            ++tail_;
+        } else {
+            break;
+        }
+    }
+}
+
+void GLRenderer::calculateView(
+    uint32_t& currentTick,
+    uint32_t& viewStart,
+    uint32_t& viewEnd,
+    uint32_t& sweepEnd) const
+{
+    if (!document_) {
+        currentTick = viewStart =
+            viewEnd = sweepEnd = 0;
+        return;
+    }
+
+    currentTick =
+        static_cast<uint32_t>(
+            std::clamp<double>(
                 std::floor(
-                    double(textureHeight_) / 128.0)));
+                    document_->secondsToTick(
+                        currentTime_)),
+                0.0,
+                document_->maxTick));
 
-    for (std::size_t i = searchFrom;
-         i < searchTo && i < notes_->size();
-         ++i) {
-        const NoteEvent& note = (*notes_)[i];
+    // Keep the current visual time-span semantics, but derive tick width at
+    // the *current* tempo instead of assuming tempo at t=0.
+    const double rightSeconds =
+        std::min<double>(
+            document_->durationSeconds,
+            double(currentTime_) +
+            double(noteSpeed_));
 
-        const double startTick =
-            double(note.startTick);
-        const double endTick =
-            double(note.endTick);
+    uint32_t rightTick =
+        static_cast<uint32_t>(
+            std::clamp<double>(
+                std::ceil(
+                    document_->secondsToTick(
+                        rightSeconds)),
+                currentTick + 1.0,
+                double(
+                    std::max<uint32_t>(
+                        currentTick + 1,
+                        document_->maxTick))));
 
-        if (endTick < stripTickStart ||
-            startTick > stripTickEnd)
-            continue;
+    // Auto mode historically keeps the impact line near 18% of the roll.
+    // If the user explicitly selects Post Buffer, use that exact seconds span.
+    const double historySeconds =
+        postBuffer_ > 0.0f
+            ? double(postBuffer_)
+            : double(noteSpeed_) *
+              (0.18 / 0.82);
 
-        const bool active =
-            startTick <= currentTick &&
-            endTick >= currentTick;
+    const double leftSeconds =
+        std::max(
+            0.0,
+            double(currentTime_) -
+            historySeconds);
 
-        const int col0Abs =
-            static_cast<int>(std::lround(
-                (startTick - currentTick + postTicks_) /
-                tpc));
-
-        const int col1Abs =
-            static_cast<int>(std::lround(
-                (endTick - currentTick + postTicks_) /
-                tpc));
-
-        const int c0 =
-            std::max(0, col0Abs - columnStart);
-
-        const int c1 =
-            std::min(
-                columnCount - 1,
-                col1Abs - columnStart);
-
-        if (c0 > c1)
-            continue;
-
-        const int rowCenter =
-            static_cast<int>(std::lround(
-                (double(note.pitch) / 127.0) *
-                double(textureHeight_ - 1)));
-
-        const int rowTop =
+    viewStart =
+        static_cast<uint32_t>(
             std::max(
-                0,
-                rowCenter - rowHeight / 2);
+                0.0,
+                std::floor(
+                    document_->secondsToTick(
+                        leftSeconds))));
 
-        const int rowBottom =
-            std::min(
-                textureHeight_ - 1,
-                rowTop + rowHeight - 1);
+    viewEnd =
+        std::max(
+            viewStart + 1,
+            rightTick);
 
-        const uint8_t colorIndex =
-            colorIndexFor(
-                note.track,
-                note.channel);
+    const uint32_t span =
+        viewEnd - viewStart;
 
-        int r = channelColors_[colorIndex][0];
-        int g = channelColors_[colorIndex][1];
-        int b = channelColors_[colorIndex][2];
+    const uint32_t lookahead =
+        std::max<uint32_t>(
+            1,
+            std::min<uint32_t>(
+                span / 2,
+                uint32_t(
+                    std::max<uint16_t>(
+                        1,
+                        document_->ticksPerBeat)) *
+                    4u));
 
-        if (active) {
-            r = std::min(
-                255,
-                static_cast<int>(
-                    std::lround(r * 1.55 + 30.0)));
-            g = std::min(
-                255,
-                static_cast<int>(
-                    std::lround(g * 1.55 + 30.0)));
-            b = std::min(
-                255,
-                static_cast<int>(
-                    std::lround(b * 1.55 + 30.0)));
-        }
-
-        const int brightR =
-            std::min(255, r + 50);
-        const int brightG =
-            std::min(255, g + 50);
-        const int brightB =
-            std::min(255, b + 50);
-
-        for (int row = rowTop;
-             row <= rowBottom;
-             ++row) {
-            for (int column = c0;
-                 column <= c1;
-                 ++column) {
-                const std::size_t base =
-                    (static_cast<std::size_t>(row) *
-                         static_cast<std::size_t>(
-                             columnCount) +
-                     static_cast<std::size_t>(
-                         column)) * 4u;
-
-                if (column == c0) {
-                    buffer[base] =
-                        static_cast<uint8_t>(brightR);
-                    buffer[base + 1] =
-                        static_cast<uint8_t>(brightG);
-                    buffer[base + 2] =
-                        static_cast<uint8_t>(brightB);
-                } else {
-                    buffer[base] =
-                        static_cast<uint8_t>(r);
-                    buffer[base + 1] =
-                        static_cast<uint8_t>(g);
-                    buffer[base + 2] =
-                        static_cast<uint8_t>(b);
-                }
-
-                buffer[base + 3] = 255;
-            }
-        }
-    }
+    sweepEnd =
+        std::min(
+            document_->maxTick,
+            viewEnd + lookahead);
 }
 
-void GLRenderer::renderFullTexture(
-    double currentTick)
+void GLRenderer::setInstanceBase(
+    std::size_t physicalIndex)
 {
-    writeStrip(
-        fullBuffer_,
+    const std::size_t base =
+        physicalIndex *
+        sizeof(RenderNote);
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        instanceVbo_);
+
+    glVertexAttribIPointer(
         0,
-        textureWidth_,
-        currentTick);
+        1,
+        GL_INT,
+        sizeof(RenderNote),
+        reinterpret_cast<void*>(
+            base +
+            offsetof(RenderNote, startTick)));
 
-    glBindTexture(
-        GL_TEXTURE_2D,
-        textures_[frontIndex_]);
+    glVertexAttribIPointer(
+        1,
+        1,
+        GL_INT,
+        sizeof(RenderNote),
+        reinterpret_cast<void*>(
+            base +
+            offsetof(RenderNote, endTick)));
 
-    glTexSubImage2D(
-        GL_TEXTURE_2D,
-        0,
-        0, 0,
-        textureWidth_,
-        textureHeight_,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        fullBuffer_.data());
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    forceFullRedraw_ = false;
-}
-
-void GLRenderer::scrollAndAdvance(
-    double currentTick,
-    int deltaColumns)
-{
-    if (deltaColumns <= 0)
-        return;
-
-    if (deltaColumns >= textureWidth_) {
-        renderFullTexture(currentTick);
-        return;
-    }
-
-    // Save Qt's current render target. MPWGL2 binds its private FBO for the
-    // scroll pass and explicitly unbinds it BEFORE modifying the resulting
-    // texture with texSubImage2D(). We must do the same here.
-    GLint previousFramebuffer = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
-
-    const int backIndex =
-        frontIndex_ == 0 ? 1 : 0;
-
-    glBindFramebuffer(
-        GL_FRAMEBUFFER,
-        framebuffers_[backIndex]);
-
-    glViewport(
-        0, 0,
-        textureWidth_,
-        textureHeight_);
-
-    glUseProgram(blitProgram_);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(
-        GL_TEXTURE_2D,
-        textures_[frontIndex_]);
-
-    glUniform1i(
-        blitSourceUniform_, 0);
-
-    glUniform1f(
-        blitOffsetUniform_,
-        float(deltaColumns) /
-        float(textureWidth_));
-
-    glBindVertexArray(emptyVao_);
-    glDrawArrays(
-        GL_TRIANGLE_STRIP,
-        0, 4);
-    glBindVertexArray(0);
-
-    // This restore is essential. Without it texture[backIndex] is still
-    // attached to the active framebuffer when texSubImage2D() below tries to
-    // write the newly exposed right-hand strip.
-    glBindFramebuffer(
-        GL_FRAMEBUFFER,
-        static_cast<GLuint>(previousFramebuffer));
-
-    frontIndex_ = backIndex;
-
-    writeStrip(
-        stripBuffer_,
-        textureWidth_ - deltaColumns,
-        deltaColumns,
-        currentTick);
-
-    glBindTexture(
-        GL_TEXTURE_2D,
-        textures_[frontIndex_]);
-
-    glTexSubImage2D(
-        GL_TEXTURE_2D,
-        0,
-        textureWidth_ - deltaColumns,
-        0,
-        deltaColumns,
-        textureHeight_,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        stripBuffer_.data());
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-void GLRenderer::drawFrontTexture(
-    GLint targetFramebuffer)
-{
-    glBindFramebuffer(
-        GL_FRAMEBUFFER,
-        static_cast<GLuint>(
-            targetFramebuffer));
-
-    glViewport(0, 0, width_, height_);
-
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-
-    glClearColor(0,0,0,0);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    glUseProgram(scrollProgram_);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(
-        GL_TEXTURE_2D,
-        textures_[frontIndex_]);
-
-    glUniform1i(
-        scrollTexUniform_, 0);
-
-    constexpr float PlayheadFraction = 0.18f;
-
-    const float playheadWidth =
-        2.0f /
-        float(std::max(1, textureWidth_));
-
-    glUniform1f(
-        playheadXUniform_,
-        PlayheadFraction);
-
-    glUniform1f(
-        playheadWidthUniform_,
-        playheadWidth);
-
-    glBindVertexArray(emptyVao_);
-    glDrawArrays(
-        GL_TRIANGLE_STRIP,
-        0, 4);
-    glBindVertexArray(0);
-
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glVertexAttribIPointer(
+        2,
+        1,
+        GL_UNSIGNED_INT,
+        sizeof(RenderNote),
+        reinterpret_cast<void*>(
+            base +
+            offsetof(RenderNote, packedData)));
 }
 
 void GLRenderer::renderRoll()
 {
-    if (!initialized_ && !initialize())
-        return;
-
-    GLint targetFramebuffer = 0;
-    glGetIntegerv(
-        GL_FRAMEBUFFER_BINDING,
-        &targetFramebuffer);
-
-    if (textureWidth_ != width_ ||
-        textureHeight_ != height_) {
-        initTextures(width_, height_);
-    }
-
-    if (!notes_ || notes_->empty()) {
-        glBindFramebuffer(
-            GL_FRAMEBUFFER,
-            static_cast<GLuint>(
-                targetFramebuffer));
-        glViewport(0, 0, width_, height_);
-        glClearColor(0,0,0,0);
-        glClear(GL_COLOR_BUFFER_BIT);
+    if (!initialized_ &&
+        !initialize()) {
         return;
     }
 
-    const double currentTick =
-        secToTick(currentTime_);
+    glViewport(
+        0,
+        0,
+        width_,
+        height_);
 
-    if (forceFullRedraw_ ||
-        lastRenderTick_ < 0.0) {
-        renderFullTexture(currentTick);
-        lastRenderTick_ = currentTick;
-    } else {
-        const double tpc =
-            ticksPerColumn();
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
 
-        const int delta =
-            static_cast<int>(std::lround(
-                (currentTick -
-                 lastRenderTick_) / tpc));
+    glClearColor(
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f);
 
-        if (delta < 0) {
-            renderFullTexture(currentTick);
-        } else if (delta > 0) {
-            scrollAndAdvance(
-                currentTick,
-                delta);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (!document_ ||
+        document_->noteCount == 0 ||
+        document_->tickGroups.empty()) {
+        return;
+    }
+
+    uint32_t currentTick = 0;
+    uint32_t viewStart = 0;
+    uint32_t viewEnd = 0;
+    uint32_t sweepEnd = 0;
+
+    calculateView(
+        currentTick,
+        viewStart,
+        viewEnd,
+        sweepEnd);
+
+    const uint32_t viewSpan =
+        std::max<uint32_t>(
+            1,
+            viewEnd - viewStart);
+
+    const bool incremental =
+        !forceSweepReset_ &&
+        lastSweepEnd_ >= 0 &&
+        sweepEnd >=
+            static_cast<uint32_t>(lastSweepEnd_) &&
+        sweepEnd -
+            static_cast<uint32_t>(lastSweepEnd_) <
+            std::max<uint32_t>(
+                1,
+                viewSpan);
+
+    if (!incremental) {
+        head_ = 0;
+        tail_ = 0;
+
+        activeCount_.fill(0);
+        activeColor_.fill(0);
+        activeNoteId_.fill(-1);
+        dirtyEndIndices_.clear();
+
+        // Same philosophy as SharpMIDI's non-incremental sweep: reconstruct
+        // enough history to preserve sustained notes near the visible window
+        // without replaying an entire 100M-event MIDI on every seek.
+        const uint32_t lookbehind =
+            std::min(
+                viewStart,
+                std::max<uint32_t>(
+                    viewSpan,
+                    uint32_t(
+                        std::max<uint16_t>(
+                            1,
+                            document_->ticksPerBeat)) *
+                        16u));
+
+        sweepRange(
+            viewStart - lookbehind,
+            sweepEnd);
+    } else if (
+        sweepEnd >
+        static_cast<uint32_t>(lastSweepEnd_)) {
+        sweepRange(
+            static_cast<uint32_t>(
+                lastSweepEnd_) + 1,
+            sweepEnd);
+    }
+
+    lastSweepEnd_ =
+        static_cast<int64_t>(
+            sweepEnd);
+
+    lastViewSpan_ =
+        viewSpan;
+
+    forceSweepReset_ = false;
+
+    advanceTail(viewStart);
+
+    glUseProgram(program_);
+
+    glUniform1f(
+        viewStartUniform_,
+        static_cast<float>(viewStart));
+
+    glUniform1f(
+        viewEndUniform_,
+        static_cast<float>(viewEnd));
+
+    glUniform1f(
+        currentTickUniform_,
+        static_cast<float>(currentTick));
+
+    if (paletteDirty_) {
+        GLfloat palette[16 * 3];
+
+        for (int i = 0; i < 16; ++i) {
+            palette[i * 3 + 0] =
+                channelColors_[i][0] /
+                255.0f;
+
+            palette[i * 3 + 1] =
+                channelColors_[i][1] /
+                255.0f;
+
+            palette[i * 3 + 2] =
+                channelColors_[i][2] /
+                255.0f;
         }
 
-        lastRenderTick_ = currentTick;
+        glUniform3fv(
+            paletteUniform_,
+            16,
+            palette);
+
+        paletteDirty_ = false;
     }
 
-    drawFrontTexture(targetFramebuffer);
+    const int64_t visible64 =
+        std::max<int64_t>(
+            0,
+            head_ - tail_);
+
+    if (visible64 > 0 &&
+        ringCapacity_ != 0) {
+        const std::size_t visible =
+            static_cast<std::size_t>(
+                std::min<int64_t>(
+                    visible64,
+                    static_cast<int64_t>(
+                        ringCapacity_)));
+
+        const std::size_t start =
+            static_cast<std::size_t>(
+                tail_) &
+            ringMask_;
+
+        const std::size_t first =
+            std::min(
+                visible,
+                ringCapacity_ - start);
+
+        const std::size_t second =
+            visible - first;
+
+        glBindVertexArray(vao_);
+
+        if (first != 0) {
+            setInstanceBase(start);
+
+            glDrawArraysInstanced(
+                GL_TRIANGLE_STRIP,
+                0,
+                4,
+                static_cast<GLsizei>(first));
+        }
+
+        if (second != 0) {
+            setInstanceBase(0);
+
+            glDrawArraysInstanced(
+                GL_TRIANGLE_STRIP,
+                0,
+                4,
+                static_cast<GLsizei>(second));
+        }
+
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    glUseProgram(0);
+
+    // Draw the same impact/playhead line without another shader or QML item.
+    const float playheadFraction =
+        std::clamp(
+            float(currentTick - viewStart) /
+            float(std::max<uint32_t>(
+                1,
+                viewEnd - viewStart)),
+            0.0f,
+            1.0f);
+
+    const int lineX =
+        std::clamp(
+            static_cast<int>(
+                std::lround(
+                    playheadFraction *
+                    float(width_))),
+            0,
+            std::max(0, width_ - 1));
+
+    glEnable(GL_SCISSOR_TEST);
+
+    glScissor(
+        lineX,
+        0,
+        std::max(1, width_ / 900),
+        height_);
+
+    glClearColor(
+        0.63f,
+        0.54f,
+        0.98f,
+        0.92f);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glDisable(GL_SCISSOR_TEST);
 }
 
 } // namespace wasmidi

@@ -9,8 +9,9 @@
 #include <QVector>
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
-#include <unordered_map>
 
 #include "midi/midi_parser.hpp"
 #include "midi/scheduler.hpp"
@@ -53,7 +54,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(float neuralActivity READ neuralActivity NOTIFY neuralVisualChanged)
 
 public:
-    explicit MainWindow(QObject *parent = nullptr);
+    explicit MainWindow(QObject* parent = nullptr);
     ~MainWindow() override;
 
     bool isPlaying() const { return isPlaying_; }
@@ -91,8 +92,14 @@ public:
 
     const wasmidi::MidiDocument& document() const { return document_; }
     const QVector<QColor>& channelColors() const { return channelColors_; }
-    std::array<uint8_t, 128> activePitchMask() const;
-    std::array<int8_t, 128> activePitchColorIndices() const;
+
+    std::array<uint8_t, 128> activePitchMask() const {
+        return visualPitchMask_;
+    }
+
+    std::array<int8_t, 128> activePitchColorIndices() const {
+        return visualPitchColor_;
+    }
 
     Q_INVOKABLE bool loadMidiFile(const QByteArray& data);
     Q_INVOKABLE bool loadMidiFileNamed(const QByteArray& data, const QString& fileName);
@@ -142,6 +149,7 @@ signals:
     void documentRevisionChanged();
     void outputModeChanged();
     void channelColorsChanged();
+    void activePitchesChanged();
     void neuralVisualChanged();
     void fileLoaded();
     void loadFailed(QString message);
@@ -152,10 +160,13 @@ private:
     void updateLiveStats();
     void updateCurrentTime();
     void updateNeuralVisuals();
-    void rebuildColorMaps();
-    uint8_t colorIndexFor(uint16_t track, uint8_t channel) const;
     void dispatchScheduler();
     void publishDocumentMetadata();
+
+    void invalidateLiveTrackers();
+    void clearVisualState();
+    void syncVisualState(uint32_t targetTick, bool forceRebuild = false);
+    void processVisualEvent(const wasmidi::CompactEvent& event, uint32_t tick);
 
     wasmidi::MidiParser parser_;
     wasmidi::MidiScheduler scheduler_;
@@ -194,13 +205,32 @@ private:
     QElapsedTimer playbackClock_;
     float playbackAnchorSeconds_ = 0.0f;
 
-    std::vector<float> noteStarts_;
-    std::vector<float> noteEnds_;
-    std::vector<float> controlTimes_;
     std::vector<float> tempoTimes_;
     std::vector<float> tempoBpms_;
-    std::array<int8_t, 16> globalChannelColor_{};
-    std::unordered_map<uint32_t, uint8_t> perTrackColorMap_;
+
+    // Sliding live-stat windows over sparse TickGroup, no per-note arrays.
+    bool liveWindowsValid_ = false;
+    float liveLastTime_ = 0.0f;
+    std::size_t liveHi_ = 0;
+    std::size_t liveNpsLo_ = 0;
+    std::size_t liveCcLo_ = 0;
+    uint64_t liveNpsCount_ = 0;
+    uint64_t liveCcCount_ = 0;
+
+    // Incremental keyboard/neural state derived from the same compact event
+    // stream used by playback and rendering.
+    bool visualStateValid_ = false;
+    uint32_t visualTick_ = 0;
+    std::size_t visualGroupCursor_ = 0;
+    int visualActiveVoices_ = 0;
+
+    std::array<uint32_t, 16 * 128> visualStateCount_{};
+    std::array<uint8_t, 16 * 128> visualStateColor_{};
+    std::array<uint32_t, 128> visualPitchCount_{};
+    std::array<uint8_t, 128> visualPitchMask_{};
+    std::array<int8_t, 128> visualPitchColor_{};
+    std::array<uint32_t, 16> visualColorVoices_{};
+
     float dominantHue_ = 230.0f;
     float neuralActivity_ = 0.0f;
 };

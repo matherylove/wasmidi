@@ -9,50 +9,46 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 namespace {
+
 MainWindow* g_browserMainWindow = nullptr;
 
-std::size_t lowerBoundNoteStart(
-    const std::vector<wasmidi::NoteEvent>& notes, float t)
+float colorHue(const QColor& color)
 {
-    return static_cast<std::size_t>(
-        std::lower_bound(notes.begin(), notes.end(), t,
-            [](const wasmidi::NoteEvent& n, float v){ return n.startTime < v; })
-        - notes.begin());
+    const qreal hue = color.hslHueF();
+    return hue < 0.0
+        ? 230.0f
+        : static_cast<float>(hue * 360.0);
 }
 
-std::size_t upperBoundNoteStart(
-    const std::vector<wasmidi::NoteEvent>& notes, float t)
-{
-    return static_cast<std::size_t>(
-        std::upper_bound(notes.begin(), notes.end(), t,
-            [](float v, const wasmidi::NoteEvent& n){ return v < n.startTime; })
-        - notes.begin());
-}
-
-float colorHue(const QColor& c)
-{
-    const qreal h = c.hslHueF();
-    return h < 0 ? 230.0f : float(h * 360.0);
-}
-}
+} // namespace
 
 #ifdef __EMSCRIPTEN__
-extern "C" EMSCRIPTEN_KEEPALIVE
-void wasmidi_browser_file_selected(const unsigned char* data,
-                                   int dataSize,
-                                   const char* fileName,
-                                   int fileNameSize)
-{
-    if (!g_browserMainWindow || !data || dataSize <= 0)
-        return;
 
-    const QString name = fileName && fileNameSize > 0
-        ? QString::fromUtf8(fileName, fileNameSize)
-        : QStringLiteral("browser.mid");
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_browser_file_selected(
+    const unsigned char* data,
+    int dataSize,
+    const char* fileName,
+    int fileNameSize)
+{
+    if (!g_browserMainWindow ||
+        !data ||
+        dataSize <= 0) {
+        return;
+    }
+
+    const QString name =
+        fileName && fileNameSize > 0
+            ? QString::fromUtf8(
+                fileName,
+                fileNameSize)
+            : QStringLiteral("browser.mid");
 
     g_browserMainWindow->loadMidiRaw(
         data,
@@ -60,8 +56,12 @@ void wasmidi_browser_file_selected(const unsigned char* data,
         name);
 }
 
+// Stream the browser File directly into one WASM allocation instead of
+// File.arrayBuffer() + Uint8Array + HEAP copy. This removes the second full
+// file-sized JS allocation during loading and yields between stream chunks.
 EM_JS(void, wasmidi_browser_open_midi_picker, (), {
     let input = document.getElementById('wasmidi-midi-file-input');
+
     if (!input) {
         input = document.createElement('input');
         input.id = 'wasmidi-midi-file-input';
@@ -77,51 +77,98 @@ EM_JS(void, wasmidi_browser_open_midi_picker, (), {
     }
 
     input.onchange = async () => {
-        const file = input.files && input.files.length ? input.files[0] : null;
+        const file =
+            input.files && input.files.length
+                ? input.files[0]
+                : null;
+
         if (!file) {
             input.value = null;
             return;
         }
 
+        let dataPtr = 0;
+        let namePtr = 0;
+
         try {
-            const buffer = await file.arrayBuffer();
-            const bytes = new Uint8Array(buffer);
-            const nameBytes = new TextEncoder().encode(file.name || 'browser.mid');
+            if (file.size > 0x7fffffff)
+                throw new Error('MIDI is too large for this wasm32 build.');
 
-            const dataPtr = _malloc(Math.max(1, bytes.length));
-            const namePtr = _malloc(Math.max(1, nameBytes.length));
+            dataPtr = _malloc(Math.max(1, file.size));
 
-            if (bytes.length)
+            if (!dataPtr)
+                throw new Error('Could not allocate WASM memory for MIDI.');
+
+            let offset = 0;
+
+            if (file.stream) {
+                const reader = file.stream().getReader();
+
+                while (true) {
+                    const result = await reader.read();
+
+                    if (result.done)
+                        break;
+
+                    const chunk = result.value;
+
+                    HEAPU8.set(
+                        chunk,
+                        dataPtr + offset);
+
+                    offset += chunk.byteLength;
+                }
+            } else {
+                // Compatibility fallback for older browsers.
+                const bytes =
+                    new Uint8Array(
+                        await file.arrayBuffer());
+
                 HEAPU8.set(bytes, dataPtr);
+                offset = bytes.length;
+            }
+
+            const nameBytes =
+                new TextEncoder().encode(
+                    file.name || 'browser.mid');
+
+            namePtr =
+                _malloc(
+                    Math.max(1, nameBytes.length));
+
             if (nameBytes.length)
                 HEAPU8.set(nameBytes, namePtr);
 
             _wasmidi_browser_file_selected(
                 dataPtr,
-                bytes.length,
+                offset,
                 namePtr,
-                nameBytes.length
-            );
-
-            _free(dataPtr);
-            _free(namePtr);
+                nameBytes.length);
         } catch (error) {
-            console.error('[WASMIDI] Could not read selected MIDI file:', error);
-        }
+            console.error(
+                '[WASMIDI] Could not load selected MIDI:',
+                error);
+        } finally {
+            if (namePtr)
+                _free(namePtr);
 
-        input.value = null;
+            if (dataPtr)
+                _free(dataPtr);
+
+            input.value = null;
+        }
     };
 
     input.click();
 });
+
 #endif
 
-MainWindow::MainWindow(QObject *parent)
+MainWindow::MainWindow(QObject* parent)
     : QObject(parent)
 {
     g_browserMainWindow = this;
 
-    // Same 16-slot palette used by MPWGL2.html.
     static const QColor defaults[16] = {
         QColor("#818cf8"), QColor("#a78bfa"), QColor("#c4b5fd"), QColor("#fb923c"),
         QColor("#4ade80"), QColor("#38bdf8"), QColor("#f472b6"), QColor("#facc15"),
@@ -130,21 +177,32 @@ MainWindow::MainWindow(QObject *parent)
     };
 
     channelColors_.reserve(16);
+
     for (const auto& color : defaults)
         channelColors_.push_back(color);
 
-    // MPWGL2 drives visual/player time from requestAnimationFrame. 16 ms is
-    // the Qt/WASM equivalent: the wall clock remains authoritative and this
-    // timer only publishes the latest position to QML/GL.
+    visualPitchColor_.fill(-1);
+
     auto* frameTimer = new QTimer(this);
     frameTimer->setTimerType(Qt::PreciseTimer);
-    connect(frameTimer, &QTimer::timeout, this, &MainWindow::updateCurrentTime);
+
+    connect(
+        frameTimer,
+        &QTimer::timeout,
+        this,
+        &MainWindow::updateCurrentTime);
+
     frameTimer->start(16);
 
-    // The legacy MIDI scheduler runs every 5 ms with a 250 ms look-ahead.
     auto* schedulerTimer = new QTimer(this);
     schedulerTimer->setTimerType(Qt::PreciseTimer);
-    connect(schedulerTimer, &QTimer::timeout, this, &MainWindow::dispatchScheduler);
+
+    connect(
+        schedulerTimer,
+        &QTimer::timeout,
+        this,
+        &MainWindow::dispatchScheduler);
+
     schedulerTimer->start(5);
 }
 
@@ -158,8 +216,10 @@ QVariantList MainWindow::channelColorList() const
 {
     QVariantList result;
     result.reserve(channelColors_.size());
+
     for (const auto& color : channelColors_)
         result.push_back(color);
+
     return result;
 }
 
@@ -167,27 +227,39 @@ void MainWindow::setPlaying(bool playing)
 {
     if (isPlaying_ == playing)
         return;
+
     isPlaying_ = playing;
     emit playingChanged();
 }
 
 bool MainWindow::loadMidiUrl(const QUrl& url)
 {
-    const QString localPath = url.isLocalFile() ? url.toLocalFile() : url.toString();
+    const QString localPath =
+        url.isLocalFile()
+            ? url.toLocalFile()
+            : url.toString();
+
     QFile file(localPath);
+
     if (!file.open(QIODevice::ReadOnly)) {
-        emit loadFailed(QStringLiteral("Could not open %1").arg(localPath));
+        emit loadFailed(
+            QStringLiteral("Could not open %1")
+                .arg(localPath));
         return false;
     }
 
-    return loadMidiFileNamed(file.readAll(), QFileInfo(localPath).fileName());
+    return loadMidiFileNamed(
+        file.readAll(),
+        QFileInfo(localPath).fileName());
 }
 
 bool MainWindow::loadMidiFile(const QByteArray& data)
 {
     return loadMidiRaw(
-        reinterpret_cast<const uint8_t*>(data.constData()),
-        static_cast<std::size_t>(data.size()),
+        reinterpret_cast<const uint8_t*>(
+            data.constData()),
+        static_cast<std::size_t>(
+            data.size()),
         fileName_);
 }
 
@@ -196,8 +268,10 @@ bool MainWindow::loadMidiFileNamed(
     const QString& fileName)
 {
     return loadMidiRaw(
-        reinterpret_cast<const uint8_t*>(data.constData()),
-        static_cast<std::size_t>(data.size()),
+        reinterpret_cast<const uint8_t*>(
+            data.constData()),
+        static_cast<std::size_t>(
+            data.size()),
         fileName);
 }
 
@@ -210,8 +284,13 @@ bool MainWindow::loadMidiRaw(
 
     wasmidi::MidiDocument parsed;
 
-    if (!parser_.parse(data, size, parsed)) {
-        emit loadFailed(QString::fromUtf8(parser_.error()));
+    if (!parser_.parse(
+            data,
+            size,
+            parsed)) {
+        emit loadFailed(
+            QString::fromUtf8(
+                parser_.error()));
         return false;
     }
 
@@ -224,12 +303,17 @@ bool MainWindow::loadMidiRaw(
     }
 
     publishDocumentMetadata();
-    rebuildColorMaps();
     rebuildDerivedStats();
+
+    invalidateLiveTrackers();
+    visualStateValid_ = false;
 
     ++documentRevision_;
     emit documentRevisionChanged();
+
+    updateLiveStats();
     emit fileLoaded();
+
     return true;
 }
 
@@ -238,15 +322,45 @@ void MainWindow::openMidiPicker()
 #ifdef __EMSCRIPTEN__
     wasmidi_browser_open_midi_picker();
 #else
-    emit loadFailed(QStringLiteral("The browser MIDI picker is available in the WebAssembly build."));
+    emit loadFailed(
+        QStringLiteral(
+            "The browser MIDI picker is available in the WebAssembly build."));
 #endif
+}
+
+void MainWindow::clearVisualState()
+{
+    visualStateCount_.fill(0);
+    visualStateColor_.fill(0);
+    visualPitchCount_.fill(0);
+    visualPitchMask_.fill(0);
+    visualPitchColor_.fill(-1);
+    visualColorVoices_.fill(0);
+
+    visualActiveVoices_ = 0;
+    visualTick_ = 0;
+    visualGroupCursor_ = 0;
+    visualStateValid_ = false;
+}
+
+void MainWindow::invalidateLiveTrackers()
+{
+    liveWindowsValid_ = false;
+    liveLastTime_ = 0.0f;
+    liveHi_ = 0;
+    liveNpsLo_ = 0;
+    liveCcLo_ = 0;
+    liveNpsCount_ = 0;
+    liveCcCount_ = 0;
 }
 
 void MainWindow::clearFile()
 {
     stop();
+
     scheduler_.setDocument(nullptr);
     document_ = wasmidi::MidiDocument{};
+
     fileName_.clear();
 
     duration_ = 0.0f;
@@ -266,15 +380,19 @@ void MainWindow::clearFile()
     peakPolyphony_ = 0;
     pitchRange_ = QStringLiteral("—");
     skippedVelocity_ = 0;
-    npsTimeline_.clear();
 
-    noteStarts_.clear();
-    noteEnds_.clear();
-    controlTimes_.clear();
+    npsTimeline_.clear();
     tempoTimes_.clear();
     tempoBpms_.clear();
 
+    clearVisualState();
+    invalidateLiveTrackers();
+
+    dominantHue_ = 230.0f;
+    neuralActivity_ = 0.0f;
+
     ++documentRevision_;
+
     emit fileNameChanged();
     emit durationChanged();
     emit noteCountChanged();
@@ -293,37 +411,72 @@ void MainWindow::clearFile()
     emit pitchRangeChanged();
     emit skippedVelocityChanged();
     emit timelineChanged();
+    emit activePitchesChanged();
+    emit neuralVisualChanged();
     emit documentRevisionChanged();
 }
 
 void MainWindow::publishDocumentMetadata()
 {
-    duration_ = document_.durationSeconds;
-    noteCount_ = static_cast<int>(document_.notes.size());
-    trackCount_ = document_.trackCount;
-    midiFormat_ = document_.format;
-    ppq_ = document_.ticksPerBeat;
-    tempoChangeCount_ = static_cast<int>(document_.tempoMap.size());
-    controlEventCount_ = static_cast<int>(document_.controls.size());
+    duration_ =
+        document_.durationSeconds;
+
+    noteCount_ =
+        static_cast<int>(
+            std::min<uint64_t>(
+                document_.noteCount,
+                uint64_t(
+                    std::numeric_limits<int>::max())));
+
+    trackCount_ =
+        document_.trackCount;
+
+    midiFormat_ =
+        document_.format;
+
+    ppq_ =
+        document_.ticksPerBeat;
+
+    tempoChangeCount_ =
+        static_cast<int>(
+            std::min<std::size_t>(
+                document_.tempoMap.size(),
+                std::size_t(
+                    std::numeric_limits<int>::max())));
+
+    controlEventCount_ =
+        static_cast<int>(
+            std::min<uint64_t>(
+                document_.controlEventCount,
+                uint64_t(
+                    std::numeric_limits<int>::max())));
 
     uint32_t channelMask = 0;
-    for (const auto mask : document_.activeChannelMasks)
+
+    for (uint32_t mask :
+         document_.activeChannelMasks) {
         channelMask |= mask;
+    }
 
     activeChannelCount_ = 0;
-    for (int channel = 0; channel < 16; ++channel)
-        activeChannelCount_ += (channelMask & (1u << channel)) ? 1 : 0;
 
-    if (!document_.notes.empty()) {
-        int minPitch = 127;
-        int maxPitch = 0;
-        for (const auto& note : document_.notes) {
-            minPitch = std::min(minPitch, static_cast<int>(note.pitch));
-            maxPitch = std::max(maxPitch, static_cast<int>(note.pitch));
-        }
-        pitchRange_ = QStringLiteral("%1–%2").arg(minPitch).arg(maxPitch);
+    for (int channel = 0;
+         channel < 16;
+         ++channel) {
+        activeChannelCount_ +=
+            (channelMask & (1u << channel))
+                ? 1
+                : 0;
+    }
+
+    if (document_.hasPitch) {
+        pitchRange_ =
+            QStringLiteral("%1–%2")
+                .arg(document_.minPitch)
+                .arg(document_.maxPitch);
     } else {
-        pitchRange_ = QStringLiteral("—");
+        pitchRange_ =
+            QStringLiteral("—");
     }
 
     emit durationChanged();
@@ -339,9 +492,6 @@ void MainWindow::publishDocumentMetadata()
 
 void MainWindow::rebuildDerivedStats()
 {
-    noteStarts_.clear();
-    noteEnds_.clear();
-    controlTimes_.clear();
     tempoTimes_.clear();
     tempoBpms_.clear();
     npsTimeline_.clear();
@@ -350,128 +500,244 @@ void MainWindow::rebuildDerivedStats()
     peakNpsTime_ = 0.0f;
     peakPolyphony_ = 0;
 
-    noteStarts_.reserve(document_.notes.size());
-    noteEnds_.reserve(document_.notes.size());
-    controlTimes_.reserve(document_.controls.size());
+    tempoTimes_.reserve(
+        document_.tempoMap.size());
 
-    for (const auto& note : document_.notes) {
-        noteStarts_.push_back(note.startTime);
-        noteEnds_.push_back(note.endTime);
-    }
+    tempoBpms_.reserve(
+        document_.tempoMap.size());
 
-    for (const auto& event : document_.controls)
-        controlTimes_.push_back(event.time);
+    for (std::size_t i = 0;
+         i < document_.tempoMap.size();
+         ++i) {
+        tempoTimes_.push_back(
+            static_cast<float>(
+                i < document_.tempoSeconds.size()
+                    ? document_.tempoSeconds[i]
+                    : document_.tickToSeconds(
+                        document_.tempoMap[i].tick)));
 
-    std::sort(noteStarts_.begin(), noteStarts_.end());
-    std::sort(noteEnds_.begin(), noteEnds_.end());
-    std::sort(controlTimes_.begin(), controlTimes_.end());
+        const uint32_t us =
+            document_.tempoMap[i]
+                .microsecondsPerBeat;
 
-    // Build the same seconds-domain tempo index used by MPWGL2.
-    if (!document_.tempoMap.empty()) {
-        double seconds = 0.0;
-        uint32_t previousTick = 0;
-        uint32_t previousUsPerBeat = 500000;
-        const double ppq = std::max(1, static_cast<int>(document_.ticksPerBeat));
-
-        tempoTimes_.reserve(document_.tempoMap.size());
-        tempoBpms_.reserve(document_.tempoMap.size());
-
-        for (const auto& tempo : document_.tempoMap) {
-            seconds += (static_cast<double>(tempo.tick - previousTick) / ppq) *
-                       (static_cast<double>(previousUsPerBeat) / 1000000.0);
-            tempoTimes_.push_back(static_cast<float>(seconds));
-            tempoBpms_.push_back(tempo.microsecondsPerBeat != 0
-                ? 60000000.0f / static_cast<float>(tempo.microsecondsPerBeat)
+        tempoBpms_.push_back(
+            us != 0
+                ? 60'000'000.0f /
+                  float(us)
                 : 120.0f);
-            previousTick = tempo.tick;
-            previousUsPerBeat = tempo.microsecondsPerBeat != 0
-                ? tempo.microsecondsPerBeat
-                : previousUsPerBeat;
-        }
     }
 
     if (tempoBpms_.empty()) {
         tempoTimes_.push_back(0.0f);
         tempoBpms_.push_back(120.0f);
     }
+
     bpm_ = tempoBpms_.front();
 
-    // Legacy computePeaks(): one-second window sampled every 100 ms.
-    if (!noteStarts_.empty()) {
-        for (float t = 0.0f; t <= duration_ + 0.0001f; t += 0.1f) {
-            const auto lo = std::lower_bound(noteStarts_.begin(), noteStarts_.end(), t - 1.0f);
-            const auto hi = std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
-            const int count = static_cast<int>(hi - lo);
-            if (count > peakNps_) {
-                peakNps_ = count;
-                peakNpsTime_ = t;
+    // Half-second NPS timeline: same visual data as before, now accumulated
+    // directly from TickGroup::noteOnCount instead of per-note start arrays.
+    if (duration_ > 0.0f) {
+        constexpr double step = 0.5;
+
+        const std::size_t bucketCount =
+            static_cast<std::size_t>(
+                std::ceil(
+                    double(duration_) /
+                    step)) + 1;
+
+        std::vector<int> buckets(
+            bucketCount,
+            0);
+
+        for (const auto& group :
+             document_.tickGroups) {
+            if (group.noteOnCount == 0)
+                continue;
+
+            const double seconds =
+                document_.tickToSeconds(
+                    group.tick);
+
+            const std::size_t bucket =
+                std::min(
+                    bucketCount - 1,
+                    static_cast<std::size_t>(
+                        std::max(
+                            0.0,
+                            std::floor(
+                                seconds /
+                                step))));
+
+            const uint64_t sum =
+                uint64_t(buckets[bucket]) +
+                group.noteOnCount;
+
+            buckets[bucket] =
+                static_cast<int>(
+                    std::min<uint64_t>(
+                        sum,
+                        uint64_t(
+                            std::numeric_limits<int>::max())));
+        }
+
+        npsTimeline_.reserve(
+            static_cast<int>(
+                std::min<std::size_t>(
+                    bucketCount,
+                    std::size_t(
+                        std::numeric_limits<int>::max()))));
+
+        for (int value : buckets)
+            npsTimeline_.push_back(value);
+    }
+
+    // Exact one-second peak-NPS using a sliding TickGroup window.
+    std::size_t left = 0;
+    uint64_t rollingNotes = 0;
+
+    for (std::size_t right = 0;
+         right < document_.tickGroups.size();
+         ++right) {
+        const auto& group =
+            document_.tickGroups[right];
+
+        rollingNotes +=
+            group.noteOnCount;
+
+        const double rightSeconds =
+            document_.tickToSeconds(
+                group.tick);
+
+        while (left <= right) {
+            const double leftSeconds =
+                document_.tickToSeconds(
+                    document_.tickGroups[left].tick);
+
+            if (leftSeconds >=
+                rightSeconds - 1.0) {
+                break;
+            }
+
+            rollingNotes -=
+                document_.tickGroups[left]
+                    .noteOnCount;
+
+            ++left;
+        }
+
+        if (rollingNotes >
+            static_cast<uint64_t>(
+                peakNps_)) {
+            peakNps_ =
+                static_cast<int>(
+                    std::min<uint64_t>(
+                        rollingNotes,
+                        uint64_t(
+                            std::numeric_limits<int>::max())));
+
+            peakNpsTime_ =
+                static_cast<float>(
+                    rightSeconds);
+        }
+    }
+
+    // Exact peak polyphony from the compact event stream. No 2x Edge vector,
+    // no global note sort and no sampling.
+    std::array<uint32_t, 16 * 128>
+        activeStates{};
+
+    int64_t active = 0;
+    int64_t peak = 0;
+
+    for (const auto& group :
+         document_.tickGroups) {
+        const std::size_t begin =
+            group.eventOffset;
+
+        const std::size_t end =
+            begin + group.eventCount;
+
+        // Match the old dirs[b]-dirs[a] edge ordering: all NoteOns at this
+        // exact tick contribute before any NoteOff at the same tick.
+        for (std::size_t i = begin;
+             i < end;
+             ++i) {
+            const auto& event =
+                document_.events[i];
+
+            if ((event.status & 0xf0) != 0x90 ||
+                event.data2 == 0) {
+                continue;
+            }
+
+            const std::size_t state =
+                std::size_t(
+                    event.status & 0x0f) *
+                128u +
+                std::size_t(
+                    event.data1 & 0x7f);
+
+            ++activeStates[state];
+            ++active;
+            peak = std::max(peak, active);
+        }
+
+        for (std::size_t i = begin;
+             i < end;
+             ++i) {
+            const auto& event =
+                document_.events[i];
+
+            if ((event.status & 0xf0) != 0x80)
+                continue;
+
+            const std::size_t state =
+                std::size_t(
+                    event.status & 0x0f) *
+                128u +
+                std::size_t(
+                    event.data1 & 0x7f);
+
+            if (activeStates[state] != 0) {
+                --activeStates[state];
+                --active;
             }
         }
     }
 
-    // MPWGL2 limits/NPS timeline: half-second buckets across the whole file.
-    if (duration_ > 0.0f) {
-        const float step = 0.5f;
-        const int buckets = static_cast<int>(std::ceil(duration_ / step)) + 1;
-        npsTimeline_.reserve(buckets);
-        for (int bucket = 0; bucket < buckets; ++bucket) {
-            const float t = (bucket + 1) * step;
-            const auto lo = std::lower_bound(noteStarts_.begin(), noteStarts_.end(), t - step);
-            const auto hi = std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
-            npsTimeline_.push_back(static_cast<int>(hi - lo));
-        }
-    }
-
-    // Legacy peak-polyphony calculation samples at most ~400k notes on huge
-    // Black MIDI files so loading the UI cannot be blocked indefinitely.
-    struct Edge { float time; int delta; };
-    constexpr std::size_t MaxPeakNotes = 400000;
-    const std::size_t stride = document_.notes.size() > MaxPeakNotes
-        ? static_cast<std::size_t>(std::ceil(
-            static_cast<double>(document_.notes.size()) / MaxPeakNotes))
-        : 1;
-
-    std::vector<Edge> edges;
-    edges.reserve((document_.notes.size() / stride + 1) * 2);
-    for (std::size_t i = 0; i < document_.notes.size(); i += stride) {
-        const auto& note = document_.notes[i];
-        edges.push_back({note.startTime, +1});
-        edges.push_back({note.endTime, -1});
-    }
-
-    std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
-        if (a.time != b.time)
-            return a.time < b.time;
-        // MPWGL2's dirs[b]-dirs[a]: note-on before note-off at equal time.
-        return a.delta > b.delta;
-    });
-
-    int active = 0;
-    for (const auto& edge : edges) {
-        active += edge.delta;
-        peakPolyphony_ = std::max(peakPolyphony_, active);
-    }
+    peakPolyphony_ =
+        static_cast<int>(
+            std::min<int64_t>(
+                peak,
+                std::numeric_limits<int>::max()));
 
     emit bpmChanged();
     emit peakNpsChanged();
     emit peakPolyphonyChanged();
     emit timelineChanged();
-    updateLiveStats();
 }
 
 void MainWindow::play()
 {
-    if (document_.notes.empty())
+    if (!hasMidi())
         return;
 
     if (currentTime_ >= duration_)
         currentTime_ = 0.0f;
 
-    // Equivalent to: startedAt = performance.now() - currentTime * 1000.
-    playbackAnchorSeconds_ = currentTime_;
+    playbackAnchorSeconds_ =
+        currentTime_;
+
     playbackClock_.restart();
-    scheduler_.seek(currentTime_);
+
+    scheduler_.seek(
+        currentTime_);
+
     scheduler_.start();
+
+    invalidateLiveTrackers();
+    visualStateValid_ = false;
+
     setPlaying(true);
 }
 
@@ -489,6 +755,7 @@ void MainWindow::stop()
 {
     scheduler_.stop();
     setPlaying(false);
+
     playbackAnchorSeconds_ = 0.0f;
     playbackClock_.invalidate();
 
@@ -497,29 +764,43 @@ void MainWindow::stop()
         emit currentTimeChanged();
     }
 
-    // MPWGL2 explicitly resets live note/NPS counters on Stop.
     if (activeVoices_ != 0) {
         activeVoices_ = 0;
         emit activeVoicesChanged();
     }
+
     if (nps_ != 0) {
         nps_ = 0;
         emit npsChanged();
     }
+
     if (ccPerSecond_ != 0) {
         ccPerSecond_ = 0;
         emit ccPerSecondChanged();
     }
 
-    if (!tempoBpms_.empty() && !qFuzzyCompare(bpm_, tempoBpms_.front())) {
+    if (!tempoBpms_.empty() &&
+        !qFuzzyCompare(
+            bpm_,
+            tempoBpms_.front())) {
         bpm_ = tempoBpms_.front();
         emit bpmChanged();
     }
+
+    clearVisualState();
+    invalidateLiveTrackers();
+
+    emit activePitchesChanged();
 }
 
 void MainWindow::seek(float seconds)
 {
-    const float clamped = std::clamp(seconds, 0.0f, duration_);
+    const float clamped =
+        std::clamp(
+            seconds,
+            0.0f,
+            duration_);
+
     currentTime_ = clamped;
     playbackAnchorSeconds_ = clamped;
 
@@ -527,261 +808,628 @@ void MainWindow::seek(float seconds)
         playbackClock_.restart();
 
     scheduler_.seek(clamped);
+
+    invalidateLiveTrackers();
+    visualStateValid_ = false;
+
     emit currentTimeChanged();
     updateLiveStats();
 }
 
 void MainWindow::setNoteSpeed(float speed)
 {
-    const float clamped = std::clamp(speed, 0.1f, 60.0f);
-    if (qFuzzyCompare(noteSpeed_, clamped))
+    const float clamped =
+        std::clamp(
+            speed,
+            0.1f,
+            60.0f);
+
+    if (qFuzzyCompare(
+            noteSpeed_,
+            clamped)) {
         return;
+    }
+
     noteSpeed_ = clamped;
     emit noteSpeedChanged();
 }
 
 void MainWindow::setPostBuffer(float buffer)
 {
-    const float clamped = std::clamp(buffer, 0.0f, 10.0f);
-    const bool autoWasEnabled = postBufferAuto_;
+    const float clamped =
+        std::clamp(
+            buffer,
+            0.0f,
+            10.0f);
+
+    const bool autoWasEnabled =
+        postBufferAuto_;
+
     postBufferAuto_ = false;
+
     if (autoWasEnabled)
         emit postBufferAutoChanged();
-    if (qFuzzyCompare(postBuffer_, clamped))
+
+    if (qFuzzyCompare(
+            postBuffer_,
+            clamped)) {
         return;
+    }
+
     postBuffer_ = clamped;
     emit postBufferChanged();
 }
 
 void MainWindow::setPostBufferAuto()
 {
-    const bool changed = !postBufferAuto_;
+    const bool changed =
+        !postBufferAuto_;
+
     postBufferAuto_ = true;
+
     if (!qFuzzyIsNull(postBuffer_)) {
         postBuffer_ = 0.0f;
         emit postBufferChanged();
     }
+
     if (changed)
         emit postBufferAutoChanged();
 }
-
-void MainWindow::rebuildColorMaps()
-{
-    globalChannelColor_.fill(-1);
-    perTrackColorMap_.clear();
-
-    int count = 0;
-
-    for (uint32_t mask : document_.activeChannelMasks) {
-        for (int ch = 0; ch < 16; ++ch) {
-            if ((mask & (1u << ch)) && globalChannelColor_[ch] < 0)
-                globalChannelColor_[ch] = static_cast<int8_t>((count++) & 15);
-        }
-    }
-
-    for (int ch = 0; ch < 16; ++ch)
-        if (globalChannelColor_[ch] < 0)
-            globalChannelColor_[ch] = static_cast<int8_t>(ch);
-
-    count = 0;
-
-    for (const auto& note : document_.notes) {
-        const uint32_t key = uint32_t(note.track) * 16u + uint32_t(note.channel & 15);
-        if (perTrackColorMap_.find(key) == perTrackColorMap_.end())
-            perTrackColorMap_[key] = static_cast<uint8_t>((count++) & 15);
-    }
-}
-
-uint8_t MainWindow::colorIndexFor(uint16_t track, uint8_t channel) const
-{
-    channel &= 15;
-
-    if (!perTrackColors_) {
-        const int value = globalChannelColor_[channel];
-        return static_cast<uint8_t>(value >= 0 ? value : channel);
-    }
-
-    const uint32_t key = uint32_t(track) * 16u + uint32_t(channel);
-    const auto it = perTrackColorMap_.find(key);
-    return it == perTrackColorMap_.end() ? channel : it->second;
-}
-
-std::array<int8_t,128> MainWindow::activePitchColorIndices() const
-{
-    std::array<int8_t,128> result;
-    result.fill(-1);
-
-    const auto& notes = document_.notes;
-    if (notes.empty())
-        return result;
-
-    const float t = currentTime_;
-    const std::size_t lo = lowerBoundNoteStart(notes, t - 0.03f);
-    const std::size_t hi = std::min(notes.size(), upperBoundNoteStart(notes, t + 0.05f));
-
-    for (std::size_t i = lo; i < hi; ++i) {
-        const auto& note = notes[i];
-        if (note.endTime >= t)
-            result[note.pitch] = static_cast<int8_t>(colorIndexFor(note.track, note.channel));
-    }
-
-    return result;
-}
-
-void MainWindow::updateNeuralVisuals()
-{
-    const auto& notes = document_.notes;
-
-    float newHue = dominantHue_;
-
-    if (!notes.empty()) {
-        std::array<int,16> freq{};
-        const float t = currentTime_;
-        const std::size_t lo = lowerBoundNoteStart(notes, t - 0.05f);
-        const std::size_t hi = std::min(notes.size(), upperBoundNoteStart(notes, t + 0.15f));
-
-        for (std::size_t i = lo; i < hi; ++i) {
-            const auto& note = notes[i];
-            if (note.endTime >= t)
-                ++freq[colorIndexFor(note.track, note.channel)];
-        }
-
-        int best = -1, bestN = 0;
-        for (int i = 0; i < 16; ++i) {
-            if (freq[i] > bestN) {
-                bestN = freq[i];
-                best = i;
-            }
-        }
-
-        if (best >= 0 && best < channelColors_.size())
-            newHue = colorHue(channelColors_[best]);
-    }
-
-    const float act = peakNps_ > 0
-        ? std::min(1.0f, float(nps_) / float(peakNps_))
-        : 0.0f;
-
-    const float newActivity = act * 0.7f + neuralActivity_ * 0.3f;
-
-    if (!qFuzzyCompare(newHue, dominantHue_) ||
-        !qFuzzyCompare(newActivity, neuralActivity_)) {
-        dominantHue_ = newHue;
-        neuralActivity_ = newActivity;
-        emit neuralVisualChanged();
-    }
-}
-
 
 void MainWindow::setPerTrackColors(bool enable)
 {
     if (perTrackColors_ == enable)
         return;
+
     perTrackColors_ = enable;
+    visualStateValid_ = false;
+
     emit perTrackColorsChanged();
-    updateNeuralVisuals();
+
+    updateLiveStats();
 }
 
 void MainWindow::setVolume(int value)
 {
-    const int clamped = std::clamp(value, 0, 100);
+    const int clamped =
+        std::clamp(
+            value,
+            0,
+            100);
+
     if (volume_ == clamped)
         return;
+
     volume_ = clamped;
     emit volumeChanged();
 }
 
 void MainWindow::setOutputMode(const QString& mode)
 {
-    QString normalized = mode.toLower();
+    QString normalized =
+        mode.toLower();
+
     if (normalized != QStringLiteral("native") &&
         normalized != QStringLiteral("input") &&
         normalized != QStringLiteral("off") &&
         normalized != QStringLiteral("embedded")) {
-        normalized = QStringLiteral("off");
+        normalized =
+            QStringLiteral("off");
     }
+
     if (outputMode_ == normalized)
         return;
+
     outputMode_ = normalized;
     emit outputModeChanged();
 }
 
-void MainWindow::setChannelColor(int channel, const QColor& color)
+void MainWindow::setChannelColor(
+    int channel,
+    const QColor& color)
 {
-    if (channel < 0 || channel >= channelColors_.size() || !color.isValid())
+    if (channel < 0 ||
+        channel >= channelColors_.size() ||
+        !color.isValid()) {
         return;
+    }
+
     if (channelColors_[channel] == color)
         return;
+
     channelColors_[channel] = color;
+
     emit channelColorsChanged();
     updateNeuralVisuals();
 }
 
-void MainWindow::updateLiveStats()
+void MainWindow::processVisualEvent(
+    const wasmidi::CompactEvent& event,
+    uint32_t /*tick*/)
 {
-    if (document_.notes.empty()) {
-        if (nps_ != 0) { nps_ = 0; emit npsChanged(); }
-        if (activeVoices_ != 0) { activeVoices_ = 0; emit activeVoicesChanged(); }
-        if (ccPerSecond_ != 0) { ccPerSecond_ = 0; emit ccPerSecondChanged(); }
+    const uint8_t command =
+        event.status & 0xf0;
+
+    if (command != 0x90 &&
+        command != 0x80) {
         return;
     }
 
-    const float t = currentTime_;
+    const uint8_t channel =
+        event.status & 0x0f;
 
-    // Exact MPWGL2 live NPS formula: count starts in the last 250 ms and
-    // multiply by four. This is why the legacy counter reacts immediately.
-    const auto npsLo = std::lower_bound(noteStarts_.begin(), noteStarts_.end(), t - 0.25f);
-    const auto npsHi = std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
-    const int newNps = static_cast<int>(std::lround((npsHi - npsLo) * 4.0));
+    const uint8_t pitch =
+        event.data1 & 0x7f;
 
-    // Same active-polyphony formula as MPWGL2:
-    // upperBound(startArr,t) - lowerBound(endArr,t).
-    //
-    // IMPORTANT: do not subtract iterators from noteStarts_ and noteEnds_
-    // directly. They belong to different vectors; doing so is undefined
-    // behavior and produced huge ACTIVE values in the WASM build.
-    const auto startedIt =
-        std::upper_bound(noteStarts_.begin(), noteStarts_.end(), t);
-    const auto endedIt =
-        std::lower_bound(noteEnds_.begin(), noteEnds_.end(), t);
+    const std::size_t state =
+        std::size_t(channel) *
+        128u +
+        std::size_t(pitch);
 
-    const std::ptrdiff_t startedCount =
-        startedIt - noteStarts_.begin();
-    const std::ptrdiff_t endedCount =
-        endedIt - noteEnds_.begin();
+    const uint8_t color =
+        document_.colorIndex(
+            event,
+            perTrackColors_);
 
-    const int newActive = std::max(
-        0,
-        static_cast<int>(startedCount - endedCount));
+    if (command == 0x90 &&
+        event.data2 != 0) {
+        ++visualStateCount_[state];
+        visualStateColor_[state] = color;
 
-    // CC/s is a moving one-second window, not a coarse per-second bucket.
-    const auto ccLo = std::lower_bound(controlTimes_.begin(), controlTimes_.end(), t - 1.0f);
-    const auto ccHi = std::upper_bound(controlTimes_.begin(), controlTimes_.end(), t);
-    const int newCc = static_cast<int>(ccHi - ccLo);
+        ++visualPitchCount_[pitch];
+        visualPitchMask_[pitch] = 1;
+        visualPitchColor_[pitch] =
+            static_cast<int8_t>(color);
+
+        ++visualColorVoices_[color];
+        ++visualActiveVoices_;
+        return;
+    }
+
+    if (visualStateCount_[state] == 0)
+        return;
+
+    const uint8_t soundingColor =
+        visualStateColor_[state] & 0x0f;
+
+    --visualStateCount_[state];
+
+    if (visualPitchCount_[pitch] != 0)
+        --visualPitchCount_[pitch];
+
+    if (visualColorVoices_[soundingColor] != 0)
+        --visualColorVoices_[soundingColor];
+
+    visualActiveVoices_ =
+        std::max(
+            0,
+            visualActiveVoices_ - 1);
+
+    if (visualPitchCount_[pitch] == 0) {
+        visualPitchMask_[pitch] = 0;
+        visualPitchColor_[pitch] = -1;
+        return;
+    }
+
+    if (visualPitchColor_[pitch] ==
+        static_cast<int8_t>(soundingColor)) {
+        // Pick another currently sounding channel for this pitch.
+        for (int ch = 0; ch < 16; ++ch) {
+            const std::size_t other =
+                std::size_t(ch) * 128u +
+                std::size_t(pitch);
+
+            if (visualStateCount_[other] != 0) {
+                visualPitchColor_[pitch] =
+                    static_cast<int8_t>(
+                        visualStateColor_[other]);
+                break;
+            }
+        }
+    }
+}
+
+void MainWindow::syncVisualState(
+    uint32_t targetTick,
+    bool forceRebuild)
+{
+    if (document_.tickGroups.empty()) {
+        clearVisualState();
+        return;
+    }
+
+    const auto oldMask =
+        visualPitchMask_;
+
+    const auto oldColors =
+        visualPitchColor_;
+
+    const bool backwards =
+        visualStateValid_ &&
+        targetTick < visualTick_;
+
+    if (forceRebuild ||
+        !visualStateValid_ ||
+        backwards) {
+        visualStateCount_.fill(0);
+        visualStateColor_.fill(0);
+        visualPitchCount_.fill(0);
+        visualPitchMask_.fill(0);
+        visualPitchColor_.fill(-1);
+        visualColorVoices_.fill(0);
+        visualActiveVoices_ = 0;
+
+        // Bounded reconstruction on seeks: mirrors SharpMIDI's renderer
+        // strategy and prevents a seek near the end of a 100M-event file from
+        // replaying the whole MIDI on the UI thread.
+        const double lookbackSeconds =
+            std::max(
+                30.0,
+                double(noteSpeed_) * 4.0 +
+                double(postBuffer_));
+
+        const double startSeconds =
+            std::max(
+                0.0,
+                double(currentTime_) -
+                lookbackSeconds);
+
+        const uint32_t startTick =
+            static_cast<uint32_t>(
+                std::max(
+                    0.0,
+                    std::floor(
+                        document_.secondsToTick(
+                            startSeconds))));
+
+        visualGroupCursor_ =
+            document_.lowerBoundGroup(
+                startTick);
+
+        visualTick_ = startTick;
+        visualStateValid_ = true;
+    }
+
+    while (visualGroupCursor_ <
+           document_.tickGroups.size()) {
+        const auto& group =
+            document_.tickGroups[
+                visualGroupCursor_];
+
+        if (group.tick > targetTick)
+            break;
+
+        const std::size_t begin =
+            group.eventOffset;
+
+        const std::size_t end =
+            begin + group.eventCount;
+
+        for (std::size_t i = begin;
+             i < end;
+             ++i) {
+            processVisualEvent(
+                document_.events[i],
+                group.tick);
+        }
+
+        ++visualGroupCursor_;
+    }
+
+    visualTick_ = targetTick;
+
+    if (oldMask != visualPitchMask_ ||
+        oldColors != visualPitchColor_) {
+        emit activePitchesChanged();
+    }
+}
+
+void MainWindow::updateNeuralVisuals()
+{
+    float newHue = dominantHue_;
+
+    std::array<uint64_t, 16> frequency{};
+
+    for (int i = 0; i < 16; ++i)
+        frequency[i] = visualColorVoices_[i];
+
+    // Preserve MPWGL2's slight look-ahead for background color reaction.
+    if (!document_.tickGroups.empty()) {
+        const double futureSeconds =
+            std::min<double>(
+                duration_,
+                double(currentTime_) +
+                0.15);
+
+        const uint32_t futureTick =
+            static_cast<uint32_t>(
+                std::min<double>(
+                    document_.maxTick,
+                    std::ceil(
+                        document_.secondsToTick(
+                            futureSeconds))));
+
+        const std::size_t futureEnd =
+            document_.upperBoundGroup(
+                futureTick);
+
+        for (std::size_t groupIndex =
+                 visualGroupCursor_;
+             groupIndex < futureEnd;
+             ++groupIndex) {
+            const auto& group =
+                document_.tickGroups[groupIndex];
+
+            const std::size_t begin =
+                group.eventOffset;
+
+            const std::size_t end =
+                begin + group.eventCount;
+
+            for (std::size_t i = begin;
+                 i < end;
+                 ++i) {
+                const auto& event =
+                    document_.events[i];
+
+                if ((event.status & 0xf0) ==
+                        0x90 &&
+                    event.data2 != 0) {
+                    ++frequency[
+                        document_.colorIndex(
+                            event,
+                            perTrackColors_)];
+                }
+            }
+        }
+    }
+
+    int bestColor = -1;
+    uint64_t bestCount = 0;
+
+    for (int color = 0;
+         color < 16;
+         ++color) {
+        if (frequency[color] >
+            bestCount) {
+            bestCount =
+                frequency[color];
+
+            bestColor = color;
+        }
+    }
+
+    if (bestColor >= 0 &&
+        bestColor <
+            channelColors_.size()) {
+        newHue =
+            colorHue(
+                channelColors_[
+                    bestColor]);
+    }
+
+    const float activity =
+        peakNps_ > 0
+            ? std::min(
+                1.0f,
+                float(nps_) /
+                float(peakNps_))
+            : 0.0f;
+
+    const float newActivity =
+        activity * 0.7f +
+        neuralActivity_ * 0.3f;
+
+    if (!qFuzzyCompare(
+            newHue,
+            dominantHue_) ||
+        !qFuzzyCompare(
+            newActivity,
+            neuralActivity_)) {
+        dominantHue_ = newHue;
+        neuralActivity_ = newActivity;
+        emit neuralVisualChanged();
+    }
+}
+
+void MainWindow::updateLiveStats()
+{
+    if (!hasMidi() ||
+        document_.tickGroups.empty()) {
+        if (nps_ != 0) {
+            nps_ = 0;
+            emit npsChanged();
+        }
+
+        if (activeVoices_ != 0) {
+            activeVoices_ = 0;
+            emit activeVoicesChanged();
+        }
+
+        if (ccPerSecond_ != 0) {
+            ccPerSecond_ = 0;
+            emit ccPerSecondChanged();
+        }
+
+        return;
+    }
+
+    const double time =
+        currentTime_;
+
+    const uint32_t currentTick =
+        static_cast<uint32_t>(
+            std::min<double>(
+                document_.maxTick,
+                std::floor(
+                    document_.secondsToTick(
+                        time))));
+
+    const uint32_t npsStartTick =
+        static_cast<uint32_t>(
+            std::max(
+                0.0,
+                std::floor(
+                    document_.secondsToTick(
+                        std::max(
+                            0.0,
+                            time - 0.25)))));
+
+    const uint32_t ccStartTick =
+        static_cast<uint32_t>(
+            std::max(
+                0.0,
+                std::floor(
+                    document_.secondsToTick(
+                        std::max(
+                            0.0,
+                            time - 1.0)))));
+
+    const std::size_t targetHi =
+        document_.upperBoundGroup(
+            currentTick);
+
+    const std::size_t targetNpsLo =
+        document_.lowerBoundGroup(
+            npsStartTick);
+
+    const std::size_t targetCcLo =
+        document_.lowerBoundGroup(
+            ccStartTick);
+
+    const bool discontinuity =
+        !liveWindowsValid_ ||
+        time < liveLastTime_ ||
+        time - liveLastTime_ > 0.5;
+
+    if (discontinuity) {
+        liveNpsCount_ = 0;
+        liveCcCount_ = 0;
+
+        for (std::size_t i = targetNpsLo;
+             i < targetHi;
+             ++i) {
+            liveNpsCount_ +=
+                document_.tickGroups[i]
+                    .noteOnCount;
+        }
+
+        for (std::size_t i = targetCcLo;
+             i < targetHi;
+             ++i) {
+            liveCcCount_ +=
+                document_.tickGroups[i]
+                    .controlCount;
+        }
+
+        liveHi_ = targetHi;
+        liveNpsLo_ = targetNpsLo;
+        liveCcLo_ = targetCcLo;
+        liveWindowsValid_ = true;
+    } else {
+        while (liveHi_ < targetHi) {
+            const auto& group =
+                document_.tickGroups[liveHi_];
+
+            liveNpsCount_ +=
+                group.noteOnCount;
+
+            liveCcCount_ +=
+                group.controlCount;
+
+            ++liveHi_;
+        }
+
+        while (liveNpsLo_ < targetNpsLo &&
+               liveNpsLo_ < liveHi_) {
+            liveNpsCount_ -=
+                document_.tickGroups[
+                    liveNpsLo_]
+                    .noteOnCount;
+
+            ++liveNpsLo_;
+        }
+
+        while (liveCcLo_ < targetCcLo &&
+               liveCcLo_ < liveHi_) {
+            liveCcCount_ -=
+                document_.tickGroups[
+                    liveCcLo_]
+                    .controlCount;
+
+            ++liveCcLo_;
+        }
+    }
+
+    liveLastTime_ =
+        static_cast<float>(time);
+
+    syncVisualState(
+        currentTick);
+
+    const int newNps =
+        static_cast<int>(
+            std::min<uint64_t>(
+                liveNpsCount_ * 4u,
+                uint64_t(
+                    std::numeric_limits<int>::max())));
+
+    const int newCc =
+        static_cast<int>(
+            std::min<uint64_t>(
+                liveCcCount_,
+                uint64_t(
+                    std::numeric_limits<int>::max())));
+
+    const int newActive =
+        visualActiveVoices_;
 
     float newBpm = 120.0f;
+
     if (!tempoTimes_.empty()) {
-        auto it = std::upper_bound(tempoTimes_.begin(), tempoTimes_.end(), t);
+        auto it =
+            std::upper_bound(
+                tempoTimes_.begin(),
+                tempoTimes_.end(),
+                currentTime_);
+
         std::size_t index = 0;
-        if (it != tempoTimes_.begin())
-            index = static_cast<std::size_t>((it - tempoTimes_.begin()) - 1);
-        index = std::min(index, tempoBpms_.size() - 1);
-        newBpm = tempoBpms_[index];
+
+        if (it != tempoTimes_.begin()) {
+            index =
+                static_cast<std::size_t>(
+                    (it -
+                     tempoTimes_.begin()) -
+                    1);
+        }
+
+        index =
+            std::min(
+                index,
+                tempoBpms_.size() - 1);
+
+        newBpm =
+            tempoBpms_[index];
     }
 
     if (nps_ != newNps) {
         nps_ = newNps;
         emit npsChanged();
     }
+
     if (activeVoices_ != newActive) {
         activeVoices_ = newActive;
         emit activeVoicesChanged();
     }
+
     if (ccPerSecond_ != newCc) {
         ccPerSecond_ = newCc;
         emit ccPerSecondChanged();
     }
-    if (!qFuzzyCompare(bpm_, newBpm)) {
+
+    if (!qFuzzyCompare(
+            bpm_,
+            newBpm)) {
         bpm_ = newBpm;
         emit bpmChanged();
     }
@@ -794,11 +1442,13 @@ void MainWindow::updateCurrentTime()
     if (!isPlaying_)
         return;
 
-    currentTime_ = playbackAnchorSeconds_ +
-        static_cast<float>(playbackClock_.elapsed()) / 1000.0f;
+    currentTime_ =
+        playbackAnchorSeconds_ +
+        static_cast<float>(
+            playbackClock_.elapsed()) /
+        1000.0f;
 
     if (currentTime_ >= duration_) {
-        // MPWGL2 calls stopPlayback() at EOF, which returns the transport to 0.
         stop();
         return;
     }
@@ -809,24 +1459,17 @@ void MainWindow::updateCurrentTime()
 
 void MainWindow::dispatchScheduler()
 {
-    if (!isPlaying_ || document_.notes.empty())
+    if (!isPlaying_ ||
+        !hasMidi()) {
         return;
+    }
 
-    // Preserve the exact legacy cadence and look-ahead. The returned events
-    // are the native hand-off point for Web MIDI / SnappySynth in the next
-    // audio-driver port; importantly, scheduler time no longer advances by
-    // 250 ms on every 5 ms callback.
-    const auto& scheduled = scheduler_.getEventsForWindow(currentTime_, 0.25f, 0.05f);
+    const auto& scheduled =
+        scheduler_.getEventsForWindow(
+            currentTime_,
+            0.25f,
+            0.05f);
+
+    // Native hand-off point for the Web MIDI / embedded synth driver.
     (void)scheduled;
-}
-
-std::array<uint8_t, 128> MainWindow::activePitchMask() const
-{
-    std::array<uint8_t,128> mask{};
-    const auto colors = activePitchColorIndices();
-
-    for (std::size_t i = 0; i < mask.size(); ++i)
-        mask[i] = colors[i] >= 0 ? 1 : 0;
-
-    return mask;
 }

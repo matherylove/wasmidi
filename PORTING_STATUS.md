@@ -1,23 +1,58 @@
-# WASMIDI Pass 7 — parser/RAM and visual parity
+# WASMIDI Pass 8 — compact tick engine + GPU note ring
 
-- Removes the browser-file QByteArray copy: selected file bytes are parsed
-  directly from the temporary WASM HEAP allocation.
-- Parser now follows MPWGL2's two-pass strategy, pre-counts notes/controls,
-  reserves once, and uses a fixed 65536-bucket contiguous pending hash instead
-  of unordered_map<key,deque>.
-- Repeated same-pitch NoteOns remain stacked correctly.
-- Large-note sorting is in-place to avoid another complete Black-MIDI buffer.
-- pitchStarts_/pitchEnds_ duplicate arrays are removed.
-- GLRenderer no longer clones the complete note list; it views document.notes.
-- Piano-roll raster uses CSS-pixel dimensions like MPWGL2.html.
-- Keyboard active window is t-0.03..t+0.05 and each active key uses its real
-  global/per-track channel color.
-- Dominant screen color uses t-0.05..t+0.15.
-- Neural activity follows liveNps/peakNps with 0.7/0.3 smoothing.
-- Neural background restores 95 nodes, hue interpolation, activity-controlled
-  speed, connection intensity and gradient blobs from the original.
+This pass changes the internal engine while keeping the existing QML/UI look.
 
-This keeps the existing Qt interface and WebGL roll while removing the largest
-unnecessary data duplication. The next parser step, if required after testing,
-is restoring the separate browser Worker so parsing itself never blocks the Qt
-GUI thread.
+## Loading / RAM
+- Browser File API now streams chunks directly into one WASM allocation.
+  `file.arrayBuffer()` is no longer required on modern browsers, removing a
+  second full-file-sized JS allocation during load.
+- MIDI parser no longer constructs `NoteEvent` objects.
+- Authoritative channel events are 4-byte `CompactEvent` values.
+- Events are indexed by sparse `TickGroup` entries.
+- Pass 1 counts/indexes track ticks, notes and controls.
+- A k-way merge combines track histograms without allocating maxTick+1 slots.
+- Pass 2 writes events directly into their final global tick-group positions.
+- There is no global note pairing and no global note sort.
+- Both global/channel and per-track color slots are packed into one byte.
+- Tempo and SysEx remain separate.
+
+## Playback
+- Scheduler walks the same TickGroup/event stream directly.
+- Removes `unordered_map` sounding-note state and separate note/control cursors.
+- Seeks are binary-searches into TickGroup.
+
+## Renderer
+- Removes CPU note rasterization, strip buffers, scroll textures and private
+  scroll FBOs entirely.
+- Visible notes are represented as 12-byte `RenderNote` instances.
+- A CPU/GPU ring keeps only the visual working set.
+- Incremental sweep appends only newly entering notes.
+- NoteOff end-tick changes are batched/coalesced before `glBufferSubData`.
+- WebGL vertex shader converts start/end tick and pitch directly to geometry.
+- Normally one or two instanced draw calls render the complete note roll.
+- The playhead is drawn with scissor/clear; no second shader/QML item.
+- Tempo-dependent tick width is recalculated at the current playback position.
+
+## UI stats / keyboard
+- Removes noteStarts_, noteEnds_ and controlTimes_ full-size duplicates.
+- Peak NPS and timeline are derived from TickGroup counts.
+- Peak polyphony is an exact one-pass CompactEvent calculation, with no Edge
+  vector and no sorting.
+- Live NPS/CC use incremental sliding TickGroup windows.
+- Keyboard state is incrementally maintained from the same event stream.
+- Keyboard redraws only when active keys/colors or reactive hue actually change.
+- Existing active-note palette and neural background inputs are preserved.
+
+## Files
+- src/midi/midi_parser.hpp
+- src/midi/midi_parser.cpp
+- src/midi/scheduler.hpp
+- src/midi/scheduler.cpp
+- src/renderer/gl_renderer.hpp
+- src/renderer/gl_renderer.cpp
+- src/mainwindow.hpp
+- src/mainwindow.cpp
+- src/pianoroll.cpp
+- src/keyboard.cpp
+
+No QML layout/theme file is changed.
