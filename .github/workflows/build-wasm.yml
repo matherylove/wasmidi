@@ -82,6 +82,8 @@ jobs:
           test -s build/snappysynth-core.js
           test -s build/snappysynth-core.wasm
           test -s build/snappysynth-core.worker.js
+          test -s build/wasmidi-midi-parser.js
+          test -s build/wasmidi-midi-parser.wasm
 
           cp build/wasmidi.html site/index.html
           cp build/wasmidi.js site/
@@ -90,6 +92,12 @@ jobs:
           if [[ -f build/qtloader.js ]]; then cp build/qtloader.js site/; fi
           if [[ -f build/wasmidi.data ]]; then cp build/wasmidi.data site/; fi
           if [[ -f build/wasmidi.worker.js ]]; then cp build/wasmidi.worker.js site/; fi
+
+          # Large MIDI parsing runs in its own non-pthread Worker WASM module.
+          cp build/wasmidi-midi-parser.js site/
+          cp build/wasmidi-midi-parser.wasm site/
+          cp web/midi-parser-worker.js site/
+          cp web/visual-cache-worker.js site/
 
           # SnappySynthV2 is a separate modularized WASM module. Emscripten
           # generates a pthread worker alongside it.
@@ -127,6 +135,10 @@ jobs:
           test -s site/index.html
           test -s site/wasmidi.js
           test -s site/wasmidi.wasm
+          test -s site/wasmidi-midi-parser.js
+          test -s site/wasmidi-midi-parser.wasm
+          test -s site/midi-parser-worker.js
+          test -s site/visual-cache-worker.js
           test -s site/snappysynth-core.js
           test -s site/snappysynth-core.wasm
           test -s site/snappysynth-core.worker.js
