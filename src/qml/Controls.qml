@@ -10,6 +10,8 @@ Item {
     signal colorRequested(int channel)
 
     property var postValues: [-1, 0.0, 0.1, 0.5, 1.0, 2.0]
+    property var synthVoiceValues: [2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    property var synthBufferValues: [128, 256, 512, 1024, 2048]
 
     component SectionLabel: Text {
         color: "#6f6685"
@@ -253,7 +255,7 @@ Item {
             anchors.rightMargin: 7
             anchors.topMargin: 4
             width: Math.max(38, parent.width * 0.48)
-            text: Math.round(chartBox.value).toLocaleString()
+            text: root.formatInteger(chartBox.value)
             color: chartBox.title === "Skipped vel" ? "#fb7185" : chartBox.accent
             font.pixelSize: 9
             minimumPixelSize: 6
@@ -357,7 +359,7 @@ Item {
             anchors.rightMargin: 7
             anchors.topMargin: 4
             width: Math.max(38, parent.width * 0.48)
-            text: root.mainWindow.nps.toLocaleString()
+            text: root.formatInteger(root.mainWindow.nps)
             color: "#818cf8"
             font.pixelSize: 9
             minimumPixelSize: 6
@@ -409,7 +411,7 @@ Item {
                     font.bold: true
                     elide: Text.ElideMiddle
                 }
-                Text { text: root.mainWindow.noteCount.toLocaleString() + " notes"; color: "#645a79"; font.pixelSize: 8 }
+                Text { text: root.formatInteger(root.mainWindow.noteCount) + " notes"; color: "#645a79"; font.pixelSize: 8 }
                 FlatButton {
                     Layout.preferredWidth: 24
                     implicitHeight: 22
@@ -422,9 +424,9 @@ Item {
         RowLayout {
             Layout.fillWidth: true
             spacing: 4
-            LiveCard { label: "ACTIVE"; value: root.mainWindow.activeVoices.toLocaleString() }
-            LiveCard { label: "NPS"; value: root.mainWindow.nps.toLocaleString() }
-            LiveCard { label: "BPM"; value: root.mainWindow.hasMidi ? root.mainWindow.bpm.toFixed(0) : "—" }
+            LiveCard { label: "ACTIVE"; value: root.formatInteger(root.mainWindow.activeVoices) }
+            LiveCard { label: "NPS"; value: root.formatInteger(root.mainWindow.nps) }
+            LiveCard { label: "BPM"; value: root.mainWindow.hasMidi ? root.formatNumber(root.mainWindow.bpm, 2) : "—" }
         }
 
         RowLayout {
@@ -564,50 +566,157 @@ Item {
 
         RowLayout {
             Layout.fillWidth: true
-            SectionLabel { text: "MIDI I/O" }
+            spacing: 5
+
+            SectionLabel { text: "SNAPPYSYNTH V2" }
             Item { Layout.fillWidth: true }
-            spacing: 3
-            FlatButton {
-                Layout.preferredWidth: 54; implicitHeight: 21; text: "MIDI Out"
-                normalColor: root.mainWindow.outputMode === "native" ? "#2a194b" : "#110e20"
-                textColor: root.mainWindow.outputMode === "native" ? "#c4b5fd" : "#746a87"
-                onClicked: root.mainWindow.outputMode = "native"
+
+            Rectangle {
+                Layout.preferredWidth: 57
+                Layout.preferredHeight: 20
+                radius: 4
+                color: root.mainWindow.soundfontLoaded ? "#0e211c"
+                     : root.mainWindow.synthReady ? "#171222"
+                     : "#120f20"
+                border.color: root.mainWindow.soundfontLoaded ? "#236a55"
+                            : root.mainWindow.synthReady ? "#382c4d"
+                            : "#2c2341"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.mainWindow.soundfontLoaded ? "SF2 READY"
+                        : root.mainWindow.synthReady ? "READY"
+                        : "IDLE"
+                    color: root.mainWindow.soundfontLoaded ? "#34d399" : "#81758f"
+                    font.pixelSize: 7
+                    font.bold: true
+                }
             }
+
             FlatButton {
-                Layout.preferredWidth: 44; implicitHeight: 21; text: "MIDI In"
-                normalColor: root.mainWindow.outputMode === "input" ? "#2a194b" : "#110e20"
-                textColor: root.mainWindow.outputMode === "input" ? "#c4b5fd" : "#746a87"
-                onClicked: root.mainWindow.outputMode = "input"
-            }
-            FlatButton {
-                Layout.preferredWidth: 29; implicitHeight: 21; text: "Off"
-                normalColor: root.mainWindow.outputMode === "off" ? "#2a194b" : "#110e20"
-                textColor: root.mainWindow.outputMode === "off" ? "#c4b5fd" : "#746a87"
-                onClicked: root.mainWindow.outputMode = "off"
-            }
-            FlatButton {
-                Layout.preferredWidth: 79; implicitHeight: 21; text: "Embedded"
-                normalColor: root.mainWindow.outputMode === "embedded" ? "#2a194b" : "#110e20"
-                textColor: root.mainWindow.outputMode === "embedded" ? "#c4b5fd" : "#746a87"
-                onClicked: root.mainWindow.outputMode = "embedded"
+                Layout.preferredWidth: 61
+                implicitHeight: 21
+                text: "Load SF2"
+                onClicked: root.mainWindow.openSoundfontPicker()
             }
         }
 
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: root.mainWindow.outputMode === "embedded" ? 112 : 66
+            Layout.preferredHeight: 126
             radius: 6
             color: "#0c0a1a"
             border.color: "#211834"
             border.width: 1
 
-            Loader {
+            ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 7
-                sourceComponent: root.mainWindow.outputMode === "native" ? nativePanel
-                               : root.mainWindow.outputMode === "input" ? inputPanel
-                               : root.mainWindow.outputMode === "embedded" ? embeddedPanel
-                               : offPanel
+                spacing: 5
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 5
+
+                    Text {
+                        Layout.preferredWidth: 28
+                        text: "SF2"
+                        color: "#6c627d"
+                        font.pixelSize: 8
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.mainWindow.soundfontLoaded
+                            ? root.mainWindow.soundfontName
+                            : "No SoundFont loaded"
+                        color: root.mainWindow.soundfontLoaded ? "#c4b5fd" : "#6b6378"
+                        font.pixelSize: 8
+                        font.bold: root.mainWindow.soundfontLoaded
+                        elide: Text.ElideMiddle
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: root.mainWindow.synthStatus
+                    color: root.mainWindow.soundfontLoaded ? "#6f998c" : "#5c5368"
+                    font.pixelSize: 7
+                    elide: Text.ElideRight
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text { text: "Voices"; color: "#6c627d"; font.pixelSize: 8 }
+                    FlatButton {
+                        Layout.preferredWidth: 61
+                        implicitHeight: 21
+                        enabled: !root.mainWindow.isPlaying
+                        text: root.formatInteger(root.mainWindow.synthMaxVoices)
+                        onClicked: root.cycleSynthMaxVoices()
+                    }
+
+                    Text { text: "Buffer"; color: "#6c627d"; font.pixelSize: 8 }
+                    FlatButton {
+                        Layout.preferredWidth: 47
+                        implicitHeight: 21
+                        enabled: !root.mainWindow.isPlaying
+                        text: root.mainWindow.synthBufferFrames + "f"
+                        onClicked: root.cycleSynthBuffer()
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    FlatButton {
+                        Layout.preferredWidth: 79
+                        implicitHeight: 21
+                        text: "Overlap gain"
+                        normalColor: root.mainWindow.synthOverlapGain ? "#2a194b" : "#110e20"
+                        borderColor: root.mainWindow.synthOverlapGain ? "#6b48a8" : "#352550"
+                        textColor: root.mainWindow.synthOverlapGain ? "#c4b5fd" : "#746a87"
+                        onClicked: root.mainWindow.synthOverlapGain = !root.mainWindow.synthOverlapGain
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 7
+
+                    Text {
+                        text: "RATE " + (root.mainWindow.synthSampleRate > 0
+                            ? root.formatInteger(root.mainWindow.synthSampleRate) + " Hz"
+                            : "—")
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+
+                    Text {
+                        text: "VOICES " + root.formatInteger(root.mainWindow.synthActiveVoices)
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+
+                    Text {
+                        text: "UNDERRUNS " + root.formatInteger(root.mainWindow.synthUnderruns)
+                        color: root.mainWindow.synthUnderruns > 0 ? "#fb923c" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+
+                    Item { Layout.fillWidth: true }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "Worker → SnappySynthV2 WASM → AudioWorklet → system audio"
+                    color: "#484252"
+                    font.pixelSize: 7
+                    elide: Text.ElideRight
+                }
             }
         }
 
@@ -619,84 +728,6 @@ Item {
         }
 
         Item { Layout.preferredHeight: 52 }
-    }
-
-    Component {
-        id: nativePanel
-        ColumnLayout {
-            spacing: 5
-            RowLayout {
-                Layout.fillWidth: true
-                Rectangle {
-                    Layout.preferredWidth: 62
-                    Layout.preferredHeight: 21
-                    radius: 4
-                    color: "#171222"
-                    border.color: "#382c4d"
-                    Text { anchors.centerIn: parent; text: "Not started"; color: "#82788e"; font.pixelSize: 8; font.bold: true }
-                }
-                FlatButton { Layout.preferredWidth: 76; implicitHeight: 21; text: "Request Access"; enabled: false }
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 21
-                    radius: 4
-                    color: "#0b0918"
-                    border.color: "#2c2341"
-                    Text { anchors.centerIn: parent; text: "— select output —"; color: "#686075"; font.pixelSize: 8 }
-                }
-                FlatButton { Layout.preferredWidth: 25; implicitHeight: 21; text: "↺"; enabled: false }
-                FlatButton { Layout.preferredWidth: 45; implicitHeight: 21; text: "All Off"; enabled: false }
-            }
-            Text { text: "Web MIDI bridge will be connected in the I/O port stage."; color: "#514a5f"; font.pixelSize: 7; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-        }
-    }
-
-    Component {
-        id: inputPanel
-        ColumnLayout {
-            spacing: 5
-            Text { text: "MIDI IN"; color: "#a78bfa"; font.pixelSize: 9; font.bold: true }
-            Text { text: "Input device enumeration, thru routing and live visualization are reserved for the browser MIDI bridge stage."; color: "#5e566d"; font.pixelSize: 8; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-        }
-    }
-
-    Component {
-        id: offPanel
-        Item {
-            Text { anchors.centerIn: parent; text: "MIDI output disabled — visualization only."; color: "#655d72"; font.pixelSize: 8 }
-        }
-    }
-
-    Component {
-        id: embeddedPanel
-        ColumnLayout {
-            spacing: 5
-            RowLayout {
-                Layout.fillWidth: true
-                Text { text: "SnappySynth / SF2"; color: "#c4b5fd"; font.pixelSize: 9; font.bold: true }
-                Item { Layout.fillWidth: true }
-                Rectangle {
-                    Layout.preferredWidth: 54; Layout.preferredHeight: 19; radius: 4
-                    color: "#171222"; border.color: "#382c4d"
-                    Text { anchors.centerIn: parent; text: "No SF2"; color: "#81758f"; font.pixelSize: 7; font.bold: true }
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Text { text: "Volume"; color: "#6c627d"; font.pixelSize: 8; Layout.preferredWidth: 42 }
-                PurpleSlider { Layout.fillWidth: true; from: 0; to: 100; value: root.mainWindow.volume; onMoved: root.mainWindow.volume = Math.round(value) }
-                Text { text: root.mainWindow.volume + "%"; color: "#a78bfa"; font.pixelSize: 8; Layout.preferredWidth: 26 }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Text { text: "Voices"; color: "#6c627d"; font.pixelSize: 8 }
-                Item { Layout.fillWidth: true }
-                Text { text: "256 / layer"; color: "#81768f"; font.pixelSize: 8 }
-                Text { text: "Layers"; color: "#6c627d"; font.pixelSize: 8 }
-                Text { text: "2"; color: "#81768f"; font.pixelSize: 8 }
-            }
-            Text { text: "SF2 engine controls are ready for the native synth port."; color: "#514a5f"; font.pixelSize: 7; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-        }
     }
 
     function cyclePostBuffer() {
@@ -718,6 +749,73 @@ Item {
             root.mainWindow.setPostBufferAuto()
         else
             root.mainWindow.postBuffer = root.postValues[idx]
+    }
+
+    function groupIntegerString(digits) {
+        var out = ""
+        for (var i = 0; i < digits.length; ++i) {
+            if (i > 0 && ((digits.length - i) % 3) === 0)
+                out += ","
+            out += digits.charAt(i)
+        }
+        return out
+    }
+
+    // QML/JS may choose scientific notation for large Numbers. Build the
+    // decimal representation explicitly so UI counters always show natural
+    // digits (for example 44,750,700, never 4.47507E+07).
+    function formatInteger(value) {
+        var n = Number(value)
+        if (!isFinite(n))
+            return "—"
+        var rounded = Math.round(n)
+        var negative = rounded < 0
+        var digits = Math.abs(rounded).toFixed(0)
+        return (negative ? "-" : "") + groupIntegerString(digits)
+    }
+
+    function formatNumber(value, maxDecimals) {
+        var n = Number(value)
+        if (!isFinite(n))
+            return "—"
+
+        var decimals = Math.max(0, Math.min(8, Math.floor(Number(maxDecimals) || 0)))
+        var negative = n < 0
+        var fixed = Math.abs(n).toFixed(decimals)
+        var dot = fixed.indexOf(".")
+        var integerPart = dot >= 0 ? fixed.substring(0, dot) : fixed
+        var decimalPart = dot >= 0 ? fixed.substring(dot + 1) : ""
+
+        while (decimalPart.length > 0 && decimalPart.charAt(decimalPart.length - 1) === "0")
+            decimalPart = decimalPart.substring(0, decimalPart.length - 1)
+
+        return (negative ? "-" : "") +
+            groupIntegerString(integerPart) +
+            (decimalPart.length > 0 ? "." + decimalPart : "")
+    }
+
+    function cycleSynthMaxVoices() {
+        var current = root.mainWindow.synthMaxVoices
+        var next = root.synthVoiceValues[0]
+        for (var i = 0; i < root.synthVoiceValues.length; ++i) {
+            if (root.synthVoiceValues[i] >= current) {
+                next = root.synthVoiceValues[(i + 1) % root.synthVoiceValues.length]
+                break
+            }
+        }
+        root.mainWindow.synthMaxVoices = next
+    }
+
+    function cycleSynthBuffer() {
+        var current = root.mainWindow.synthBufferFrames
+        var next = root.synthBufferValues[0]
+        for (var i = 0; i < root.synthBufferValues.length; ++i) {
+            if (root.synthBufferValues[i] >= current) {
+                next = root.synthBufferValues[(i + 1) % root.synthBufferValues.length]
+                break
+            }
+        }
+        root.mainWindow.synthBufferFrames = next
     }
 
     function formatTime(seconds) {

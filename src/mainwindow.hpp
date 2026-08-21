@@ -48,7 +48,18 @@ class MainWindow : public QObject {
     Q_PROPERTY(int skippedVelocity READ skippedVelocity NOTIFY skippedVelocityChanged)
     Q_PROPERTY(QVariantList npsTimeline READ npsTimeline NOTIFY timelineChanged)
     Q_PROPERTY(quint64 documentRevision READ documentRevision NOTIFY documentRevisionChanged)
-    Q_PROPERTY(QString outputMode READ outputMode WRITE setOutputMode NOTIFY outputModeChanged)
+
+    Q_PROPERTY(bool synthReady READ synthReady NOTIFY synthStateChanged)
+    Q_PROPERTY(bool soundfontLoaded READ soundfontLoaded NOTIFY synthStateChanged)
+    Q_PROPERTY(QString soundfontName READ soundfontName NOTIFY synthStateChanged)
+    Q_PROPERTY(QString synthStatus READ synthStatus NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthSampleRate READ synthSampleRate NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthActiveVoices READ synthActiveVoices NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthUnderruns READ synthUnderruns NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthMaxVoices READ synthMaxVoices WRITE setSynthMaxVoices NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthBufferFrames READ synthBufferFrames WRITE setSynthBufferFrames NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthOverlapGain READ synthOverlapGain WRITE setSynthOverlapGain NOTIFY synthConfigChanged)
+
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
     Q_PROPERTY(float dominantHue READ dominantHue NOTIFY neuralVisualChanged)
     Q_PROPERTY(float neuralActivity READ neuralActivity NOTIFY neuralVisualChanged)
@@ -85,7 +96,18 @@ public:
     int skippedVelocity() const { return skippedVelocity_; }
     QVariantList npsTimeline() const { return npsTimeline_; }
     quint64 documentRevision() const { return documentRevision_; }
-    QString outputMode() const { return outputMode_; }
+
+    bool synthReady() const { return synthReady_; }
+    bool soundfontLoaded() const { return soundfontLoaded_; }
+    QString soundfontName() const { return soundfontName_; }
+    QString synthStatus() const { return synthStatus_; }
+    int synthSampleRate() const { return synthSampleRate_; }
+    int synthActiveVoices() const { return synthActiveVoices_; }
+    int synthUnderruns() const { return synthUnderruns_; }
+    int synthMaxVoices() const { return synthMaxVoices_; }
+    int synthBufferFrames() const { return synthBufferFrames_; }
+    bool synthOverlapGain() const { return synthOverlapGain_; }
+
     QVariantList channelColorList() const;
     float dominantHue() const { return dominantHue_; }
     float neuralActivity() const { return neuralActivity_; }
@@ -106,6 +128,7 @@ public:
     bool loadMidiRaw(const uint8_t* data, std::size_t size, const QString& fileName);
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
     Q_INVOKABLE void openMidiPicker();
+    Q_INVOKABLE void openSoundfontPicker();
     Q_INVOKABLE void clearFile();
     Q_INVOKABLE void play();
     Q_INVOKABLE void pause();
@@ -118,7 +141,9 @@ public:
     void setPostBuffer(float buffer);
     void setPerTrackColors(bool enable);
     void setVolume(int value);
-    void setOutputMode(const QString& mode);
+    void setSynthMaxVoices(int value);
+    void setSynthBufferFrames(int value);
+    void setSynthOverlapGain(bool enabled);
 
 signals:
     void playingChanged();
@@ -147,7 +172,8 @@ signals:
     void skippedVelocityChanged();
     void timelineChanged();
     void documentRevisionChanged();
-    void outputModeChanged();
+    void synthStateChanged();
+    void synthConfigChanged();
     void channelColorsChanged();
     void activePitchesChanged();
     void neuralVisualChanged();
@@ -165,8 +191,15 @@ private:
 
     void invalidateLiveTrackers();
     void clearVisualState();
-    void syncVisualState(uint32_t targetTick, bool forceRebuild = false);
-    void processVisualEvent(const wasmidi::CompactEvent& event, uint32_t tick);
+    void syncVisualState(double targetTick, bool forceRebuild = false);
+    void rebuildVisualStateAt(double targetTick);
+    void addVisualNote(std::size_t sourceIndex);
+    void removeVisualNote(uint8_t pitch, uint8_t color);
+
+    void pollSynthState();
+    void resetSynthSchedule(float seconds);
+    void scheduleSynthAhead();
+    uint32_t packSynthMessage(const wasmidi::CompactEvent& event) const;
 
     wasmidi::MidiParser parser_;
     wasmidi::MidiScheduler scheduler_;
@@ -199,7 +232,6 @@ private:
     int skippedVelocity_ = 0;
     QVariantList npsTimeline_;
     quint64 documentRevision_ = 0;
-    QString outputMode_ = QStringLiteral("native");
 
     QVector<QColor> channelColors_;
     QElapsedTimer playbackClock_;
@@ -217,19 +249,46 @@ private:
     uint64_t liveNpsCount_ = 0;
     uint64_t liveCcCount_ = 0;
 
-    // Incremental keyboard/neural state derived from the same compact event
-    // stream used by playback and rendering.
+    // Exact keyboard state from Pass 8.3's independent VisualNote intervals.
+    // Only currently-active note endings live in the heap; steady-state cost is
+    // O(polyphony), not O(total notes).
+    struct VisualActiveEnd {
+        uint32_t endTick = 0;
+        uint32_t sourceIndex = 0;
+        uint8_t pitch = 0;
+        uint8_t color = 0;
+    };
+
     bool visualStateValid_ = false;
-    uint32_t visualTick_ = 0;
-    std::size_t visualGroupCursor_ = 0;
+    double visualTick_ = 0.0;
+    std::size_t visualStartCursor_ = 0;
     int visualActiveVoices_ = 0;
 
-    std::array<uint32_t, 16 * 128> visualStateCount_{};
-    std::array<uint8_t, 16 * 128> visualStateColor_{};
+    std::vector<VisualActiveEnd> visualEndHeap_;
     std::array<uint32_t, 128> visualPitchCount_{};
     std::array<uint8_t, 128> visualPitchMask_{};
     std::array<int8_t, 128> visualPitchColor_{};
+    std::array<std::array<uint32_t, 16>, 128> visualPitchColorCounts_{};
     std::array<uint32_t, 16> visualColorVoices_{};
+
+    // Dedicated SnappySynthV2 browser worker state.
+    bool synthReady_ = false;
+    bool soundfontLoaded_ = false;
+    QString soundfontName_;
+    QString synthStatus_ = QStringLiteral("SnappySynthV2 idle");
+    int synthSampleRate_ = 0;
+    int synthActiveVoices_ = 0;
+    int synthUnderruns_ = 0;
+    int synthMaxVoices_ = 16384;
+    int synthBufferFrames_ = 512;
+    bool synthOverlapGain_ = false;
+    bool synthPlaybackPrimed_ = false;
+    bool synthWasSoundfontLoaded_ = false;
+    std::size_t synthGroupCursor_ = 0;
+    double synthScheduledUntil_ = 0.0;
+
+    std::vector<uint32_t> synthMessages_;
+    std::vector<double> synthTimes_;
 
     // Incremental +150 ms neural-color lookahead. This replaces rescanning
     // the same dense future event window on every UI frame.

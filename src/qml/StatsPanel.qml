@@ -27,17 +27,17 @@ Item {
 
             Repeater {
                 model: [
-                    ["Notes", root.mainWindow.noteCount.toLocaleString()],
-                    ["Tracks", root.mainWindow.trackCount.toString()],
+                    ["Notes", formatInteger(root.mainWindow.noteCount)],
+                    ["Tracks", formatInteger(root.mainWindow.trackCount)],
                     ["Dur", formatTime(root.mainWindow.duration)],
-                    ["BPM", root.mainWindow.bpm.toFixed(0)],
-                    ["Chs", root.mainWindow.activeChannelCount.toString()],
-                    ["Fmt", root.mainWindow.midiFormat.toString()],
-                    ["PPQ", root.mainWindow.ppq.toString()],
-                    ["Tmp Chg", root.mainWindow.tempoChangeCount.toString()],
-                    ["Pk NPS", root.mainWindow.peakNps.toLocaleString()],
-                    ["Pk Poly", root.mainWindow.peakPolyphony.toLocaleString()],
-                    ["CC Evts", root.mainWindow.controlEventCount.toLocaleString()],
+                    ["BPM", formatNumber(root.mainWindow.bpm, 2)],
+                    ["Chs", formatInteger(root.mainWindow.activeChannelCount)],
+                    ["Fmt", formatInteger(root.mainWindow.midiFormat)],
+                    ["PPQ", formatInteger(root.mainWindow.ppq)],
+                    ["Tmp Chg", formatInteger(root.mainWindow.tempoChangeCount)],
+                    ["Pk NPS", formatInteger(root.mainWindow.peakNps)],
+                    ["Pk Poly", formatInteger(root.mainWindow.peakPolyphony)],
+                    ["CC Evts", formatInteger(root.mainWindow.controlEventCount)],
                     ["Pitch", root.mainWindow.pitchRange]
                 ]
 
@@ -69,6 +69,42 @@ Item {
                 }
             }
         }
+    }
+
+    function groupIntegerString(digits) {
+        var out = ""
+        for (var i = 0; i < digits.length; ++i) {
+            if (i > 0 && ((digits.length - i) % 3) === 0)
+                out += ","
+            out += digits.charAt(i)
+        }
+        return out
+    }
+
+    function formatInteger(value) {
+        var n = Number(value)
+        if (!isFinite(n))
+            return "—"
+        var rounded = Math.round(n)
+        var negative = rounded < 0
+        var digits = Math.abs(rounded).toFixed(0)
+        return (negative ? "-" : "") + groupIntegerString(digits)
+    }
+
+    function formatNumber(value, maxDecimals) {
+        var n = Number(value)
+        if (!isFinite(n))
+            return "—"
+        var decimals = Math.max(0, Math.min(8, Math.floor(Number(maxDecimals) || 0)))
+        var negative = n < 0
+        var fixed = Math.abs(n).toFixed(decimals)
+        var dot = fixed.indexOf(".")
+        var integerPart = dot >= 0 ? fixed.substring(0, dot) : fixed
+        var decimalPart = dot >= 0 ? fixed.substring(dot + 1) : ""
+        while (decimalPart.length > 0 && decimalPart.charAt(decimalPart.length - 1) === "0")
+            decimalPart = decimalPart.substring(0, decimalPart.length - 1)
+        return (negative ? "-" : "") + groupIntegerString(integerPart) +
+            (decimalPart.length > 0 ? "." + decimalPart : "")
     }
 
     function formatTime(seconds) {

@@ -866,7 +866,10 @@ void buildVisualNotes(
                         0x0f) << 16) |
                     (uint32_t(
                         perTrackColor &
-                        0x0f) << 20)
+                        0x0f) << 20) |
+                    (uint32_t(
+                        channel &
+                        0x0f) << 24)
                 });
 
                 if (queue.tail !=
@@ -963,6 +966,32 @@ void buildVisualNotes(
     // the same stable start order produced by MPWGL2's final sort.
     output.noteCount =
         output.visualNotes.size();
+
+    output.visualBlockMaxEnd.clear();
+
+    const std::size_t blockSize =
+        MidiDocument::VisualSeekBlockSize;
+
+    const std::size_t blockCount =
+        (output.visualNotes.size() +
+         blockSize - 1) /
+        blockSize;
+
+    output.visualBlockMaxEnd.resize(
+        blockCount,
+        0);
+
+    for (std::size_t i = 0;
+         i < output.visualNotes.size();
+         ++i) {
+        const std::size_t block =
+            i / blockSize;
+
+        output.visualBlockMaxEnd[block] =
+            std::max(
+                output.visualBlockMaxEnd[block],
+                output.visualNotes[i].endTick);
+    }
 }
 
 } // namespace

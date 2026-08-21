@@ -28,6 +28,7 @@ static_assert(sizeof(CompactEvent) == 4, "CompactEvent must stay packed to 4 byt
 //   bits  8..15 pitch
 //   bits 16..19 global/channel color slot
 //   bits 20..23 per-track color slot
+//   bits 24..27 original MIDI channel (used only to rebuild held notes on seek)
 struct VisualNote {
     uint32_t startTick = 0;
     uint32_t endTick = 0;
@@ -79,6 +80,12 @@ struct MidiDocument {
     // channel+pitch merger, every NoteOn remains an independent note exactly
     // as in MPWGL2. It is already sorted by startTick, so rendering never sorts.
     std::vector<VisualNote> visualNotes;
+
+    // Tiny exact-seek accelerator for keyboard/sustained-note reconstruction.
+    // Each entry stores the maximum endTick of a 4096-note start-ordered block.
+    // A seek can skip entire historical blocks whose notes all ended already.
+    static constexpr std::size_t VisualSeekBlockSize = 4096;
+    std::vector<uint32_t> visualBlockMaxEnd;
 
     std::vector<TempoChange> tempoMap;
     // Seconds corresponding to tempoMap[i].tick. Tiny compared with MIDI data

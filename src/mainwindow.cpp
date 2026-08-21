@@ -162,6 +162,117 @@ EM_JS(void, wasmidi_browser_open_midi_picker, (), {
     input.click();
 });
 
+
+EM_JS(int, wasmidi_snappy_ready, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state && b.state.ready ? 1 : 0;
+});
+
+EM_JS(int, wasmidi_snappy_soundfont_loaded, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state && b.state.soundfontLoaded ? 1 : 0;
+});
+
+EM_JS(int, wasmidi_snappy_sample_rate, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.sampleRate) | 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_active_voices, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.activeVoices) | 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_underruns, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.underruns) | 0) : 0;
+});
+
+EM_JS(double, wasmidi_snappy_audio_clock, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.getAudioClock ? Number(b.getAudioClock()) : -1.0;
+});
+
+EM_JS(int, wasmidi_snappy_copy_string, (int which, char* dst, int capacity), {
+    if (!dst || capacity <= 0)
+        return 0;
+    const b = globalThis.WasmidiSnappyBridge;
+    let text = '';
+    if (b && b.state) {
+        text = which === 0
+            ? String(b.state.soundfontName || '')
+            : String(b.state.status || '');
+    }
+    stringToUTF8(text, dst, capacity);
+    return lengthBytesUTF8(text);
+});
+
+EM_JS(void, wasmidi_snappy_open_soundfont, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.openSoundfont)
+        b.openSoundfont();
+});
+
+EM_JS(void, wasmidi_snappy_play, (double time, int reset), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.play)
+        b.play(time, !!reset);
+});
+
+EM_JS(void, wasmidi_snappy_pause, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.pause)
+        b.pause();
+});
+
+EM_JS(void, wasmidi_snappy_stop, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.stop)
+        b.stop();
+});
+
+EM_JS(void, wasmidi_snappy_seek, (double time), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.seek)
+        b.seek(time);
+});
+
+EM_JS(void, wasmidi_snappy_set_volume, (int percent), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.setVolume)
+        b.setVolume(percent);
+});
+
+EM_JS(void, wasmidi_snappy_configure, (int maxVoices, int blockFrames), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.configure)
+        b.configure(maxVoices, blockFrames);
+});
+
+EM_JS(void, wasmidi_snappy_set_overlap_gain, (int enabled), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.setOverlapGain)
+        b.setOverlapGain(!!enabled);
+});
+
+EM_JS(void, wasmidi_snappy_schedule,
+      (const uint32_t* messages, const double* times, int count, double safeUntil), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (!b || !b.schedule)
+        return;
+
+    const n = Math.max(0, count | 0);
+    const m = new Uint32Array(n);
+    const t = new Float64Array(n);
+
+    if (n > 0) {
+        m.set(HEAPU32.subarray(messages >>> 2, (messages >>> 2) + n));
+        t.set(HEAPF64.subarray(times >>> 3, (times >>> 3) + n));
+    }
+
+    b.schedule(m, t, Number(safeUntil) || 0.0);
+});
+
 #endif
 
 MainWindow::MainWindow(QObject* parent)
@@ -194,17 +305,30 @@ MainWindow::MainWindow(QObject* parent)
 
     frameTimer->start(16);
 
-    /*
-     * Do NOT run the 5 ms scheduler until an actual MIDI/audio sink is
-     * connected. Pass 8 was building a 250 ms event queue 200 times/second
-     * and immediately discarding it in dispatchScheduler(), which is
-     * catastrophic on Black MIDI. The scheduler remains available for the
-     * audio-driver port and will be driven by that sink.
-     */
+    // SnappySynth is scheduled in coarse 20 ms batches. dispatchScheduler()
+    // walks CompactEvent directly and transfers only the new ~400 ms look-ahead
+    // delta to the synth Worker; there is no browser MIDI-output path.
+    auto* synthScheduleTimer = new QTimer(this);
+    synthScheduleTimer->setTimerType(Qt::PreciseTimer);
+    connect(synthScheduleTimer, &QTimer::timeout,
+            this, &MainWindow::dispatchScheduler);
+    synthScheduleTimer->start(20);
+
+    auto* synthStateTimer = new QTimer(this);
+    connect(synthStateTimer, &QTimer::timeout,
+            this, &MainWindow::pollSynthState);
+    synthStateTimer->start(200);
+
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_set_volume(volume_);
+#endif
 }
 
 MainWindow::~MainWindow()
 {
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_stop();
+#endif
     if (g_browserMainWindow == this)
         g_browserMainWindow = nullptr;
 }
@@ -325,18 +449,30 @@ void MainWindow::openMidiPicker()
 #endif
 }
 
+void MainWindow::openSoundfontPicker()
+{
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_open_soundfont();
+#else
+    synthStatus_ = QStringLiteral("SnappySynthV2 SF2 picker is available in the WebAssembly build.");
+    emit synthStateChanged();
+#endif
+}
+
+
 void MainWindow::clearVisualState()
 {
-    visualStateCount_.fill(0);
-    visualStateColor_.fill(0);
+    visualEndHeap_.clear();
     visualPitchCount_.fill(0);
     visualPitchMask_.fill(0);
     visualPitchColor_.fill(-1);
+    for (auto& counts : visualPitchColorCounts_)
+        counts.fill(0);
     visualColorVoices_.fill(0);
 
     visualActiveVoices_ = 0;
-    visualTick_ = 0;
-    visualGroupCursor_ = 0;
+    visualTick_ = 0.0;
+    visualStartCursor_ = 0;
     visualStateValid_ = false;
 }
 
@@ -721,20 +857,35 @@ void MainWindow::play()
     if (currentTime_ >= duration_)
         currentTime_ = 0.0f;
 
-    playbackAnchorSeconds_ =
-        currentTime_;
-
+    playbackAnchorSeconds_ = currentTime_;
     playbackClock_.restart();
 
-    scheduler_.seek(
-        currentTime_);
-
+    scheduler_.seek(currentTime_);
     scheduler_.start();
 
     invalidateLiveTrackers();
     visualStateValid_ = false;
 
+    // Mark playback active before priming the synth so scheduleSynthAhead() can
+    // immediately fill the first look-ahead window instead of waiting 20 ms.
     setPlaying(true);
+
+#ifdef __EMSCRIPTEN__
+    if (soundfontLoaded_) {
+        if (!synthPlaybackPrimed_) {
+            // Reset the worker first. resetSynthSchedule() sends controller and
+            // held-note reconstruction data; doing it in the opposite order
+            // would let the subsequent reset erase that batch.
+            wasmidi_snappy_play(currentTime_, 1);
+            resetSynthSchedule(currentTime_);
+            synthPlaybackPrimed_ = true;
+            scheduleSynthAhead();
+        } else {
+            wasmidi_snappy_play(currentTime_, 0);
+            scheduleSynthAhead();
+        }
+    }
+#endif
 }
 
 void MainWindow::pause()
@@ -744,12 +895,22 @@ void MainWindow::pause()
 
     updateCurrentTime();
     scheduler_.pause();
+#ifdef __EMSCRIPTEN__
+    if (soundfontLoaded_)
+        wasmidi_snappy_pause();
+#endif
     setPlaying(false);
 }
 
 void MainWindow::stop()
 {
     scheduler_.stop();
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_stop();
+#endif
+    synthPlaybackPrimed_ = false;
+    synthGroupCursor_ = 0;
+    synthScheduledUntil_ = 0.0;
     setPlaying(false);
 
     playbackAnchorSeconds_ = 0.0f;
@@ -776,26 +937,20 @@ void MainWindow::stop()
     }
 
     if (!tempoBpms_.empty() &&
-        !qFuzzyCompare(
-            bpm_,
-            tempoBpms_.front())) {
+        !qFuzzyCompare(bpm_, tempoBpms_.front())) {
         bpm_ = tempoBpms_.front();
         emit bpmChanged();
     }
 
     clearVisualState();
     invalidateLiveTrackers();
-
     emit activePitchesChanged();
 }
 
 void MainWindow::seek(float seconds)
 {
     const float clamped =
-        std::clamp(
-            seconds,
-            0.0f,
-            duration_);
+        std::clamp(seconds, 0.0f, duration_);
 
     currentTime_ = clamped;
     playbackAnchorSeconds_ = clamped;
@@ -804,9 +959,17 @@ void MainWindow::seek(float seconds)
         playbackClock_.restart();
 
     scheduler_.seek(clamped);
-
     invalidateLiveTrackers();
     visualStateValid_ = false;
+
+#ifdef __EMSCRIPTEN__
+    if (soundfontLoaded_) {
+        wasmidi_snappy_seek(clamped);
+        resetSynthSchedule(clamped);
+        synthPlaybackPrimed_ = true;
+        scheduleSynthAhead();
+    }
+#endif
 
     emit currentTimeChanged();
     updateLiveStats();
@@ -879,6 +1042,7 @@ void MainWindow::setPerTrackColors(bool enable)
 
     perTrackColors_ = enable;
     visualStateValid_ = false;
+    neuralWindowValid_ = false;
 
     emit perTrackColorsChanged();
 
@@ -898,26 +1062,53 @@ void MainWindow::setVolume(int value)
 
     volume_ = clamped;
     emit volumeChanged();
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_set_volume(volume_);
+#endif
 }
 
-void MainWindow::setOutputMode(const QString& mode)
+
+void MainWindow::setSynthMaxVoices(int value)
 {
-    QString normalized =
-        mode.toLower();
-
-    if (normalized != QStringLiteral("native") &&
-        normalized != QStringLiteral("input") &&
-        normalized != QStringLiteral("off") &&
-        normalized != QStringLiteral("embedded")) {
-        normalized =
-            QStringLiteral("off");
-    }
-
-    if (outputMode_ == normalized)
+    const int clamped = std::clamp(value, 128, 262144);
+    if (synthMaxVoices_ == clamped)
         return;
+    synthMaxVoices_ = clamped;
+    synthPlaybackPrimed_ = false;
+    emit synthConfigChanged();
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_configure(synthMaxVoices_, synthBufferFrames_);
+#endif
+}
 
-    outputMode_ = normalized;
-    emit outputModeChanged();
+void MainWindow::setSynthBufferFrames(int value)
+{
+    int clamped = std::clamp(value, 128, 2048);
+    // Keep the worker/render block on a power of two, which is the efficient
+    // path for both the source voice engine and the AudioWorklet queue.
+    int pow2 = 128;
+    while (pow2 < clamped && pow2 < 2048)
+        pow2 <<= 1;
+    clamped = pow2;
+    if (synthBufferFrames_ == clamped)
+        return;
+    synthBufferFrames_ = clamped;
+    synthPlaybackPrimed_ = false;
+    emit synthConfigChanged();
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_configure(synthMaxVoices_, synthBufferFrames_);
+#endif
+}
+
+void MainWindow::setSynthOverlapGain(bool enabled)
+{
+    if (synthOverlapGain_ == enabled)
+        return;
+    synthOverlapGain_ = enabled;
+    emit synthConfigChanged();
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_set_overlap_gain(enabled ? 1 : 0);
+#endif
 }
 
 void MainWindow::setChannelColor(
@@ -939,72 +1130,43 @@ void MainWindow::setChannelColor(
     updateNeuralVisuals();
 }
 
-void MainWindow::processVisualEvent(
-    const wasmidi::CompactEvent& event,
-    uint32_t /*tick*/)
+void MainWindow::addVisualNote(std::size_t sourceIndex)
 {
-    const uint8_t command =
-        event.status & 0xf0;
-
-    if (command != 0x90 &&
-        command != 0x80) {
-        return;
-    }
-
-    const uint8_t channel =
-        event.status & 0x0f;
-
-    const uint8_t pitch =
-        event.data1 & 0x7f;
-
-    const std::size_t state =
-        std::size_t(channel) *
-        128u +
-        std::size_t(pitch);
-
-    const uint8_t color =
-        document_.colorIndex(
-            event,
-            perTrackColors_);
-
-    if (command == 0x90 &&
-        event.data2 != 0) {
-        ++visualStateCount_[state];
-        visualStateColor_[state] = color;
-
-        ++visualPitchCount_[pitch];
-        visualPitchMask_[pitch] = 1;
-        visualPitchColor_[pitch] =
-            static_cast<int8_t>(color);
-
-        ++visualColorVoices_[color];
-        ++visualActiveVoices_;
-        return;
-    }
-
-    if (visualStateCount_[state] == 0)
+    if (sourceIndex >= document_.visualNotes.size())
         return;
 
-    const uint8_t soundingColor =
-        visualStateColor_[state] & 0x0f;
+    const auto& note = document_.visualNotes[sourceIndex];
+    const uint8_t pitch = static_cast<uint8_t>((note.packedData >> 8) & 0x7f);
+    const uint8_t color = document_.visualColorIndex(note, perTrackColors_) & 0x0f;
 
-    // Same ownership rule used by the GPU sweep: an old track's NoteOff must
-    // not terminate a newer colored segment using the same channel+pitch.
-    if (perTrackColors_ && soundingColor != color)
-        return;
+    ++visualPitchCount_[pitch];
+    ++visualPitchColorCounts_[pitch][color];
+    ++visualColorVoices_[color];
+    ++visualActiveVoices_;
 
-    --visualStateCount_[state];
+    visualPitchMask_[pitch] = 1;
+    // VisualNote is start-ordered, so the newest active note owns the key color.
+    visualPitchColor_[pitch] = static_cast<int8_t>(color);
 
+    visualEndHeap_.push_back({note.endTick, static_cast<uint32_t>(sourceIndex), pitch, color});
+    std::push_heap(
+        visualEndHeap_.begin(), visualEndHeap_.end(),
+        [](const VisualActiveEnd& left, const VisualActiveEnd& right) {
+            if (left.endTick != right.endTick)
+                return left.endTick > right.endTick;
+            return left.sourceIndex > right.sourceIndex;
+        });
+}
+
+void MainWindow::removeVisualNote(uint8_t pitch, uint8_t color)
+{
     if (visualPitchCount_[pitch] != 0)
         --visualPitchCount_[pitch];
-
-    if (visualColorVoices_[soundingColor] != 0)
-        --visualColorVoices_[soundingColor];
-
-    visualActiveVoices_ =
-        std::max(
-            0,
-            visualActiveVoices_ - 1);
+    if (visualPitchColorCounts_[pitch][color] != 0)
+        --visualPitchColorCounts_[pitch][color];
+    if (visualColorVoices_[color] != 0)
+        --visualColorVoices_[color];
+    visualActiveVoices_ = std::max(0, visualActiveVoices_ - 1);
 
     if (visualPitchCount_[pitch] == 0) {
         visualPitchMask_[pitch] = 0;
@@ -1012,143 +1174,111 @@ void MainWindow::processVisualEvent(
         return;
     }
 
-    if (visualPitchColor_[pitch] ==
-        static_cast<int8_t>(soundingColor)) {
-        // Pick another currently sounding channel for this pitch.
-        for (int ch = 0; ch < 16; ++ch) {
-            const std::size_t other =
-                std::size_t(ch) * 128u +
-                std::size_t(pitch);
-
-            if (visualStateCount_[other] != 0) {
-                visualPitchColor_[pitch] =
-                    static_cast<int8_t>(
-                        visualStateColor_[other]);
+    if (visualPitchColor_[pitch] == static_cast<int8_t>(color) &&
+        visualPitchColorCounts_[pitch][color] == 0) {
+        // The original key visual ultimately only needs one representative
+        // active color. Prefer the highest currently populated palette slot;
+        // held-state correctness is independent of this tie-break.
+        for (int candidate = 15; candidate >= 0; --candidate) {
+            if (visualPitchColorCounts_[pitch][candidate] != 0) {
+                visualPitchColor_[pitch] = static_cast<int8_t>(candidate);
                 break;
             }
         }
     }
 }
 
-void MainWindow::syncVisualState(
-    uint32_t targetTick,
-    bool forceRebuild)
+void MainWindow::rebuildVisualStateAt(double targetTick)
 {
-    if (document_.tickGroups.empty()) {
+    visualEndHeap_.clear();
+    visualPitchCount_.fill(0);
+    visualPitchMask_.fill(0);
+    visualPitchColor_.fill(-1);
+    for (auto& counts : visualPitchColorCounts_)
+        counts.fill(0);
+    visualColorVoices_.fill(0);
+    visualActiveVoices_ = 0;
+
+    const std::size_t hi = document_.upperBoundVisualStart(targetTick);
+    const std::size_t blockSize = wasmidi::MidiDocument::VisualSeekBlockSize;
+    const std::size_t blockCount = (hi + blockSize - 1) / blockSize;
+
+    for (std::size_t block = 0; block < blockCount; ++block) {
+        if (block < document_.visualBlockMaxEnd.size() &&
+            double(document_.visualBlockMaxEnd[block]) < targetTick) {
+            continue;
+        }
+
+        const std::size_t begin = block * blockSize;
+        const std::size_t end = std::min(hi, begin + blockSize);
+        for (std::size_t i = begin; i < end; ++i) {
+            const auto& note = document_.visualNotes[i];
+            if (double(note.endTick) >= targetTick)
+                addVisualNote(i);
+        }
+    }
+
+    visualStartCursor_ = hi;
+    visualTick_ = targetTick;
+    visualStateValid_ = true;
+}
+
+void MainWindow::syncVisualState(double targetTick, bool forceRebuild)
+{
+    if (document_.visualNotes.empty()) {
         clearVisualState();
         return;
     }
 
-    const auto oldMask =
-        visualPitchMask_;
+    const auto oldMask = visualPitchMask_;
+    const auto oldColors = visualPitchColor_;
 
-    const auto oldColors =
-        visualPitchColor_;
+    if (forceRebuild || !visualStateValid_ || targetTick < visualTick_) {
+        rebuildVisualStateAt(targetTick);
+    } else {
+        const auto heapCompare =
+            [](const VisualActiveEnd& left, const VisualActiveEnd& right) {
+                if (left.endTick != right.endTick)
+                    return left.endTick > right.endTick;
+                return left.sourceIndex > right.sourceIndex;
+            };
 
-    const bool backwards =
-        visualStateValid_ &&
-        targetTick < visualTick_;
-
-    if (forceRebuild ||
-        !visualStateValid_ ||
-        backwards) {
-        visualStateCount_.fill(0);
-        visualStateColor_.fill(0);
-        visualPitchCount_.fill(0);
-        visualPitchMask_.fill(0);
-        visualPitchColor_.fill(-1);
-        visualColorVoices_.fill(0);
-        visualActiveVoices_ = 0;
-
-        // Bounded reconstruction on seeks: mirrors SharpMIDI's renderer
-        // strategy and prevents a seek near the end of a 100M-event file from
-        // replaying the whole MIDI on the UI thread.
-        const double lookbackSeconds =
-            std::max(
-                30.0,
-                double(noteSpeed_) * 4.0 +
-                double(postBuffer_));
-
-        const double startSeconds =
-            std::max(
-                0.0,
-                double(currentTime_) -
-                lookbackSeconds);
-
-        const uint32_t startTick =
-            static_cast<uint32_t>(
-                std::max(
-                    0.0,
-                    std::floor(
-                        document_.secondsToTick(
-                            startSeconds))));
-
-        visualGroupCursor_ =
-            document_.lowerBoundGroup(
-                startTick);
-
-        visualTick_ = startTick;
-        visualStateValid_ = true;
-    }
-
-    while (visualGroupCursor_ <
-           document_.tickGroups.size()) {
-        const auto& group =
-            document_.tickGroups[
-                visualGroupCursor_];
-
-        if (group.tick > targetTick)
-            break;
-
-        const std::size_t begin =
-            group.eventOffset;
-
-        const std::size_t end =
-            begin + group.eventCount;
-
-        for (std::size_t i = begin;
-             i < end;
-             ++i) {
-            processVisualEvent(
-                document_.events[i],
-                group.tick);
+        // A note remains held at its exact MIDI end tick, matching the visual
+        // interval test endTick >= currentTick. Remove it on the first later tick.
+        while (!visualEndHeap_.empty() &&
+               double(visualEndHeap_.front().endTick) < targetTick) {
+            std::pop_heap(visualEndHeap_.begin(), visualEndHeap_.end(), heapCompare);
+            const VisualActiveEnd ended = visualEndHeap_.back();
+            visualEndHeap_.pop_back();
+            removeVisualNote(ended.pitch, ended.color);
         }
 
-        ++visualGroupCursor_;
+        while (visualStartCursor_ < document_.visualNotes.size() &&
+               double(document_.visualNotes[visualStartCursor_].startTick) <= targetTick) {
+            const auto& note = document_.visualNotes[visualStartCursor_];
+            if (double(note.endTick) >= targetTick)
+                addVisualNote(visualStartCursor_);
+            ++visualStartCursor_;
+        }
+
+        visualTick_ = targetTick;
     }
 
-    visualTick_ = targetTick;
-
-    if (oldMask != visualPitchMask_ ||
-        oldColors != visualPitchColor_) {
+    if (oldMask != visualPitchMask_ || oldColors != visualPitchColor_)
         emit activePitchesChanged();
-    }
 }
 
 void MainWindow::updateNeuralVisuals()
 {
     float newHue = dominantHue_;
 
-    if (!document_.tickGroups.empty()) {
+    if (!document_.visualNotes.empty()) {
         const double futureSeconds =
-            std::min<double>(
-                duration_,
-                double(currentTime_) + 0.15);
+            std::min<double>(duration_, double(currentTime_) + 0.15);
+        const double futureTick = document_.secondsToTick(futureSeconds);
 
-        const uint32_t futureTick =
-            static_cast<uint32_t>(
-                std::min<double>(
-                    document_.maxTick,
-                    std::ceil(
-                        document_.secondsToTick(
-                            futureSeconds))));
-
-        const std::size_t targetLo =
-            visualGroupCursor_;
-
-        const std::size_t targetHi =
-            document_.upperBoundGroup(
-                futureTick);
+        const std::size_t targetLo = visualStartCursor_;
+        const std::size_t targetHi = document_.upperBoundVisualStart(futureTick);
 
         const bool rebuild =
             !neuralWindowValid_ ||
@@ -1156,75 +1286,29 @@ void MainWindow::updateNeuralVisuals()
             targetHi < neuralFutureHi_ ||
             targetLo > targetHi;
 
-        auto addGroupColors =
-            [this](std::size_t groupIndex,
-                   int direction) {
-                const auto& group =
-                    document_.tickGroups[
-                        groupIndex];
-
-                const std::size_t begin =
-                    group.eventOffset;
-
-                const std::size_t end =
-                    begin + group.eventCount;
-
-                for (std::size_t i = begin;
-                     i < end;
-                     ++i) {
-                    const auto& event =
-                        document_.events[i];
-
-                    if ((event.status & 0xf0) !=
-                            0x90 ||
-                        event.data2 == 0) {
-                        continue;
-                    }
-
-                    const uint8_t color =
-                        document_.colorIndex(
-                            event,
-                            perTrackColors_);
-
-                    if (direction > 0) {
-                        ++neuralFutureColors_[
-                            color];
-                    } else if (
-                        neuralFutureColors_[
-                            color] != 0) {
-                        --neuralFutureColors_[
-                            color];
-                    }
-                }
-            };
+        auto addNoteColor = [this](std::size_t index, int direction) {
+            if (index >= document_.visualNotes.size())
+                return;
+            const uint8_t color =
+                document_.visualColorIndex(document_.visualNotes[index], perTrackColors_) & 0x0f;
+            if (direction > 0) {
+                ++neuralFutureColors_[color];
+            } else if (neuralFutureColors_[color] != 0) {
+                --neuralFutureColors_[color];
+            }
+        };
 
         if (rebuild) {
             neuralFutureColors_.fill(0);
-
-            for (std::size_t groupIndex =
-                     targetLo;
-                 groupIndex < targetHi;
-                 ++groupIndex) {
-                addGroupColors(
-                    groupIndex,
-                    +1);
-            }
+            for (std::size_t i = targetLo; i < targetHi; ++i)
+                addNoteColor(i, +1);
         } else {
-            while (neuralFutureLo_ <
-                   targetLo) {
-                addGroupColors(
-                    neuralFutureLo_,
-                    -1);
-
+            while (neuralFutureLo_ < targetLo) {
+                addNoteColor(neuralFutureLo_, -1);
                 ++neuralFutureLo_;
             }
-
-            while (neuralFutureHi_ <
-                   targetHi) {
-                addGroupColors(
-                    neuralFutureHi_,
-                    +1);
-
+            while (neuralFutureHi_ < targetHi) {
+                addNoteColor(neuralFutureHi_, +1);
                 ++neuralFutureHi_;
             }
         }
@@ -1235,51 +1319,27 @@ void MainWindow::updateNeuralVisuals()
 
         uint64_t bestCount = 0;
         int bestColor = -1;
-
-        for (int color = 0;
-             color < 16;
-             ++color) {
+        for (int color = 0; color < 16; ++color) {
             const uint64_t combined =
-                uint64_t(
-                    visualColorVoices_[
-                        color]) +
-                neuralFutureColors_[
-                    color];
-
+                uint64_t(visualColorVoices_[color]) + neuralFutureColors_[color];
             if (combined > bestCount) {
                 bestCount = combined;
                 bestColor = color;
             }
         }
 
-        if (bestColor >= 0 &&
-            bestColor <
-                channelColors_.size()) {
-            newHue =
-                colorHue(
-                    channelColors_[
-                        bestColor]);
-        }
+        if (bestColor >= 0 && bestColor < channelColors_.size())
+            newHue = colorHue(channelColors_[bestColor]);
     }
 
     const float activity =
         peakNps_ > 0
-            ? std::min(
-                1.0f,
-                float(nps_) /
-                float(peakNps_))
+            ? std::min(1.0f, float(nps_) / float(peakNps_))
             : 0.0f;
+    const float newActivity = activity * 0.7f + neuralActivity_ * 0.3f;
 
-    const float newActivity =
-        activity * 0.7f +
-        neuralActivity_ * 0.3f;
-
-    if (!qFuzzyCompare(
-            newHue,
-            dominantHue_) ||
-        !qFuzzyCompare(
-            newActivity,
-            neuralActivity_)) {
+    if (!qFuzzyCompare(newHue, dominantHue_) ||
+        !qFuzzyCompare(newActivity, neuralActivity_)) {
         dominantHue_ = newHue;
         neuralActivity_ = newActivity;
         emit neuralVisualChanged();
@@ -1403,8 +1463,11 @@ void MainWindow::updateLiveStats()
     liveLastTime_ =
         static_cast<float>(time);
 
+    // Keyboard/polyphony state uses the fractional tick corresponding to the
+    // exact playback time. Using floor(currentTick) kept NoteOff keys lit until
+    // the next whole MIDI tick, which was visible at low PPQ / slow tempos.
     syncVisualState(
-        currentTick);
+        currentVisualTick);
 
     const uint64_t exactNpsCount =
         exactNpsHi >= exactNpsLo
@@ -1488,11 +1551,19 @@ void MainWindow::updateCurrentTime()
     if (!isPlaying_)
         return;
 
-    currentTime_ =
+    float nextTime =
         playbackAnchorSeconds_ +
-        static_cast<float>(
-            playbackClock_.elapsed()) /
-        1000.0f;
+        static_cast<float>(playbackClock_.elapsed()) / 1000.0f;
+
+#ifdef __EMSCRIPTEN__
+    if (soundfontLoaded_) {
+        const double audioTime = wasmidi_snappy_audio_clock();
+        if (audioTime >= 0.0 && std::isfinite(audioTime))
+            nextTime = static_cast<float>(audioTime);
+    }
+#endif
+
+    currentTime_ = std::clamp(nextTime, 0.0f, duration_);
 
     if (currentTime_ >= duration_) {
         stop();
@@ -1503,8 +1574,272 @@ void MainWindow::updateCurrentTime()
     updateLiveStats();
 }
 
+uint32_t MainWindow::packSynthMessage(const wasmidi::CompactEvent& event) const
+{
+    const uint8_t command = event.status & 0xf0;
+    if (command != 0x80 && command != 0x90 && command != 0xb0 &&
+        command != 0xc0 && command != 0xe0) {
+        return 0xffffffffu;
+    }
+
+    return uint32_t(event.status) |
+           (uint32_t(event.data1) << 8) |
+           (uint32_t(event.data2) << 16);
+}
+
+void MainWindow::resetSynthSchedule(float seconds)
+{
+    const double time = std::clamp<double>(seconds, 0.0, duration_);
+    const uint32_t tick = static_cast<uint32_t>(
+        std::max(0.0, std::floor(document_.secondsToTick(time))));
+
+    synthGroupCursor_ = document_.lowerBoundGroup(tick);
+    synthScheduledUntil_ = time;
+    synthMessages_.clear();
+    synthTimes_.clear();
+
+#ifdef __EMSCRIPTEN__
+    if (!soundfontLoaded_)
+        return;
+
+    // Restore the last controller/program/bend state at a seek. Groups with no
+    // control data are skipped, so this scans the sparse control history rather
+    // than materializing or replaying every NoteOn in a Black MIDI.
+    std::array<std::array<int16_t, 128>, 16> cc{};
+    for (auto& row : cc)
+        row.fill(-1);
+    std::array<int16_t, 16> program{};
+    std::array<int16_t, 16> bend{};
+    program.fill(-1);
+    bend.fill(-1);
+
+    for (std::size_t gi = 0; gi < synthGroupCursor_; ++gi) {
+        const auto& group = document_.tickGroups[gi];
+        if (group.controlCount == 0)
+            continue;
+        const std::size_t end = group.eventOffset + group.eventCount;
+        for (std::size_t ei = group.eventOffset; ei < end; ++ei) {
+            const auto& event = document_.events[ei];
+            const uint8_t cmd = event.status & 0xf0;
+            const uint8_t ch = event.status & 0x0f;
+            if (cmd == 0xb0)
+                cc[ch][event.data1 & 0x7f] = event.data2 & 0x7f;
+            else if (cmd == 0xc0)
+                program[ch] = event.data1 & 0x7f;
+            else if (cmd == 0xe0)
+                bend[ch] = int16_t((event.data1 & 0x7f) | ((event.data2 & 0x7f) << 7));
+        }
+    }
+
+    auto appendState = [this, time](uint32_t message) {
+        synthMessages_.push_back(message);
+        synthTimes_.push_back(time);
+    };
+
+    for (int ch = 0; ch < 16; ++ch) {
+        if (cc[ch][0] >= 0)
+            appendState(uint32_t(0xb0 | ch) | (0u << 8) | (uint32_t(cc[ch][0]) << 16));
+        if (cc[ch][32] >= 0)
+            appendState(uint32_t(0xb0 | ch) | (32u << 8) | (uint32_t(cc[ch][32]) << 16));
+        if (program[ch] >= 0)
+            appendState(uint32_t(0xc0 | ch) | (uint32_t(program[ch]) << 8));
+        for (int controller = 1; controller < 128; ++controller) {
+            if (controller == 32 || cc[ch][controller] < 0)
+                continue;
+            appendState(uint32_t(0xb0 | ch) |
+                        (uint32_t(controller) << 8) |
+                        (uint32_t(cc[ch][controller]) << 16));
+        }
+        if (bend[ch] >= 0) {
+            const uint16_t value = static_cast<uint16_t>(bend[ch]);
+            appendState(uint32_t(0xe0 | ch) |
+                        (uint32_t(value & 0x7f) << 8) |
+                        (uint32_t((value >> 7) & 0x7f) << 16));
+        }
+    }
+
+    // Restore notes that genuinely span the seek point. VisualNote carries the
+    // original channel in bits 24..27; future original NoteOff events will close
+    // these voices at their correct MIDI time. Notes that start exactly on the
+    // seek tick are NOT restored here because synthGroupCursor_ will schedule
+    // their original NoteOns, preventing duplicate voices at the boundary.
+    const std::size_t hi =
+        tick == 0
+            ? 0
+            : document_.lowerBoundVisualStart(double(tick));
+    const std::size_t blockSize = wasmidi::MidiDocument::VisualSeekBlockSize;
+    const std::size_t blockCount = (hi + blockSize - 1) / blockSize;
+    for (std::size_t block = 0; block < blockCount; ++block) {
+        if (block < document_.visualBlockMaxEnd.size() &&
+            document_.visualBlockMaxEnd[block] < tick)
+            continue;
+        const std::size_t begin = block * blockSize;
+        const std::size_t end = std::min(hi, begin + blockSize);
+        for (std::size_t i = begin; i < end; ++i) {
+            const auto& note = document_.visualNotes[i];
+            if (note.endTick < tick)
+                continue;
+            const uint8_t velocity = note.packedData & 0x7f;
+            const uint8_t pitch = (note.packedData >> 8) & 0x7f;
+            const uint8_t channel = (note.packedData >> 24) & 0x0f;
+            appendState(uint32_t(0x90 | channel) |
+                        (uint32_t(pitch) << 8) |
+                        (uint32_t(velocity) << 16));
+        }
+    }
+
+    if (!synthMessages_.empty()) {
+        wasmidi_snappy_schedule(synthMessages_.data(), synthTimes_.data(),
+                                static_cast<int>(synthMessages_.size()), time);
+    } else {
+        wasmidi_snappy_schedule(nullptr, nullptr, 0, time);
+    }
+    synthMessages_.clear();
+    synthTimes_.clear();
+#endif
+}
+
+void MainWindow::scheduleSynthAhead()
+{
+#ifdef __EMSCRIPTEN__
+    if (!isPlaying_ || !soundfontLoaded_ || document_.tickGroups.empty())
+        return;
+
+    constexpr double LookAheadSeconds = 0.40;
+    constexpr std::size_t BatchLimit = 65536;
+
+    const double target = std::min<double>(duration_, double(currentTime_) + LookAheadSeconds);
+    if (target <= synthScheduledUntil_ + 0.015)
+        return;
+
+    const uint32_t targetTick = static_cast<uint32_t>(
+        std::min<double>(document_.maxTick,
+                         std::ceil(document_.secondsToTick(target))));
+    const std::size_t endGroup = document_.upperBoundGroup(targetTick);
+
+    auto flush = [this](double safeUntil) {
+        if (synthMessages_.empty()) {
+            wasmidi_snappy_schedule(nullptr, nullptr, 0, safeUntil);
+            return;
+        }
+        wasmidi_snappy_schedule(synthMessages_.data(), synthTimes_.data(),
+                                static_cast<int>(synthMessages_.size()), safeUntil);
+        synthMessages_.clear();
+        synthTimes_.clear();
+    };
+
+    synthMessages_.clear();
+    synthTimes_.clear();
+    synthMessages_.reserve(std::min<std::size_t>(BatchLimit, 8192));
+    synthTimes_.reserve(std::min<std::size_t>(BatchLimit, 8192));
+
+    for (; synthGroupCursor_ < endGroup; ++synthGroupCursor_) {
+        const auto& group = document_.tickGroups[synthGroupCursor_];
+        const double eventTime = document_.tickToSeconds(group.tick);
+        const std::size_t end = group.eventOffset + group.eventCount;
+
+        for (std::size_t i = group.eventOffset; i < end; ++i) {
+            const auto& event = document_.events[i];
+            uint32_t message = packSynthMessage(event);
+            if (message == 0xffffffffu)
+                continue;
+
+            // Source SnappySynthV2 supports exact-overlap stack count in the
+            // high byte. Pack only consecutive identical NoteOns so controller
+            // ordering at the same tick can never be changed.
+            if ((event.status & 0xf0) == 0x90 && event.data2 != 0) {
+                std::size_t run = 1;
+                while (i + run < end && run < 256) {
+                    const auto& next = document_.events[i + run];
+                    if (packSynthMessage(next) != message)
+                        break;
+                    ++run;
+                }
+                if (run > 1) {
+                    message |= uint32_t(run - 1) << 24;
+                    i += run - 1;
+                }
+            }
+
+            synthMessages_.push_back(message);
+            synthTimes_.push_back(eventTime);
+
+            if (synthMessages_.size() >= BatchLimit)
+                flush(synthScheduledUntil_);
+        }
+    }
+
+    // Only advance safeUntil after every event through the target horizon has
+    // been transferred; this prevents the audio worker from rendering past a
+    // partially delivered ultra-dense tick.
+    // Let the final audio block cross the exact MIDI duration by a tiny
+    // bounded margin. Without this, a 128/256/512-frame AudioWorklet request
+    // that straddles the last MIDI timestamp can be refused forever, leaving
+    // the audio clock a few samples short of `duration_` and preventing the
+    // normal end-of-song stop condition.
+    double safeUntil = target;
+    if (target >= double(duration_) - 1e-7) {
+        const double rate = synthSampleRate_ > 0
+            ? double(synthSampleRate_)
+            : 48000.0;
+        safeUntil += std::max(
+            0.05,
+            (double(synthBufferFrames_) / rate) * 2.0);
+    }
+
+    flush(safeUntil);
+    synthScheduledUntil_ = target;
+#endif
+}
+
 void MainWindow::dispatchScheduler()
 {
-    // Reserved for the audio-driver output sink. Do not materialize scheduler
-    // windows when no consumer exists.
+    scheduleSynthAhead();
+}
+
+void MainWindow::pollSynthState()
+{
+#ifdef __EMSCRIPTEN__
+    const bool ready = wasmidi_snappy_ready() != 0;
+    const bool loaded = wasmidi_snappy_soundfont_loaded() != 0;
+    const int sampleRate = wasmidi_snappy_sample_rate();
+    const int active = wasmidi_snappy_active_voices();
+    const int underruns = wasmidi_snappy_underruns();
+
+    char nameBuffer[512] = {};
+    char statusBuffer[512] = {};
+    wasmidi_snappy_copy_string(0, nameBuffer, int(sizeof(nameBuffer)));
+    wasmidi_snappy_copy_string(1, statusBuffer, int(sizeof(statusBuffer)));
+    const QString name = QString::fromUtf8(nameBuffer);
+    const QString status = QString::fromUtf8(statusBuffer);
+
+    const bool changed =
+        ready != synthReady_ || loaded != soundfontLoaded_ ||
+        sampleRate != synthSampleRate_ || active != synthActiveVoices_ ||
+        underruns != synthUnderruns_ || name != soundfontName_ || status != synthStatus_;
+
+    synthReady_ = ready;
+    soundfontLoaded_ = loaded;
+    synthSampleRate_ = sampleRate;
+    synthActiveVoices_ = active;
+    synthUnderruns_ = underruns;
+    soundfontName_ = name;
+    synthStatus_ = status.isEmpty() ? QStringLiteral("SnappySynthV2 idle") : status;
+
+    if (loaded && !synthWasSoundfontLoaded_) {
+        synthPlaybackPrimed_ = false;
+        if (isPlaying_) {
+            wasmidi_snappy_play(currentTime_, 1);
+            resetSynthSchedule(currentTime_);
+            synthPlaybackPrimed_ = true;
+            scheduleSynthAhead();
+        }
+    }
+    if (!loaded)
+        synthPlaybackPrimed_ = false;
+    synthWasSoundfontLoaded_ = loaded;
+
+    if (changed)
+        emit synthStateChanged();
+#endif
 }

@@ -1,59 +1,103 @@
-# WASMIDI Pass 8.3 — MPWGL2 visual order + exact NPS + numeric fit
+# WASMIDI Pass 9 — SnappySynthV2 Worker Audio
 
-Apply on top of Pass 8.2.2.
+Apply this overlay on top of the current WASMIDI main / Pass 8.3 state.
 
-## Why the notes looked out of order
+## Audio architecture
 
-Pass 8/8.2 optimized visual state by merging NoteOns by channel+pitch and by
-appending completed notes at NoteOff time. Both differ from MPWGL2:
+The old browser MIDI-output path is removed from the UI/controller. WASMIDI now
+uses the SnappySynthV2 source archive supplied for this port as its synth engine:
 
-- MPWGL2 pairs notes by (track, channel, pitch), FIFO.
-- Every NoteOn remains an independent visual note.
-- The final note buffer is stable-sorted by note START time.
-- _writeStrip walks that start order, so later-starting notes overwrite earlier
-  notes where rectangles overlap.
+Qt/WASM CompactEvent scheduler
+  -> batched timestamped MIDI messages
+  -> dedicated snappysynth-worker.js
+  -> SnappySynthV2 pthread WASM core
+  -> interleaved float PCM
+  -> direct MessageChannel
+  -> AudioWorklet
+  -> browser/system audio output
 
-Pass 8.3 restores those semantics without restoring the old CPU texture path.
+The Qt WebAssembly application remains single-threaded. SnappySynthV2 is built
+as a separate Emscripten pthread module, so its voice workers do not run on the
+QML/render hot path.
 
-## New visual representation
+## SnappySynthV2 subset
 
-`VisualNote` is 12 bytes:
-- uint32 startTick
-- uint32 endTick
-- uint32 packedData (velocity, pitch, global color, per-track color)
+Only the required upstream pieces are included under third_party/snappysynthv2:
+- voice engine
+- SF2/SFZ/WAV parser support required by SF2 instruments
+- minimal headers/stubs
+- browser-specific C ABI in snappy_wasm_core.c
 
-A temporary uint16/event track side-buffer exists only while loading. It is
-discarded before MidiDocument is returned, so steady-state event RAM remains
-CompactEvent + TickGroup + VisualNote.
+Not integrated:
+- KDMAPI / WinMM / browser MIDI Out
+- DirectSound / Windows output backends
+- SnappySynth MIDI-file parser
+- Configurator
+- DLL/config plumbing
+- GPU/D3D backends
 
-Visual notes are generated in global NoteOn order and paired FIFO using exact
-(track,channel,pitch) keys. No visual sort is needed.
+## Browser audio
 
-## Renderer
+- SF2 files are passed to the synth Worker as File objects and mounted with
+  WORKERFS; the main Qt thread does not copy the full SoundFont into its WASM heap.
+- AudioContext sample rate is propagated to the worker/core (44.1/48 kHz etc.).
+- SnappySynth renders float stereo blocks with voice_render_float().
+- PCM moves Worker -> AudioWorklet directly through MessageChannel.
+- Transferable ArrayBuffers are recycled to reduce GC allocation pressure.
+- Worklet queue uses low/high water marks and reports underruns.
+- The player clock follows actually consumed audio frames; if synthesis starves,
+  visuals do not run ahead of the audible stream.
+- A small final safe-render margin lets the audio clock cross the exact MIDI
+  duration instead of deadlocking on a block that straddles the final timestamp.
 
-- Removes runtime NoteOn/NoteOff merging from the GL hot path.
-- VBO ring contains an immutable contiguous slice of the start-ordered
-  VisualNote stream.
-- Forward playback uploads only newly entering source notes.
-- No random NoteOff VBO writes.
-- No per-frame sort.
-- Draw calls preserve source/start order exactly like MPWGL2.
-- X positions are snapped to CSS-pixel columns like Math.round() in _writeStrip.
-- Pitch rows use pitch/127 and 1/128 row height to match MPWGL2 geometry.
-- Existing optimized GPU neural background remains.
+## Black MIDI scheduling
 
-## NPS
+- C++ sends only the new ~400 ms scheduling delta every 20 ms.
+- Events are transferred in typed-array batches, not individual JS messages.
+- Exact consecutive simultaneous NoteOns are packed using SnappySynthV2's high
+  byte overlap stack-count convention.
+- Seek reconstructs controller/program/pitch-bend state and notes that genuinely
+  span the seek position.
 
-Live NPS now implements MPWGL2 literally:
-  round((upperBound(starts,t)-lowerBound(starts,t-0.25))*4)
+## Keyboard / visual correctness
 
-The binary searches run directly on VisualNote.startTick with fractional
-secondsToTick boundaries, avoiding the floor-rounded TickGroup approximation.
+- Keyboard state uses independent Pass 8.3 VisualNote intervals instead of the
+  old channel+pitch merged runtime state.
+- A 4096-note block max-end index skips dead history during seeks while preserving
+  long sustained notes.
+- Fractional tick playback removes a key immediately after its real MIDI end
+  instead of waiting for the next integer tick.
+- Overlapping same-pitch notes remain counted independently.
 
-Peak NPS also restores MPWGL2's 0.1-second sampling cadence over a 1-second
-window.
+## Number display
 
-## Numbers
+Large counters are explicitly formatted as ordinary decimal digits. QML no
+longer relies on the engine's default Number-to-string conversion, so values are
+shown like `44,750,700` rather than `4.47507E+07`. BPM retains ordinary decimal
+places when needed. Text uses HorizontalFit instead of scientific abbreviation.
 
-Live cards, mini-chart values, timeline NPS and File Info numeric values now use
-Text.HorizontalFit + minimumPixelSize instead of clipping/eliding large numbers.
+## UI
+
+The former MIDI I/O / MIDI Out controls are replaced by SNAPPYSYNTH V2 controls:
+- Load SF2
+- Max voices
+- Audio block size
+- Overlap gain mode
+- Sample rate
+- Active synth voices
+- Underrun count
+
+The existing master volume controls SnappySynthV2 directly.
+
+## Build/deploy
+
+CMake builds two independent WebAssembly modules:
+- wasmidi: Qt 6.8 wasm_singlethread
+- snappysynth-core: pthread-enabled Emscripten worker module
+
+GitHub Actions deploys the synth JS/WASM/pthread worker plus the bridge,
+AudioWorklet, worker host and COI service worker. GitHub Pages receives
+cross-origin-isolation headers through the service worker so SharedArrayBuffer
+and Emscripten pthreads can operate.
+
+See VALIDATION.md for the final pre-package checks.
