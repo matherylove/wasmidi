@@ -6,8 +6,18 @@
  */
 (() => {
     if (typeof window !== "undefined") {
-        if (window.crossOriginIsolated || !("serviceWorker" in navigator))
+        if (window.crossOriginIsolated) {
+            try {
+                sessionStorage.removeItem("wasmidi-coi-reload");
+            } catch (_) {}
+            console.info("[WASMIDI] cross-origin isolation active");
             return;
+        }
+
+        if (!("serviceWorker" in navigator)) {
+            console.error("[WASMIDI] Service Worker API is unavailable; SnappySynthV2 pthreads cannot start.");
+            return;
+        }
 
         let reloading = false;
 
@@ -17,6 +27,8 @@
             reloading = true;
             window.location.reload();
         });
+
+        console.info("[WASMIDI] preparing cross-origin isolation for SnappySynthV2");
 
         navigator.serviceWorker.register("./coi-serviceworker.js", {
             scope: "./"

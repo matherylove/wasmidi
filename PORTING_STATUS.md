@@ -1,30 +1,42 @@
-# WASMIDI Pass 9.2 — exact unified MIDI/SF2 picker
+# WASMIDI Pass 9.3 — GitHub Pages SnappySynthV2 deployment fix
 
-Apply on top of Pass 9.1.
+Apply on top of Pass 9.x.
 
-The separate SF2 picker path has been removed completely.
+## Root cause
 
-Both:
-- MainWindow::openMidiPicker()
-- MainWindow::openSoundfontPicker()
+The active `.github/workflows/build-wasm.yml` in the repository was still the
+old Qt-only deployment. It published:
+- wasmidi.html / wasmidi.js / wasmidi.wasm
+but did NOT publish the SnappySynthV2 runtime payload.
 
-now call the SAME Emscripten function:
+Selecting an SF2 therefore worked, but the browser could not reliably start the
+SnappySynth worker/core, so the UI remained at "No SoundFont loaded".
 
-    wasmidi_browser_open_file_picker(kind)
+## This overlay restores the complete deployment
 
-with:
-- kind=0 for MIDI
-- kind=1 for SF2
+GitHub Pages now publishes and verifies:
+- snappysynth-core.js
+- snappysynth-core.wasm
+- snappysynth-core.worker.js
+- snappysynth-worker.js
+- snappysynth-audio-worklet.js
+- snappysynth_bridge.js
+- coi-serviceworker.js
 
-The DOM code, input creation, append-to-body, synchronous input.click(), and
-cleanup path are identical. Only the accept filter and post-selection handler
-differ.
+`index.html` is patched during Actions to load:
+1. coi-serviceworker.js
+2. snappysynth_bridge.js
 
-A fresh input element is created for every click. No input is shared with the
-SnappySynth bridge and there is no stale picker state.
+## Why COI remains required
 
-No AudioContext, Worker, Promise, or SnappySynth initialization happens before
-input.click().
+The supplied SnappySynthV2 voice engine internally creates worker threads via
+its Win32 compatibility layer (`_beginthreadex` -> pthread). Therefore its
+Emscripten core correctly remains a pthread build. GitHub Pages does not emit
+COOP/COEP headers itself, so the same-origin service worker injects them.
 
-This means that if the MIDI browser prompt opens on a given browser, SF2 now
-uses exactly that same working prompt mechanism.
+On the first deployment/navigation the page may reload once while the service
+worker takes control. After that `crossOriginIsolated` should be true and SF2
+loading can proceed.
+
+GitHub Actions now fails before deployment if any required SnappySynthV2 file
+is missing.

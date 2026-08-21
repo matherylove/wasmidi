@@ -62,10 +62,11 @@
         backendPromise = (async () => {
             if (!globalThis.crossOriginIsolated) {
                 updateStatus(
-                    "SnappySynthV2 needs the isolation reload. Refreshing…");
+                    "Preparing SnappySynthV2 audio isolation — reload required");
 
                 throw new Error(
-                    "crossOriginIsolated is false; the COI service worker has not taken control yet.");
+                    "SnappySynthV2 pthread core requires crossOriginIsolated=true. " +
+                    "The Pages COI service worker has not taken control yet; reload the page and select the SF2 again.");
             }
 
             context =
