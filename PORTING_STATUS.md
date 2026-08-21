@@ -207,3 +207,20 @@ The current GitHub `main` also had an inconsistent parser/manifest combination:
 `src/midi/midi_parser.cpp` still contained the older `endKeys.reserve(notes.size())`
 path. Pass 12.8 ships the cumulative low-memory parser implementation again so
 that regression is removed together with paged input.
+
+## Pass 12.9 — deployment freshness / paged-source enforcement
+
+The paged `parseReadAt()` implementation from Pass 12.8 was present in source,
+but a browser could still execute an older deployed Qt bootstrap/Worker and show
+the obsolete `Allocating parser memory on demand` path. Pass 12.9 removes that
+ambiguity. Qt fetches `midi-parser-worker.js` with `cache: no-store`, verifies an
+exact `12.9` source marker, launches the fetched source from a Blob with an
+explicit deployment base URL, and the Worker reports a `worker-ready` handshake
+stating that paged-source mode is active. The COI service worker now checks for
+updates even while the current page is already cross-origin isolated, registers
+with `updateViaCache: none`, and bypasses HTTP cache for executable same-origin
+assets. Pages fingerprints the Qt/COI bootstrap URLs with the commit SHA and
+ships `build-id.txt`.
+
+The production MIDI path still uses `_wmp_parse_file_js()` with bounded 4 MiB
+random-access windows; it does not allocate `file.size` in the parser heap.

@@ -137,9 +137,9 @@ void wasmidi_visual_key_page_ready(
         wordCount);
 }
 
-// Stream the browser File directly into one WASM allocation instead of
-// File.arrayBuffer() + Uint8Array + HEAP copy. This removes the second full
-// file-sized JS allocation during loading and yields between stream chunks.
+// Browser MIDI loading is delegated to a cache-busted Worker. The Worker keeps
+// the File outside WebAssembly and lets the parser read bounded windows, so no
+// allocation proportional to the raw MIDI file size occurs on the Qt thread.
 EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
     /*
      * One single native browser file picker for BOTH MIDI and SF2.
@@ -323,14 +323,65 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             setProgress(0, 'Starting MIDI loader');
 
-            worker =
-                new Worker(
-                    './midi-parser-worker.js?v=12.8');
+            // Fetch the Worker source explicitly with cache:no-store instead of
+            // trusting the browser/Pages HTTP cache for a Worker constructor.
+            // This prevents a successful 12.9 deployment from silently running
+            // the old 12.7 "allocate file.size" loader.
+            const parserWorkerUrl =
+                new URL('./midi-parser-worker.js?v=12.9', window.location.href);
+            const parserWorkerResponse =
+                await fetch(parserWorkerUrl.href, { cache: 'no-store' });
+            if (!parserWorkerResponse.ok) {
+                throw new Error(
+                    'Could not fetch current MIDI parser Worker (' +
+                    parserWorkerResponse.status + ').');
+            }
+
+            const parserWorkerSource = await parserWorkerResponse.text();
+            if (!parserWorkerSource.includes(
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.9"')) {
+                throw new Error(
+                    'GitHub Pages returned a stale MIDI parser Worker. ' +
+                    'Expected bootstrap 12.9.');
+            }
+
+            const parserBaseUrl =
+                new URL('./', window.location.href).href;
+            const parserWorkerPrelude =
+                'self.__wasmidiMidiParserBaseUrl = ' +
+                JSON.stringify(parserBaseUrl) + ';\n';
+            const parserWorkerBlobUrl = URL.createObjectURL(
+                new Blob(
+                    [parserWorkerPrelude, parserWorkerSource],
+                    { type: 'text/javascript' }));
+
+            try {
+                worker = new Worker(parserWorkerBlobUrl);
+            } finally {
+                URL.revokeObjectURL(parserWorkerBlobUrl);
+            }
 
             worker.onmessage =
                 (event) => {
                     const message =
                         event.data || {};
+
+                    if (message.type === 'worker-ready') {
+                        console.info(
+                            '[WASMIDI MIDI parser] worker bootstrap',
+                            String(message.bootstrap || '?'),
+                            message.pagedSource === true ? 'paged-source' : 'legacy-source');
+                        if (String(message.bootstrap || '') !== '12.9' ||
+                            message.pagedSource !== true) {
+                            failLoading(
+                                'Stale or incompatible MIDI parser Worker loaded. ' +
+                                'Expected paged-source bootstrap 12.9.');
+                            if (worker) worker.terminate();
+                            worker = null;
+                            cleanup();
+                        }
+                        return;
+                    }
 
                     if (message.type === 'progress') {
                         setProgress(

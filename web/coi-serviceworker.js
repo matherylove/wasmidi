@@ -6,13 +6,7 @@
  */
 (() => {
     if (typeof window !== "undefined") {
-        if (window.crossOriginIsolated) {
-            try {
-                sessionStorage.removeItem("wasmidi-coi-reload");
-            } catch (_) {}
-            console.info("[WASMIDI] cross-origin isolation active");
-            return;
-        }
+        const alreadyIsolated = !!window.crossOriginIsolated;
 
         if (!("serviceWorker" in navigator)) {
             console.error("[WASMIDI] Service Worker API is unavailable; SnappySynthV2 pthreads cannot start.");
@@ -20,7 +14,6 @@
         }
 
         let reloading = false;
-
         navigator.serviceWorker.addEventListener("controllerchange", () => {
             if (reloading)
                 return;
@@ -28,21 +21,36 @@
             window.location.reload();
         });
 
-        console.info("[WASMIDI] preparing cross-origin isolation for SnappySynthV2");
+        // Never stop checking for SW updates merely because the *old* worker
+        // already made this navigation cross-origin isolated. That behavior
+        // could leave old deployment code controlling the site indefinitely.
+        const current = document.currentScript && document.currentScript.src;
+        const workerUrl = current
+            ? new URL(current, window.location.href)
+            : new URL("./coi-serviceworker.js", window.location.href);
 
-        navigator.serviceWorker.register("./coi-serviceworker.js", {
-            scope: "./"
+        console.info(
+            alreadyIsolated
+                ? "[WASMIDI] cross-origin isolation active; checking deployment worker"
+                : "[WASMIDI] preparing cross-origin isolation for SnappySynthV2");
+
+        navigator.serviceWorker.register(workerUrl.href, {
+            scope: "./",
+            updateViaCache: "none"
         }).then(async registration => {
+            try { await registration.update(); } catch (_) {}
             await navigator.serviceWorker.ready;
 
-            // If an older controller exists but this navigation was not
-            // isolated, force exactly one new navigation through the SW.
-            if (navigator.serviceWorker.controller && !window.crossOriginIsolated) {
+            if (!alreadyIsolated &&
+                navigator.serviceWorker.controller &&
+                !window.crossOriginIsolated) {
                 const key = "wasmidi-coi-reload";
                 if (sessionStorage.getItem(key) !== "1") {
                     sessionStorage.setItem(key, "1");
                     window.location.reload();
                 }
+            } else if (alreadyIsolated) {
+                try { sessionStorage.removeItem("wasmidi-coi-reload"); } catch (_) {}
             }
         }).catch(error => {
             console.error("[WASMIDI] COI service worker registration failed:", error);
@@ -63,15 +71,23 @@
         if (request.cache === "only-if-cached" && request.mode !== "same-origin")
             return;
 
-        // COOP/COEP headers are needed only on our own deployment resources.
-        // Passing third-party requests through untouched prevents an unrelated
-        // blocked analytics/beacon fetch from becoming a rejected FetchEvent.
         const requestUrl = new URL(request.url);
         if (requestUrl.origin !== self.location.origin)
             return;
 
         event.respondWith((async () => {
-            const response = await fetch(request);
+            const path = requestUrl.pathname.toLowerCase();
+            const freshnessCritical =
+                request.mode === "navigate" ||
+                /\.(?:js|wasm|html|data|json)$/.test(path) ||
+                path.endsWith("/coi-serviceworker.js");
+
+            // GitHub Pages may serve cacheable JS/WASM. For executable/runtime
+            // assets always revalidate from the network so a successful deploy
+            // cannot keep running yesterday's parser or Qt bootstrap.
+            const response = await fetch(
+                request,
+                freshnessCritical ? { cache: "no-store" } : undefined);
 
             if (response.status === 0)
                 return response;
@@ -80,6 +96,11 @@
             headers.set("Cross-Origin-Opener-Policy", "same-origin");
             headers.set("Cross-Origin-Embedder-Policy", "require-corp");
             headers.set("Cross-Origin-Resource-Policy", "same-origin");
+
+            if (freshnessCritical) {
+                headers.set("Cache-Control", "no-store, max-age=0");
+                headers.set("Pragma", "no-cache");
+            }
 
             return new Response(response.body, {
                 status: response.status,

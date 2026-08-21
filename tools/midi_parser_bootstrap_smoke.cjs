@@ -256,7 +256,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 12.8 parser is not Memory64.");
+        throw new Error("Generated Pass 12.9 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -316,7 +316,7 @@ async function main() {
             "Parser progress callback leaked a non-string Memory64 stage value.");
     }
 
-    // Regression for the browser failure that motivated Pass 12.8: the old
+    // Regression for the browser failure that motivated Pass 12.8/12.9: the old
     // Worker tried to grow a 64 MiB heap directly to ~500 MiB just to hold the
     // raw file. This virtual ~480 MiB MIDI contains two large skipped meta
     // payloads but never exists as one JS/WASM allocation. The generated module
@@ -390,7 +390,7 @@ async function main() {
     Module._wmp_release_result();
 
     console.log(
-        "MIDI parser Memory64 paged-source/progress-ABI/dense parse smoke test OK");
+        "MIDI parser Memory64 paged-source/no-stale-deploy/progress-ABI/dense parse smoke test OK");
 }
 
 main().catch(error => {

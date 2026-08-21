@@ -149,3 +149,23 @@ stage during the generated Memory64 parser smoke test.
 - GitHub Actions must still compile/run the generated Emscripten Memory64 module;
   the smoke test now exercises `_wmp_parse_file_js()` and includes the virtual
   ~480 MiB source regression.
+
+## Pass 12.9 — stale deployment regression validation
+
+- `web/midi-parser-worker.js` advertises bootstrap `12.9`, reports a
+  `worker-ready` handshake, and uses `_wmp_parse_file_js(total)` for production
+  browser files.
+- `src/mainwindow.cpp` fetches the Worker source with `cache: no-store`, verifies
+  the exact `12.9` marker before execution, and launches it with an explicit base
+  URL so the generated single-file Memory64 parser can still be imported from a
+  Blob Worker.
+- The obsolete `Allocating parser memory on demand` string and production
+  `_wmp_alloc_js(file.size)` pattern are absent from the current source tree.
+- The COI service worker no longer returns early when a page is already isolated;
+  it checks for an updated worker and uses `updateViaCache: none`. JS/WASM/HTML/
+  data requests are fetched with `cache: no-store` while retaining COOP/COEP.
+- The Pages artifact fingerprints `wasmidi.js`, `coi-serviceworker.js`, and
+  `snappysynth_bridge.js` with `${GITHUB_SHA}` and writes `build-id.txt`.
+- `node --check` passes for both browser workers and the generated-module smoke
+  harness; workflow YAML parses successfully; the artifact post-processing
+  Python was executed against a representative Qt HTML bootstrap.

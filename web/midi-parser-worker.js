@@ -2,18 +2,34 @@
 
 "use strict";
 
-// Pass 12.8: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
+// Pass 12.9: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
 // memory to 16 GiB; physical pages are committed on demand, so the effective
 // limit below that is whatever the browser/OS can actually provide.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.8";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.9";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
 self.__wasmidiMidiParserPercent = 14;
 
-importScripts(
-    "./wasmidi-midi-parser.js?v=" +
-    encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP));
+// When MainWindow fetches this Worker with cache: no-store and launches it
+// from a Blob URL, relative importScripts() would resolve against blob:. Keep
+// the real deployment directory in a tiny prelude so the generated parser
+// core is always fetched from the current site and current bootstrap version.
+const WASMIDI_MIDI_PARSER_BASE_URL = (() => {
+    const configured = self.__wasmidiMidiParserBaseUrl;
+    if (configured)
+        return String(configured);
+    try {
+        return new URL("./", self.location.href).href;
+    } catch (_) {
+        return "./";
+    }
+})();
+
+importScripts(new URL(
+    "wasmidi-midi-parser.js?v=" +
+        encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP),
+    WASMIDI_MIDI_PARSER_BASE_URL).href);
 
 let modulePromise = null;
 let lastAbortReason = "";
@@ -217,6 +233,15 @@ async function streamPackedResult(Module, file, resultPtr, resultSize) {
     });
 }
 
+// Explicit source-version handshake. MainWindow does not send the File until
+// this arrives, so a stale Worker can never silently execute an older loading
+// path after a GitHub Pages deployment.
+postMessage({
+    type: "worker-ready",
+    bootstrap: WASMIDI_MIDI_PARSER_BOOTSTRAP,
+    pagedSource: true
+});
+
 self.onmessage = async event => {
     const message = event.data || {};
     if (message.type !== "parse" || !message.file)
@@ -233,7 +258,7 @@ self.onmessage = async event => {
 
         Module = await getModule();
 
-        // Pass 12.8: keep the browser File outside the wasm heap. C++ requests
+        // Pass 12.9: keep the browser File outside the wasm heap. C++ requests
         // only bounded 4 MiB windows through FileReaderSync as its two parser
         // passes move through the track ranges. A 500 MB/5 GB source therefore
         // does not require a 500 MB/5 GB raw allocation before parsing begins.
