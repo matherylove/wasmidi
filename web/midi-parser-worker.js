@@ -9,9 +9,33 @@ let modulePromise = null;
 function getModule() {
     if (!modulePromise) {
         modulePromise = WasmidiMidiParserCore({
+            // This target exposes a C API and is not an application. Do not let
+            // Emscripten run an executable main()/exit sequence in this Worker.
+            // The CMake target is also linked with --no-entry; keeping this here
+            // makes the worker robust against stale/generated glue during deploys.
+            noInitialRun: true,
             locateFile(path) {
-                return "./" + path;
+                return new URL(path, self.location.href).href;
+            },
+            onAbort(reason) {
+                console.error(
+                    "[WASMIDI MIDI parser] core aborted:",
+                    reason || "unknown reason");
             }
+        }).then(Module => {
+            if (!Module ||
+                typeof Module._wmp_parse !== "function" ||
+                typeof Module._malloc !== "function" ||
+                !Module.HEAPU8) {
+                throw new Error(
+                    "MIDI parser WASM initialized without its exported API.");
+            }
+            return Module;
+        }).catch(error => {
+            // Permit a later load attempt after a transient deployment/cache
+            // failure instead of permanently retaining a rejected Promise.
+            modulePromise = null;
+            throw error;
         });
     }
     return modulePromise;

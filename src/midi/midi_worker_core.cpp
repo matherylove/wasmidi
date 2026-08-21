@@ -111,7 +111,9 @@ const char* wmp_error_ptr()
 
 } // extern "C"
 
+#ifndef __EMSCRIPTEN__
 int main()
 {
     return 0;
 }
+#endif

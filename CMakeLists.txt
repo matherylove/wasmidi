@@ -70,6 +70,7 @@ if(EMSCRIPTEN)
     target_link_options(midi_parser_core PRIVATE
         -O3
         -flto
+        "--no-entry"
         "-sMODULARIZE=1"
         "-sEXPORT_NAME=WasmidiMidiParserCore"
         "-sENVIRONMENT=worker"

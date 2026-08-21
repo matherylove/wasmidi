@@ -63,6 +63,13 @@
         if (request.cache === "only-if-cached" && request.mode !== "same-origin")
             return;
 
+        // COOP/COEP headers are needed only on our own deployment resources.
+        // Passing third-party requests through untouched prevents an unrelated
+        // blocked analytics/beacon fetch from becoming a rejected FetchEvent.
+        const requestUrl = new URL(request.url);
+        if (requestUrl.origin !== self.location.origin)
+            return;
+
         event.respondWith((async () => {
             const response = await fetch(request);
 

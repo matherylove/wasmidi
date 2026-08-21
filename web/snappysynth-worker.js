@@ -1066,12 +1066,15 @@ onmessage = async event => {
                         Number(data.numBuffers) |
                         0));
 
-            prebufferSeconds =
-                Math.max(
-                    0.0,
-                    Math.min(
-                        3600.0,
-                        Number(data.prebufferSeconds) || prebufferSeconds));
+            {
+                const requestedPrebuffer = Number(data.prebufferSeconds);
+                if (Number.isFinite(requestedPrebuffer)) {
+                    prebufferSeconds =
+                        Math.max(
+                            0.0,
+                            Math.min(3600.0, requestedPrebuffer));
+                }
+            }
 
             midiDuration =
                 Math.max(
@@ -1118,6 +1121,16 @@ onmessage = async event => {
 
             softClip =
                 data.softClip !== false;
+
+            // The bridge intentionally sends configuration immediately after
+            // creating this Worker so startup settings are available before the
+            // Emscripten core is instantiated. During that bootstrap window
+            // Module is still null. Keep the settings above, but do not touch
+            // exported WASM functions until SnappySynthCore(...).then() has
+            // completed. initCore() below will consume these already-updated
+            // values on its first initialization.
+            if (!Module || !coreReady)
+                return;
 
             playing = false;
             reinitializeCore();
