@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 12.7: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
+// Pass 12.8: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
 // memory to 16 GiB; physical pages are committed on demand, so the effective
 // limit below that is whatever the browser/OS can actually provide.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.7";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.8";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
@@ -128,6 +128,7 @@ function getModule() {
                 typeof Module._wmp_alloc_js !== "function" ||
                 typeof Module._wmp_free_js !== "function" ||
                 typeof Module._wmp_parse_js !== "function" ||
+                typeof Module._wmp_parse_file_js !== "function" ||
                 typeof Module._wmp_pack !== "function" ||
                 typeof Module._wmp_result_ptr_js !== "function" ||
                 typeof Module._wmp_result_size_js !== "function" ||
@@ -143,7 +144,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 12.7 parser was built without Memory64 (pointer width " +
+                    "Pass 12.8 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 
@@ -179,60 +180,6 @@ function progress(percent, stage) {
         percent: bounded,
         stage: text
     });
-}
-
-async function streamFileIntoWasm(file, Module, inputPtr) {
-    const total = Number(file.size);
-    if (!Number.isSafeInteger(total) || total < 0)
-        throw new Error("Invalid MIDI file size.");
-
-    const base = pointerToNumber(inputPtr, "MIDI input pointer");
-    let offset = 0;
-
-    progress(1, "Streaming MIDI directly into parser memory");
-
-    if (file.stream && total > 0) {
-        const reader = file.stream().getReader();
-        try {
-            while (true) {
-                const result = await reader.read();
-                if (result.done)
-                    break;
-
-                const chunk = result.value;
-                if (!chunk || offset + chunk.byteLength > total)
-                    throw new Error("MIDI file changed while it was being read.");
-
-                // Do not retain a second file-sized JS Uint8Array. The File
-                // stream writes each chunk straight into the already-grown
-                // Memory64 heap.
-                Module.HEAPU8.set(chunk, base + offset);
-                offset += chunk.byteLength;
-
-                progress(
-                    1 + Math.floor(13 * offset / Math.max(1, total)),
-                    "Streaming MIDI directly into parser memory");
-
-                if ((offset & ((16 * 1024 * 1024) - 1)) === 0)
-                    await new Promise(resolve => setTimeout(resolve, 0));
-            }
-        } finally {
-            try { reader.releaseLock(); } catch (_) {}
-        }
-    } else {
-        // Fallback only for browsers without File.stream(). This path may need a
-        // transient ArrayBuffer, but never an additional persistent copy.
-        const source = new Uint8Array(await file.arrayBuffer());
-        if (source.length !== total)
-            throw new Error("MIDI file size changed while loading.");
-        Module.HEAPU8.set(source, base);
-        offset = source.length;
-    }
-
-    if (offset !== total)
-        throw new Error("MIDI file ended before the advertised size.");
-
-    progress(15, "Starting MIDI parser");
 }
 
 async function streamPackedResult(Module, file, resultPtr, resultSize) {
@@ -275,7 +222,6 @@ self.onmessage = async event => {
     if (message.type !== "parse" || !message.file)
         return;
 
-    let inputPtr = null;
     let Module = null;
     let resultOwned = false;
 
@@ -287,27 +233,30 @@ self.onmessage = async event => {
 
         Module = await getModule();
 
-        self.__wasmidiMidiParserStage = "Allocating parser memory on demand";
-        inputPtr = Module._wmp_alloc_js(Math.max(1, total));
-        if (!inputPtr) {
-            throw new Error(
-                "The browser/OS could not commit enough Memory64 pages for this MIDI. " +
-                "There is no lower WASMIDI RAM cap; this is the effective process/system memory limit.");
-        }
+        // Pass 12.8: keep the browser File outside the wasm heap. C++ requests
+        // only bounded 4 MiB windows through FileReaderSync as its two parser
+        // passes move through the track ranges. A 500 MB/5 GB source therefore
+        // does not require a 500 MB/5 GB raw allocation before parsing begins.
+        self.__wasmidiMidiParserFile = file;
+        self.__wasmidiMidiParserFileReader = null;
+        self.__wasmidiMidiParserReadError = "";
+        self.__wasmidiMidiParserStage = "Parsing MIDI from bounded file windows";
+        progress(1, "Opening MIDI as a paged source");
 
-        await streamFileIntoWasm(file, Module, inputPtr);
-
-        self.__wasmidiMidiParserStage = "Parsing MIDI";
-        const ok = Module._wmp_parse_js(inputPtr, total);
+        const ok = Module._wmp_parse_file_js(total);
         if (!ok) {
+            const parserText = parserErrorText(Module, "Could not parse MIDI");
+            const readText = String(self.__wasmidiMidiParserReadError || "");
             throw new Error(
-                parserErrorText(Module, "Could not parse MIDI"));
+                readText && !parserText.includes(readText)
+                    ? parserText + ": " + readText
+                    : parserText);
         }
 
-        // Parsing owns everything needed. Release the raw file allocation before
-        // packing so input + document + wire image are never all resident.
-        Module._wmp_free_js(inputPtr);
-        inputPtr = null;
+        // The C++ document is now independent of the File source. Drop all
+        // browser-side source references before allocating the packed result.
+        self.__wasmidiMidiParserFile = null;
+        self.__wasmidiMidiParserFileReader = null;
 
         self.__wasmidiMidiParserStage = "Packing parsed MIDI";
         const packed = Module._wmp_pack();
@@ -345,9 +294,9 @@ self.onmessage = async event => {
                 : String(failure || "Could not parse MIDI")
         });
     } finally {
-        if (inputPtr && Module) {
-            try { Module._wmp_free_js(inputPtr); } catch (_) {}
-        }
+        self.__wasmidiMidiParserFile = null;
+        self.__wasmidiMidiParserFileReader = null;
+        self.__wasmidiMidiParserReadAt = null;
         if (resultOwned && Module) {
             try { Module._wmp_release_result(); } catch (_) {}
         }

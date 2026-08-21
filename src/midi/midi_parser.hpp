@@ -169,11 +169,28 @@ struct MidiDocument {
 using MidiParseProgress =
     void (*)(void* user, int percent, const char* stage);
 
+// Random-access byte source used by the browser Worker. The callback must copy
+// exactly BYTECOUNT bytes starting at OFFSET into DST and return true. Keeping
+// the source outside WebAssembly lets giant MIDIs be parsed from File/Blob
+// windows without first allocating the entire raw file inside the wasm heap.
+using MidiReadAt =
+    bool (*)(void* user, uint64_t offset, uint8_t* dst, std::size_t byteCount);
+
 class MidiParser {
 public:
     bool parse(
         const uint8_t* data,
         std::size_t size,
+        MidiDocument& output,
+        MidiParseProgress progress = nullptr,
+        void* progressUser = nullptr);
+
+    // Same parser, backed by a random-access source instead of one contiguous
+    // allocation. This is the production browser path for very large MIDIs.
+    bool parseReadAt(
+        uint64_t size,
+        MidiReadAt readAt,
+        void* readUser,
         MidiDocument& output,
         MidiParseProgress progress = nullptr,
         void* progressUser = nullptr);

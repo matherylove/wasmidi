@@ -325,7 +325,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             worker =
                 new Worker(
-                    './midi-parser-worker.js?v=12.7');
+                    './midi-parser-worker.js?v=12.8');
 
             worker.onmessage =
                 (event) => {

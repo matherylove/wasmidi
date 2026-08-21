@@ -12,8 +12,41 @@
 namespace wasmidi {
 namespace {
 
+struct MidiByteSource {
+    uint64_t size = 0;
+    const uint8_t* contiguous = nullptr;
+    MidiReadAt readAt = nullptr;
+    void* readUser = nullptr;
+    bool readFailed = false;
+
+    bool read(uint64_t offset, uint8_t* dst, std::size_t byteCount)
+    {
+        if (byteCount == 0)
+            return true;
+
+        if (!dst ||
+            offset > size ||
+            uint64_t(byteCount) > size - offset) {
+            readFailed = true;
+            return false;
+        }
+
+        if (contiguous) {
+            std::memcpy(dst, contiguous + static_cast<std::size_t>(offset), byteCount);
+            return true;
+        }
+
+        if (!readAt || !readAt(readUser, offset, dst, byteCount)) {
+            readFailed = true;
+            return false;
+        }
+
+        return true;
+    }
+};
+
 struct TrackRef {
-    const uint8_t* data = nullptr;
+    uint64_t offset = 0;
     uint32_t size = 0;
 };
 
@@ -30,54 +63,158 @@ struct TrackScan {
     uint32_t maxTick = 0;
 };
 
-inline bool need(const uint8_t* p, const uint8_t* end, std::size_t bytes)
-{
-    return p <= end && static_cast<std::size_t>(end - p) >= bytes;
-}
+// A single reusable 4 MiB read window is enough to keep FileReaderSync calls
+// coarse while avoiding any allocation proportional to the MIDI file size.
+// Contiguous/native parsing bypasses this cache entirely.
+class SourceCursor {
+public:
+    static constexpr std::size_t CacheBytes = 4u * 1024u * 1024u;
 
-uint16_t read16(const uint8_t*& p, const uint8_t* end, bool& ok)
+    SourceCursor(MidiByteSource& source, uint64_t begin, uint64_t end)
+        : source_(source), position_(begin), end_(end)
+    {
+    }
+
+    uint64_t position() const { return position_; }
+    uint64_t remaining() const {
+        return position_ <= end_ ? end_ - position_ : 0;
+    }
+
+    bool readByte(uint8_t& value)
+    {
+        return read(&value, 1);
+    }
+
+    bool peekByte(uint8_t& value)
+    {
+        if (position_ >= end_)
+            return false;
+
+        if (source_.contiguous) {
+            value = source_.contiguous[static_cast<std::size_t>(position_)];
+            return true;
+        }
+
+        if (!ensureCache())
+            return false;
+
+        value = cache_[static_cast<std::size_t>(position_ - cacheStart_)];
+        return true;
+    }
+
+    bool read(uint8_t* dst, std::size_t byteCount)
+    {
+        if (byteCount == 0)
+            return true;
+
+        if (!dst || uint64_t(byteCount) > remaining())
+            return false;
+
+        if (source_.contiguous) {
+            std::memcpy(
+                dst,
+                source_.contiguous + static_cast<std::size_t>(position_),
+                byteCount);
+            position_ += byteCount;
+            return true;
+        }
+
+        std::size_t written = 0;
+        while (written < byteCount) {
+            if (!ensureCache())
+                return false;
+
+            const std::size_t cacheOffset =
+                static_cast<std::size_t>(position_ - cacheStart_);
+            const std::size_t available = cacheSize_ - cacheOffset;
+            const std::size_t take =
+                std::min(available, byteCount - written);
+
+            std::memcpy(dst + written, cache_.data() + cacheOffset, take);
+            written += take;
+            position_ += take;
+        }
+
+        return true;
+    }
+
+    bool skip(uint64_t byteCount)
+    {
+        if (byteCount > remaining())
+            return false;
+        position_ += byteCount;
+        return true;
+    }
+
+private:
+    bool ensureCache()
+    {
+        if (position_ >= end_)
+            return false;
+
+        if (cacheSize_ != 0 &&
+            position_ >= cacheStart_ &&
+            position_ < cacheStart_ + cacheSize_) {
+            return true;
+        }
+
+        cacheStart_ = position_;
+        cacheSize_ = static_cast<std::size_t>(
+            std::min<uint64_t>(CacheBytes, end_ - position_));
+
+        if (cache_.size() < cacheSize_)
+            cache_.resize(cacheSize_);
+
+        return source_.read(cacheStart_, cache_.data(), cacheSize_);
+    }
+
+    MidiByteSource& source_;
+    uint64_t position_ = 0;
+    uint64_t end_ = 0;
+    std::vector<uint8_t> cache_;
+    uint64_t cacheStart_ = 0;
+    std::size_t cacheSize_ = 0;
+};
+
+uint16_t read16(SourceCursor& cursor, bool& ok)
 {
-    if (!ok || !need(p, end, 2)) {
+    uint8_t bytes[2]{};
+    if (!ok || !cursor.read(bytes, sizeof(bytes))) {
         ok = false;
         return 0;
     }
 
-    const uint16_t value =
-        (uint16_t(p[0]) << 8) |
-        uint16_t(p[1]);
-
-    p += 2;
-    return value;
+    return
+        (uint16_t(bytes[0]) << 8) |
+        uint16_t(bytes[1]);
 }
 
-uint32_t read32(const uint8_t*& p, const uint8_t* end, bool& ok)
+uint32_t read32(SourceCursor& cursor, bool& ok)
 {
-    if (!ok || !need(p, end, 4)) {
+    uint8_t bytes[4]{};
+    if (!ok || !cursor.read(bytes, sizeof(bytes))) {
         ok = false;
         return 0;
     }
 
-    const uint32_t value =
-        (uint32_t(p[0]) << 24) |
-        (uint32_t(p[1]) << 16) |
-        (uint32_t(p[2]) << 8) |
-        uint32_t(p[3]);
-
-    p += 4;
-    return value;
+    return
+        (uint32_t(bytes[0]) << 24) |
+        (uint32_t(bytes[1]) << 16) |
+        (uint32_t(bytes[2]) << 8) |
+        uint32_t(bytes[3]);
 }
 
-uint32_t readVarLen(const uint8_t*& p, const uint8_t* end, bool& ok)
+uint32_t readVarLen(SourceCursor& cursor, bool& ok)
 {
     uint32_t value = 0;
 
     for (int i = 0; i < 4; ++i) {
-        if (!ok || p >= end) {
+        uint8_t byte = 0;
+        if (!ok || !cursor.readByte(byte)) {
             ok = false;
             return 0;
         }
 
-        const uint8_t byte = *p++;
         value = (value << 7) | uint32_t(byte & 0x7f);
 
         if ((byte & 0x80) == 0)
@@ -90,15 +227,12 @@ uint32_t readVarLen(const uint8_t*& p, const uint8_t* end, bool& ok)
 
 // SMF running status applies to channel messages. System common/SysEx/meta
 // cancels it; realtime bytes are tolerated without replacing it.
-bool readStatus(const uint8_t*& p,
-                const uint8_t* end,
+bool readStatus(SourceCursor& cursor,
                 uint8_t& running,
                 uint8_t& status)
 {
-    if (p >= end)
+    if (!cursor.peekByte(status))
         return false;
-
-    status = *p;
 
     if (status < 0x80) {
         if (running == 0)
@@ -107,7 +241,11 @@ bool readStatus(const uint8_t*& p,
         return true;
     }
 
-    ++p;
+    uint8_t consumed = 0;
+    if (!cursor.readByte(consumed))
+        return false;
+
+    status = consumed;
 
     if (status < 0xf0) {
         running = status;
@@ -150,7 +288,8 @@ void appendTrackCount(TrackScan& scan,
         ++group.controlCount;
 }
 
-bool scanTrack(const TrackRef& track,
+bool scanTrack(MidiByteSource& source,
+               const TrackRef& track,
                std::size_t trackIndex,
                TrackScan& scan,
                MidiDocument& output,
@@ -158,43 +297,51 @@ bool scanTrack(const TrackRef& track,
                uint64_t& totalNotes,
                uint64_t& totalControls)
 {
-    const uint8_t* p = track.data;
-    const uint8_t* end = p + track.size;
+    SourceCursor cursor(
+        source,
+        track.offset,
+        track.offset + uint64_t(track.size));
 
     uint32_t tick = 0;
     uint8_t running = 0;
     bool ok = true;
 
-    while (p < end && ok) {
-        tick += readVarLen(p, end, ok);
+    while (cursor.remaining() != 0 && ok) {
+        tick += readVarLen(cursor, ok);
 
         uint8_t status = 0;
-        if (!ok || !readStatus(p, end, running, status))
+        if (!ok || !readStatus(cursor, running, status))
             return false;
 
         if (status == 0xff) {
-            if (p >= end)
+            uint8_t meta = 0;
+            if (!cursor.readByte(meta))
                 return false;
 
-            const uint8_t meta = *p++;
-            const uint32_t length = readVarLen(p, end, ok);
-
-            if (!ok || !need(p, end, length))
+            const uint32_t length = readVarLen(cursor, ok);
+            if (!ok || uint64_t(length) > cursor.remaining())
                 return false;
 
             if (meta == 0x51 && length >= 3) {
+                uint8_t tempoBytes[3]{};
+                if (!cursor.read(tempoBytes, sizeof(tempoBytes)))
+                    return false;
+
                 const uint32_t us =
-                    (uint32_t(p[0]) << 16) |
-                    (uint32_t(p[1]) << 8) |
-                    uint32_t(p[2]);
+                    (uint32_t(tempoBytes[0]) << 16) |
+                    (uint32_t(tempoBytes[1]) << 8) |
+                    uint32_t(tempoBytes[2]);
 
                 output.tempoMap.push_back({
                     tick,
                     us
                 });
-            }
 
-            p += length;
+                if (!cursor.skip(uint64_t(length) - 3u))
+                    return false;
+            } else if (!cursor.skip(length)) {
+                return false;
+            }
 
             if (meta == 0x2f)
                 break;
@@ -203,22 +350,20 @@ bool scanTrack(const TrackRef& track,
         }
 
         if (status == 0xf0 || status == 0xf7) {
-            const uint32_t length = readVarLen(p, end, ok);
+            const uint32_t length = readVarLen(cursor, ok);
 
-            if (!ok || !need(p, end, length))
+            if (!ok || !cursor.skip(length))
                 return false;
 
-            p += length;
             continue;
         }
 
         if (status >= 0xf0) {
             const int bytes = systemDataBytes(status);
 
-            if (!need(p, end, static_cast<std::size_t>(bytes)))
+            if (!cursor.skip(static_cast<uint64_t>(bytes)))
                 return false;
 
-            p += bytes;
             continue;
         }
 
@@ -227,11 +372,12 @@ bool scanTrack(const TrackRef& track,
         const int dataBytes =
             (command == 0xc0 || command == 0xd0) ? 1 : 2;
 
-        if (!need(p, end, static_cast<std::size_t>(dataBytes)))
+        uint8_t data[2]{};
+        if (!cursor.read(data, static_cast<std::size_t>(dataBytes)))
             return false;
 
-        const uint8_t data1 = *p++;
-        const uint8_t data2 = dataBytes == 2 ? *p++ : 0;
+        const uint8_t data1 = data[0];
+        const uint8_t data2 = dataBytes == 2 ? data[1] : 0;
 
         const bool noteOn =
             command == 0x90 && data2 != 0;
@@ -488,6 +634,7 @@ bool buildGlobalTickIndex(
 }
 
 bool parseTrackEvents(
+    MidiByteSource& source,
     const TrackRef& track,
     std::size_t trackIndex,
     const TrackScan& scan,
@@ -497,33 +644,33 @@ bool parseTrackEvents(
     std::vector<uint16_t>& eventTracks,
     MidiDocument& output)
 {
-    const uint8_t* p = track.data;
-    const uint8_t* end = p + track.size;
+    SourceCursor cursor(
+        source,
+        track.offset,
+        track.offset + uint64_t(track.size));
 
     uint32_t tick = 0;
     uint8_t running = 0;
     bool ok = true;
     std::size_t localGroup = 0;
 
-    while (p < end && ok) {
-        tick += readVarLen(p, end, ok);
+    while (cursor.remaining() != 0 && ok) {
+        tick += readVarLen(cursor, ok);
 
         uint8_t status = 0;
 
-        if (!ok || !readStatus(p, end, running, status))
+        if (!ok || !readStatus(cursor, running, status))
             return false;
 
         if (status == 0xff) {
-            if (p >= end)
+            uint8_t meta = 0;
+            if (!cursor.readByte(meta))
                 return false;
 
-            const uint8_t meta = *p++;
-            const uint32_t length = readVarLen(p, end, ok);
+            const uint32_t length = readVarLen(cursor, ok);
 
-            if (!ok || !need(p, end, length))
+            if (!ok || !cursor.skip(length))
                 return false;
-
-            p += length;
 
             if (meta == 0x2f)
                 break;
@@ -532,33 +679,31 @@ bool parseTrackEvents(
         }
 
         if (status == 0xf0 || status == 0xf7) {
-            const uint32_t length = readVarLen(p, end, ok);
+            const uint32_t length = readVarLen(cursor, ok);
 
-            if (!ok || !need(p, end, length))
+            if (!ok || uint64_t(length) > cursor.remaining())
                 return false;
 
             SysExEvent event;
             event.tick = tick;
-            event.data.reserve(
-                static_cast<std::size_t>(length) + 1);
-            event.data.push_back(status);
-            event.data.insert(
-                event.data.end(),
-                p,
-                p + length);
+            event.data.resize(static_cast<std::size_t>(length) + 1);
+            event.data[0] = status;
+
+            if (length != 0 &&
+                !cursor.read(event.data.data() + 1, length)) {
+                return false;
+            }
 
             output.sysEx.push_back(std::move(event));
-            p += length;
             continue;
         }
 
         if (status >= 0xf0) {
             const int bytes = systemDataBytes(status);
 
-            if (!need(p, end, static_cast<std::size_t>(bytes)))
+            if (!cursor.skip(static_cast<uint64_t>(bytes)))
                 return false;
 
-            p += bytes;
             continue;
         }
 
@@ -567,11 +712,12 @@ bool parseTrackEvents(
         const int dataBytes =
             (command == 0xc0 || command == 0xd0) ? 1 : 2;
 
-        if (!need(p, end, static_cast<std::size_t>(dataBytes)))
+        uint8_t data[2]{};
+        if (!cursor.read(data, static_cast<std::size_t>(dataBytes)))
             return false;
 
-        uint8_t data1 = *p++;
-        uint8_t data2 = dataBytes == 2 ? *p++ : 0;
+        uint8_t data1 = data[0];
+        uint8_t data2 = dataBytes == 2 ? data[1] : 0;
 
         // MIDI convention: NoteOn velocity zero is NoteOff.
         if (command == 0x90 && data2 == 0) {
@@ -706,6 +852,87 @@ void buildVisualNotes(
         static_cast<std::size_t>(
             output.noteCount));
 
+    // Build the compressed keyboard NoteOff timeline while notes are paired.
+    // The previous implementation first materialized one uint64_t sort key per
+    // note (8 * noteCount bytes) and only then compressed it. Large black MIDIs
+    // could therefore need another multi-gigabyte allocation after visualNotes
+    // had already been built. Here we aggregate closures at each source tick,
+    // so memory scales with the final compressed keyboard timeline instead of
+    // with the raw note count.
+    output.visualKeyEnds.clear();
+    output.visualKeyEnds.reserve(
+        std::min<std::size_t>(
+            static_cast<std::size_t>(output.noteCount),
+            std::size_t(1) << 20));
+
+    constexpr std::size_t VisualKeySignatureCount =
+        std::size_t(1) << 15;
+
+    std::vector<uint32_t> endCounts(
+        VisualKeySignatureCount, 0);
+    std::vector<uint32_t> minimumEndCounts(
+        VisualKeySignatureCount, 0);
+    std::vector<uint16_t> touchedEnds;
+    std::vector<uint16_t> touchedMinimumEnds;
+    touchedEnds.reserve(1024);
+    touchedMinimumEnds.reserve(1024);
+
+    auto keySignatureFromNote =
+        [](const VisualNote& note) -> uint16_t {
+            const uint32_t pitch =
+                (note.packedData >> 8) & 0x7f;
+            const uint32_t globalColor =
+                (note.packedData >> 16) & 0x0f;
+            const uint32_t trackColor =
+                (note.packedData >> 20) & 0x0f;
+            return static_cast<uint16_t>(
+                pitch |
+                (globalColor << 7) |
+                (trackColor << 11));
+        };
+
+    auto packedFromKeySignature =
+        [](uint16_t signature) -> uint32_t {
+            const uint32_t pitch = signature & 0x7f;
+            const uint32_t globalColor =
+                (signature >> 7) & 0x0f;
+            const uint32_t trackColor =
+                (signature >> 11) & 0x0f;
+            return pitch |
+                (globalColor << 8) |
+                (trackColor << 12);
+        };
+
+    auto countKeyboardEnd =
+        [](std::vector<uint32_t>& counts,
+           std::vector<uint16_t>& touched,
+           uint16_t signature) {
+            if (counts[signature] == 0)
+                touched.push_back(signature);
+            if (counts[signature] !=
+                std::numeric_limits<uint32_t>::max()) {
+                ++counts[signature];
+            }
+        };
+
+    auto flushKeyboardEnds =
+        [&](uint32_t tick,
+            std::vector<uint32_t>& counts,
+            std::vector<uint16_t>& touched) {
+            for (uint16_t signature : touched) {
+                const uint32_t count = counts[signature];
+                if (count != 0) {
+                    output.visualKeyEnds.push_back({
+                        tick,
+                        count,
+                        packedFromKeySignature(signature)
+                    });
+                    counts[signature] = 0;
+                }
+            }
+            touched.clear();
+        };
+
     std::array<uint32_t, VisualHashSize>
         buckets;
 
@@ -788,6 +1015,12 @@ void buildVisualNotes(
 
     for (const TickGroup& group :
          output.tickGroups) {
+        // These vectors are flushed at the end of every tick group. A NoteOff
+        // can either end at the group tick or, for a zero-length note, at the
+        // MPWGL2 minimum-duration tick. All zero-length closures in one group
+        // share the same start tick and therefore the same adjusted end tick.
+        uint32_t adjustedEndTick = 0;
+
         const std::size_t begin =
             group.eventOffset;
 
@@ -921,6 +1154,36 @@ void buildVisualNotes(
                 : minimumEndTick(
                     output,
                     note.startTick);
+
+            const uint16_t signature =
+                keySignatureFromNote(note);
+
+            if (note.endTick == group.tick) {
+                countKeyboardEnd(
+                    endCounts,
+                    touchedEnds,
+                    signature);
+            } else {
+                adjustedEndTick = note.endTick;
+                countKeyboardEnd(
+                    minimumEndCounts,
+                    touchedMinimumEnds,
+                    signature);
+            }
+        }
+
+        flushKeyboardEnds(
+            group.tick,
+            endCounts,
+            touchedEnds);
+
+        if (!touchedMinimumEnds.empty()) {
+            // minimumEndTick() depends only on this group's tick for these
+            // zero-length notes, so one adjusted tick covers the whole group.
+            flushKeyboardEnds(
+                adjustedEndTick,
+                minimumEndCounts,
+                touchedMinimumEnds);
         }
     }
 
@@ -931,6 +1194,9 @@ void buildVisualNotes(
         uint32_t noteIndex =
             queueInfo.head;
 
+        if (noteIndex == VisualNoIndex)
+            continue;
+
         const uint16_t track =
             static_cast<uint16_t>(
                 queueInfo.key >> 11);
@@ -939,6 +1205,12 @@ void buildVisualNotes(
             track < scans.size()
                 ? scans[track].maxTick
                 : output.maxTick;
+
+        uint32_t regularCount = 0;
+        uint32_t adjustedCount = 0;
+        uint16_t signature = 0;
+        uint32_t adjustedTick = 0;
+        bool haveSignature = false;
 
         while (noteIndex !=
                VisualNoIndex) {
@@ -957,9 +1229,78 @@ void buildVisualNotes(
                     output,
                     note.startTick);
 
+            if (!haveSignature) {
+                signature =
+                    keySignatureFromNote(note);
+                haveSignature = true;
+            }
+
+            if (note.endTick == trackEnd) {
+                if (regularCount !=
+                    std::numeric_limits<uint32_t>::max()) {
+                    ++regularCount;
+                }
+            } else {
+                adjustedTick = note.endTick;
+                if (adjustedCount !=
+                    std::numeric_limits<uint32_t>::max()) {
+                    ++adjustedCount;
+                }
+            }
+
             noteIndex = next;
         }
+
+        if (regularCount != 0) {
+            output.visualKeyEnds.push_back({
+                trackEnd,
+                regularCount,
+                packedFromKeySignature(signature)
+            });
+        }
+
+        if (adjustedCount != 0) {
+            output.visualKeyEnds.push_back({
+                adjustedTick,
+                adjustedCount,
+                packedFromKeySignature(signature)
+            });
+        }
     }
+
+    // Normal NoteOffs were emitted in source-tick order, while zero-length and
+    // orphan closures can target slightly later ticks. Sort only the already
+    // compressed events, then coalesce duplicates in place. This keeps peak
+    // memory bounded by visualNotes + the final keyboard timeline.
+    std::sort(
+        output.visualKeyEnds.begin(),
+        output.visualKeyEnds.end(),
+        [](const VisualKeyEvent& a,
+           const VisualKeyEvent& b) {
+            if (a.tick != b.tick)
+                return a.tick < b.tick;
+            return a.packedData < b.packedData;
+        });
+
+    std::size_t endWrite = 0;
+    for (const VisualKeyEvent& event :
+         output.visualKeyEnds) {
+        if (endWrite != 0) {
+            VisualKeyEvent& previous =
+                output.visualKeyEnds[endWrite - 1];
+
+            if (previous.tick == event.tick &&
+                previous.packedData == event.packedData &&
+                uint64_t(previous.count) + event.count <=
+                    std::numeric_limits<uint32_t>::max()) {
+                previous.count += event.count;
+                continue;
+            }
+        }
+
+        output.visualKeyEnds[endWrite++] = event;
+    }
+    output.visualKeyEnds.resize(endWrite);
 
     // The source event stream is globally tick ordered and events at equal
     // ticks were written track-by-track. Therefore visualNotes is already in
@@ -1022,7 +1363,8 @@ uint32_t packedFromVisualKeySignature(uint32_t signature)
 void buildVisualKeyIndex(MidiDocument& output)
 {
     output.visualKeyStarts.clear();
-    output.visualKeyEnds.clear();
+    // visualKeyEnds is built incrementally during note pairing to avoid a
+    // second O(noteCount) allocation on large black MIDIs.
     output.visualKeyOwners.clear();
 
     const auto& notes = output.visualNotes;
@@ -1092,39 +1434,6 @@ void buildVisualKeyIndex(MidiDocument& output)
         begin = end;
     }
 
-    // End ticks are not source ordered. Sort a compact 64-bit key instead of
-    // materializing a 12-byte event per note before aggregation.
-    std::vector<uint64_t> endKeys;
-    endKeys.reserve(notes.size());
-
-    for (const VisualNote& note : notes) {
-        const uint32_t signature =
-            visualKeySignature(visualKeyPacked(note));
-        endKeys.push_back(
-            (uint64_t(note.endTick) << 15) |
-            uint64_t(signature));
-    }
-
-    std::sort(endKeys.begin(), endKeys.end());
-    output.visualKeyEnds.reserve(
-        std::min<std::size_t>(endKeys.size(), 1u << 20));
-
-    std::size_t i = 0;
-    while (i < endKeys.size()) {
-        const uint64_t key = endKeys[i];
-        std::size_t j = i + 1;
-        while (j < endKeys.size() && endKeys[j] == key)
-            ++j;
-
-        output.visualKeyEnds.push_back({
-            static_cast<uint32_t>(key >> 15),
-            static_cast<uint32_t>(j - i),
-            packedFromVisualKeySignature(
-                static_cast<uint32_t>(key & 0x7fffu))
-        });
-
-        i = j;
-    }
 }
 
 void buildDerivedStats(MidiDocument& output)
@@ -1365,12 +1674,12 @@ std::size_t MidiDocument::upperBoundVisualStart(double tick) const
         visualNotes.begin());
 }
 
-bool MidiParser::parse(
-    const uint8_t* data,
-    std::size_t size,
+static bool parseSource(
+    MidiByteSource& source,
     MidiDocument& output,
     MidiParseProgress progress,
-    void* progressUser)
+    void* progressUser,
+    const char*& errorMessage)
 {
     auto report =
         [&](int percent, const char* stage) {
@@ -1380,59 +1689,66 @@ bool MidiParser::parse(
 
     report(1, "Validating MIDI");
     output = MidiDocument{};
-    errorMessage_ = "Unknown error";
+    errorMessage = "Unknown error";
+    source.readFailed = false;
 
-    if (!data || size < 14) {
-        errorMessage_ = "MIDI data is too short";
+    if (source.size < 14) {
+        errorMessage = "MIDI data is too short";
         return false;
     }
 
-    const uint8_t* p = data;
-    const uint8_t* end = data + size;
+    SourceCursor cursor(source, 0, source.size);
     bool ok = true;
 
-    if (!need(p, end, 4) ||
-        std::memcmp(p, "MThd", 4) != 0) {
-        errorMessage_ = "Missing MThd header";
+    uint8_t chunkId[4]{};
+    if (!cursor.read(chunkId, sizeof(chunkId)) ||
+        std::memcmp(chunkId, "MThd", 4) != 0) {
+        errorMessage = source.readFailed
+            ? "Could not read MIDI source"
+            : "Missing MThd header";
         return false;
     }
 
-    p += 4;
-
     const uint32_t headerLength =
-        read32(p, end, ok);
+        read32(cursor, ok);
 
     if (!ok ||
         headerLength < 6 ||
-        !need(p, end, headerLength)) {
-        errorMessage_ = "Invalid MIDI header";
+        uint64_t(headerLength) > cursor.remaining()) {
+        errorMessage = source.readFailed
+            ? "Could not read MIDI source"
+            : "Invalid MIDI header";
         return false;
     }
 
-    const uint8_t* headerEnd =
-        p + headerLength;
+    const uint64_t headerEnd =
+        cursor.position() + uint64_t(headerLength);
 
     output.format =
-        read16(p, headerEnd, ok);
+        read16(cursor, ok);
     output.trackCount =
-        read16(p, headerEnd, ok);
+        read16(cursor, ok);
     output.ticksPerBeat =
-        read16(p, headerEnd, ok);
+        read16(cursor, ok);
 
     if (!ok || output.format > 1) {
-        errorMessage_ =
+        errorMessage =
             "Only MIDI Format 0 and 1 are supported";
         return false;
     }
 
     if (output.ticksPerBeat == 0 ||
         (output.ticksPerBeat & 0x8000)) {
-        errorMessage_ =
+        errorMessage =
             "SMPTE timing is not supported";
         return false;
     }
 
-    p = headerEnd;
+    if (cursor.position() > headerEnd ||
+        !cursor.skip(headerEnd - cursor.position())) {
+        errorMessage = "Invalid MIDI header";
+        return false;
+    }
 
     std::vector<TrackRef> tracks;
     tracks.reserve(output.trackCount);
@@ -1440,29 +1756,33 @@ bool MidiParser::parse(
     for (uint16_t track = 0;
          track < output.trackCount;
          ++track) {
-        if (!need(p, end, 8) ||
-            std::memcmp(p, "MTrk", 4) != 0) {
-            errorMessage_ =
-                "Invalid or truncated MTrk chunk";
+        if (!cursor.read(chunkId, sizeof(chunkId)) ||
+            std::memcmp(chunkId, "MTrk", 4) != 0) {
+            errorMessage = source.readFailed
+                ? "Could not read MIDI source"
+                : "Invalid or truncated MTrk chunk";
             return false;
         }
 
-        p += 4;
         const uint32_t length =
-            read32(p, end, ok);
+            read32(cursor, ok);
 
-        if (!ok || !need(p, end, length)) {
-            errorMessage_ =
-                "Truncated MIDI track";
+        if (!ok || uint64_t(length) > cursor.remaining()) {
+            errorMessage = source.readFailed
+                ? "Could not read MIDI source"
+                : "Truncated MIDI track";
             return false;
         }
 
         tracks.push_back({
-            p,
+            cursor.position(),
             length
         });
 
-        p += length;
+        if (!cursor.skip(length)) {
+            errorMessage = "Truncated MIDI track";
+            return false;
+        }
     }
 
     report(5, "Indexing tracks");
@@ -1484,12 +1804,13 @@ bool MidiParser::parse(
     uint64_t totalNotes = 0;
     uint64_t totalControls = 0;
 
-    // Pass 1: index/count each track. There is no NoteEvent allocation,
-    // no NoteOn->NoteOff pairing and no global note sort.
+    // Pass 1: index/count each track. Browser builds use a fixed-size read
+    // window over the File/Blob; no raw file-sized allocation exists in WASM.
     for (std::size_t track = 0;
          track < tracks.size();
          ++track) {
         if (!scanTrack(
+                source,
                 tracks[track],
                 track,
                 scans[track],
@@ -1497,8 +1818,9 @@ bool MidiParser::parse(
                 totalEvents,
                 totalNotes,
                 totalControls)) {
-            errorMessage_ =
-                "Malformed MIDI event data";
+            errorMessage = source.readFailed
+                ? "Could not read MIDI source"
+                : "Malformed MIDI event data";
             output = MidiDocument{};
             return false;
         }
@@ -1531,8 +1853,8 @@ bool MidiParser::parse(
             scans,
             output,
             totalEvents)) {
-        errorMessage_ =
-            "MIDI contains too many channel events for wasm32";
+        errorMessage =
+            "MIDI contains too many channel events for the current event index";
         output = MidiDocument{};
         return false;
     }
@@ -1573,12 +1895,14 @@ bool MidiParser::parse(
             output.tickGroups[i].eventOffset;
     }
 
-    // Pass 2: write compact events directly into final tick-group positions.
+    // Pass 2: revisit the same source ranges and write compact events directly
+    // into final tick-group positions. Only the cursor window is resident.
     report(50, "Decoding MIDI events");
     for (std::size_t track = 0;
          track < tracks.size();
          ++track) {
         if (!parseTrackEvents(
+                source,
                 tracks[track],
                 track,
                 scans[track],
@@ -1587,8 +1911,9 @@ bool MidiParser::parse(
                 writeCursors,
                 eventTracks,
                 output)) {
-            errorMessage_ =
-                "Malformed MIDI event data";
+            errorMessage = source.readFailed
+                ? "Could not read MIDI source"
+                : "Malformed MIDI event data";
             output = MidiDocument{};
             return false;
         }
@@ -1608,7 +1933,7 @@ bool MidiParser::parse(
         eventTracks,
         scans);
 
-    report(87, "Compressing keyboard timeline");
+    report(87, "Finalizing keyboard timeline");
     buildVisualKeyIndex(output);
 
     report(90, "Analyzing MIDI density");
@@ -1630,9 +1955,55 @@ bool MidiParser::parse(
             return a.tick < b.tick;
         });
 
-    errorMessage_ = "";
+    errorMessage = "";
     report(100, "Parsed");
     return true;
+}
+
+bool MidiParser::parse(
+    const uint8_t* data,
+    std::size_t size,
+    MidiDocument& output,
+    MidiParseProgress progress,
+    void* progressUser)
+{
+    MidiByteSource source;
+    source.size = static_cast<uint64_t>(size);
+    source.contiguous = data;
+
+    return parseSource(
+        source,
+        output,
+        progress,
+        progressUser,
+        errorMessage_);
+}
+
+bool MidiParser::parseReadAt(
+    uint64_t size,
+    MidiReadAt readAt,
+    void* readUser,
+    MidiDocument& output,
+    MidiParseProgress progress,
+    void* progressUser)
+{
+    MidiByteSource source;
+    source.size = size;
+    source.readAt = readAt;
+    source.readUser = readUser;
+
+    if (!readAt) {
+        output = MidiDocument{};
+        errorMessage_ = "MIDI read callback is unavailable";
+        return false;
+    }
+
+    return parseSource(
+        source,
+        output,
+        progress,
+        progressUser,
+        errorMessage_);
 }
 
 } // namespace wasmidi

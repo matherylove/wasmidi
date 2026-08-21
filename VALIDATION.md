@@ -132,3 +132,20 @@ C++ before entering JavaScript, so progress reporting uses the same JS-safe ABI
 as the parser's exported data/result/error paths. The browser Worker/core URLs
 are cache-busted to 12.7, and CI requires at least one decoded string progress
 stage during the generated Memory64 parser smoke test.
+
+## Pass 12.8 — paged source validation
+
+- Native `parse()` and `parseReadAt()` outputs were serialized and compared
+  byte-for-byte on randomized MIDIs plus 200k and 2M-note crashpoints.
+- A 16,000,026-byte 2M-note MIDI required 9 read-at calls; the largest was
+  exactly 4,194,304 bytes.
+- A synthetic random-access MIDI of 503,316,520 bytes (~480 MiB) was parsed
+  without materializing the file. It required 7 reads, each <=4 MiB, produced a
+  124-byte wire document, and the native test peaked at roughly 12 MiB RSS.
+- `midi_parser.cpp`, `midi_worker_core.cpp`, and `midi_document_codec.cpp`
+  compile as C++17 in the local validation environment.
+- `node --check` passes for `web/midi-parser-worker.js` and
+  `tools/midi_parser_bootstrap_smoke.cjs`.
+- GitHub Actions must still compile/run the generated Emscripten Memory64 module;
+  the smoke test now exercises `_wmp_parse_file_js()` and includes the virtual
+  ~480 MiB source regression.

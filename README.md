@@ -262,3 +262,30 @@ C++ before entering JavaScript, so progress reporting uses the same JS-safe ABI
 as the parser's exported data/result/error paths. The browser Worker/core URLs
 are cache-busted to 12.7, and CI requires at least one decoded string progress
 stage during the generated Memory64 parser smoke test.
+
+## Pass 12.8 — paged MIDI source / no raw-file-sized WASM allocation
+
+The background parser no longer copies the selected browser `File` into one
+contiguous WebAssembly allocation before parsing. `MidiParser` now has a
+`parseReadAt()` source interface and the browser Worker exposes the selected
+`File` through synchronous `FileReaderSync` windows. The C++ parser keeps at
+most a 4 MiB source window resident while its indexing and decode passes move
+through the track ranges.
+
+This specifically removes the failure mode where a ~480 MiB MIDI forced the
+Memory64 heap to jump from 64 MiB to ~500 MiB before the first event was parsed.
+The source file may now be much larger than the parser's transient input RAM;
+RAM growth is driven by the parsed indexes/events/notes that are actually
+needed, not by the raw file size itself.
+
+The generated-module CI smoke test includes a virtual ~480 MiB MIDI that is
+never materialized as one allocation and fails if any source read exceeds
+4 MiB. It also keeps the dense-note crashpoint test and the Memory64 progress
+ABI checks from earlier passes.
+
+This is an important step toward system-limited huge-MIDI playback, but the Qt
+player is still wasm32 and still installs the final serialized `MidiDocument`
+monolithically. Files whose *parsed resident document* exceeds that address
+space still require the planned segmented player-residency path; Pass 12.8
+removes the raw-input allocation ceiling, not that separate final residency
+ceiling.

@@ -76,6 +76,88 @@ EM_JS(void, wmp_post_absolute_progress, (int percent, double stageAddress), {
         });
     }
 });
+
+EM_JS(int, wmp_read_file_slice,
+      (double sourceOffset, double byteCount, double destinationAddress), {
+    const root = typeof globalThis !== "undefined"
+        ? globalThis
+        : (typeof self !== "undefined" ? self : null);
+
+    const offset = Number(sourceOffset);
+    const count = Number(byteCount);
+    const destination = Number(destinationAddress);
+
+    const fail = message => {
+        if (root)
+            root.__wasmidiMidiParserReadError = String(message || "MIDI source read failed");
+        return 0;
+    };
+
+    if (!root ||
+        !Number.isSafeInteger(offset) || offset < 0 ||
+        !Number.isSafeInteger(count) || count < 0 ||
+        !Number.isSafeInteger(destination) || destination < 0 ||
+        !Number.isSafeInteger(destination + count) ||
+        destination + count > HEAPU8.length) {
+        return fail("Invalid bounded MIDI source read request");
+    }
+
+    if (count === 0)
+        return 1;
+
+    try {
+        let bytes = null;
+
+        // CI/diagnostic path: the exact generated Memory64 module can provide a
+        // synchronous read-at hook without requiring browser FileReaderSync.
+        if (typeof root.__wasmidiMidiParserReadAt === "function") {
+            const result = root.__wasmidiMidiParserReadAt(offset, count);
+            if (result instanceof Uint8Array) {
+                bytes = result;
+            } else if (result instanceof ArrayBuffer) {
+                bytes = new Uint8Array(result);
+            } else if (ArrayBuffer.isView(result)) {
+                bytes = new Uint8Array(
+                    result.buffer,
+                    result.byteOffset,
+                    result.byteLength);
+            }
+        } else {
+            const file = root.__wasmidiMidiParserFile;
+            if (!file || typeof file.slice !== "function")
+                return fail("Browser MIDI File source is unavailable");
+
+            if (typeof FileReaderSync !== "function")
+                return fail("FileReaderSync is unavailable in the MIDI parser Worker");
+
+            let reader = root.__wasmidiMidiParserFileReader;
+            if (!reader) {
+                reader = new FileReaderSync();
+                root.__wasmidiMidiParserFileReader = reader;
+            }
+
+            const buffer = reader.readAsArrayBuffer(
+                file.slice(offset, offset + count));
+            bytes = new Uint8Array(buffer);
+        }
+
+        if (!bytes || bytes.byteLength !== count) {
+            return fail(
+                "MIDI source returned " +
+                (bytes ? bytes.byteLength : 0) +
+                " bytes, expected " + count);
+        }
+
+        HEAPU8.set(bytes, destination);
+        return 1;
+    } catch (error) {
+        return fail(
+            error && error.message
+                ? error.message
+                : String(error || "MIDI source read failed"));
+    }
+});
+
 #endif
 
 void progressCallback(void*, int percent, const char* stage)
@@ -88,6 +170,34 @@ void progressCallback(void*, int percent, const char* stage)
 #else
     (void)percent;
     (void)stage;
+#endif
+}
+
+
+bool browserReadAt(void*,
+                   uint64_t offset,
+                   uint8_t* destination,
+                   std::size_t byteCount)
+{
+#ifdef __EMSCRIPTEN__
+    constexpr uint64_t JsExactIntegerLimit = 9007199254740991ull;
+
+    if ((!destination && byteCount != 0) ||
+        offset > JsExactIntegerLimit ||
+        uint64_t(byteCount) > JsExactIntegerLimit ||
+        reinterpret_cast<std::uintptr_t>(destination) > JsExactIntegerLimit) {
+        return false;
+    }
+
+    return wmp_read_file_slice(
+        static_cast<double>(offset),
+        static_cast<double>(byteCount),
+        static_cast<double>(reinterpret_cast<std::uintptr_t>(destination))) != 0;
+#else
+    (void)offset;
+    (void)destination;
+    (void)byteCount;
+    return false;
 #endif
 }
 
@@ -157,6 +267,46 @@ int parseDocument(const uint8_t* data, std::size_t size)
         // Packing is intentionally a separate call. The Worker frees the raw
         // MIDI allocation immediately after this function returns, before a
         // potentially large serialized transfer buffer is allocated.
+        return 1;
+    } catch (const std::bad_alloc&) {
+        std::vector<uint8_t>().swap(g_result);
+        g_document = wasmidi::MidiDocument{};
+        g_error =
+            "MIDI parser could not obtain more memory from the browser/OS while building indexes";
+        return 0;
+    } catch (const std::exception& error) {
+        std::vector<uint8_t>().swap(g_result);
+        g_document = wasmidi::MidiDocument{};
+        g_error = std::string("MIDI parser exception: ") + error.what();
+        return 0;
+    } catch (...) {
+        std::vector<uint8_t>().swap(g_result);
+        g_document = wasmidi::MidiDocument{};
+        g_error = "Unknown MIDI parser exception";
+        return 0;
+    }
+}
+
+
+int parseFileDocument(std::size_t size)
+{
+    try {
+        std::vector<uint8_t>().swap(g_result);
+        g_error.clear();
+        g_document = wasmidi::MidiDocument{};
+
+        if (!g_parser.parseReadAt(
+                static_cast<uint64_t>(size),
+                &browserReadAt,
+                nullptr,
+                g_document,
+                &progressCallback,
+                nullptr)) {
+            g_error = g_parser.error();
+            g_document = wasmidi::MidiDocument{};
+            return 0;
+        }
+
         return 1;
     } catch (const std::bad_alloc&) {
         std::vector<uint8_t>().swap(g_result);
@@ -267,6 +417,20 @@ void wmp_free_js(double address)
         return;
 
     std::free(pointer);
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_parse_file_js(double byteCount)
+{
+    std::size_t size = 0;
+    if (!jsSizeToNative(byteCount, size)) {
+        g_error = "Invalid browser MIDI source size";
+        return 0;
+    }
+
+    return parseFileDocument(size);
 }
 
 #ifdef __EMSCRIPTEN__

@@ -188,3 +188,22 @@ C++ before entering JavaScript, so progress reporting uses the same JS-safe ABI
 as the parser's exported data/result/error paths. The browser Worker/core URLs
 are cache-busted to 12.7, and CI requires at least one decoded string progress
 stage during the generated Memory64 parser smoke test.
+
+## Pass 12.8 — bounded random-access MIDI source
+
+The browser parser no longer allocates `file.size` bytes in Memory64 before
+parsing. `MidiParser::parseReadAt()` reads a 64-bit source through a callback,
+and its source cursor caches at most 4 MiB. The dedicated Worker backs that
+callback with `FileReaderSync(file.slice(...))`, so both parser passes can seek
+through a huge browser `File` without copying the full raw MIDI into WASM.
+
+Production uses `_wmp_parse_file_js(size)`; the previous Number-safe contiguous
+API remains available for diagnostics but is no longer used by the browser file
+picker. A generated-module smoke source emulates a ~480 MiB MIDI without
+allocating it and verifies that no read exceeds the 4 MiB window.
+
+The current GitHub `main` also had an inconsistent parser/manifest combination:
+`MANIFEST.sha256` described the low-memory keyboard-end implementation while
+`src/midi/midi_parser.cpp` still contained the older `endKeys.reserve(notes.size())`
+path. Pass 12.8 ships the cumulative low-memory parser implementation again so
+that regression is removed together with paged input.
