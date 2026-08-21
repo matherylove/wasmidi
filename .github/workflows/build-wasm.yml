@@ -19,7 +19,7 @@ env:
 
 jobs:
   build-wasm:
-    name: Qt 6.8 WebAssembly
+    name: Qt 6.8 WebAssembly + SnappySynthV2
     runs-on: ubuntu-24.04
 
     steps:
@@ -79,6 +79,9 @@ jobs:
           test -s build/wasmidi.html
           test -s build/wasmidi.js
           test -s build/wasmidi.wasm
+          test -s build/snappysynth-core.js
+          test -s build/snappysynth-core.wasm
+          test -s build/snappysynth-core.worker.js
 
           cp build/wasmidi.html site/index.html
           cp build/wasmidi.js site/
@@ -88,6 +91,34 @@ jobs:
           if [[ -f build/wasmidi.data ]]; then cp build/wasmidi.data site/; fi
           if [[ -f build/wasmidi.worker.js ]]; then cp build/wasmidi.worker.js site/; fi
 
+          # SnappySynthV2 is a separate modularized WASM module. Emscripten
+          # generates a pthread worker alongside it.
+          cp build/snappysynth-core.js site/
+          cp build/snappysynth-core.wasm site/
+          cp build/snappysynth-core.worker.js site/
+
+          cp web/coi-serviceworker.js site/
+          cp web/snappysynth_bridge.js site/
+          cp web/snappysynth-worker.js site/
+          cp web/snappysynth-audio-worklet.js site/
+
+          # Load the isolation helper and bridge before Qt's generated bootstrap.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("site/index.html")
+          html = p.read_text(encoding="utf-8")
+          scripts = """
+          <script src="coi-serviceworker.js"></script>
+          <script src="snappysynth_bridge.js"></script>
+          """
+          if "snappysynth_bridge.js" not in html:
+              if "</head>" in html:
+                  html = html.replace("</head>", scripts + "\n</head>", 1)
+              else:
+                  html = scripts + "\n" + html
+          p.write_text(html, encoding="utf-8")
+          PY
+
           touch site/.nojekyll
 
           echo "Deployment files:"
@@ -96,6 +127,24 @@ jobs:
           test -s site/index.html
           test -s site/wasmidi.js
           test -s site/wasmidi.wasm
+          test -s site/snappysynth-core.js
+          test -s site/snappysynth-core.wasm
+          test -s site/snappysynth-core.worker.js
+          test -s site/snappysynth-worker.js
+          test -s site/snappysynth-audio-worklet.js
+          test -s site/snappysynth_bridge.js
+          test -s site/coi-serviceworker.js
+
+          echo "SnappySynthV2 deployment validation:"
+          grep -q 'coi-serviceworker.js' site/index.html
+          grep -q 'snappysynth_bridge.js' site/index.html
+          test -s site/snappysynth-core.js
+          test -s site/snappysynth-core.wasm
+          test -s site/snappysynth-core.worker.js
+          test -s site/snappysynth-worker.js
+          test -s site/snappysynth-audio-worklet.js
+          test -s site/snappysynth_bridge.js
+          echo "SnappySynthV2 Pages payload OK"
 
       - name: Upload reproducible WASM build
         uses: actions/upload-artifact@v4
