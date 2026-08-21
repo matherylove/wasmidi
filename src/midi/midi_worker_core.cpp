@@ -23,7 +23,12 @@ std::vector<uint8_t> g_result;
 std::string g_error;
 
 #ifdef __EMSCRIPTEN__
-EM_JS(void, wmp_post_progress, (int percent, const char* stage), {
+EM_JS(void, wmp_post_progress, (int percent, double stageAddress), {
+    // Memory64 C/C++ pointers are i64 and enter JavaScript as BigInt. Do not
+    // pass a raw const char* into UTF8ToString(): Emscripten 3.1.56 asserts
+    // that UTF8ToString receives a Number. C++ legalizes the pointer to f64
+    // first; the current <=16 GiB Memory64 address range is exactly representable.
+    const stage = Number(stageAddress);
     const stageText = stage ? UTF8ToString(stage) : "Parsing MIDI";
     const absolutePercent = 15 + Math.floor(
         Math.max(0, Math.min(100, percent | 0)) * 0.79);
@@ -49,7 +54,8 @@ EM_JS(void, wmp_post_progress, (int percent, const char* stage), {
     }
 });
 
-EM_JS(void, wmp_post_absolute_progress, (int percent, const char* stage), {
+EM_JS(void, wmp_post_absolute_progress, (int percent, double stageAddress), {
+    const stage = Number(stageAddress);
     const stageText = stage ? UTF8ToString(stage) : "Loading MIDI";
     const absolutePercent = Math.max(0, Math.min(100, percent | 0));
 
@@ -75,7 +81,10 @@ EM_JS(void, wmp_post_absolute_progress, (int percent, const char* stage), {
 void progressCallback(void*, int percent, const char* stage)
 {
 #ifdef __EMSCRIPTEN__
-    wmp_post_progress(percent, stage);
+    const double stageAddress = stage
+        ? static_cast<double>(reinterpret_cast<std::uintptr_t>(stage))
+        : 0.0;
+    wmp_post_progress(percent, stageAddress);
 #else
     (void)percent;
     (void)stage;
@@ -172,7 +181,10 @@ int packDocument()
 {
     try {
     #ifdef __EMSCRIPTEN__
-        wmp_post_absolute_progress(94, "Packing parsed MIDI");
+        wmp_post_absolute_progress(
+            94,
+            static_cast<double>(reinterpret_cast<std::uintptr_t>(
+                "Packing parsed MIDI")));
     #endif
 
         if (!wasmidi::serializeMidiDocument(
@@ -187,7 +199,10 @@ int packDocument()
         g_document = wasmidi::MidiDocument{};
 
     #ifdef __EMSCRIPTEN__
-        wmp_post_absolute_progress(95, "Parsed");
+        wmp_post_absolute_progress(
+            95,
+            static_cast<double>(reinterpret_cast<std::uintptr_t>(
+                "Parsed")));
     #endif
         return 1;
     } catch (const std::bad_alloc&) {

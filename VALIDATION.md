@@ -121,3 +121,14 @@ future fatal runtime error reports its actual reason and stage instead of only
 - The remaining mandatory CI check is execution of the *generated* Memory64
   Emscripten module under Node 24; it must complete both the minimal MIDI and
   dense 250k-note smoke parse without any BigInt conversion error.
+
+## Pass 12.7 — Memory64 progress callback ABI hotfix
+
+The Memory64 parser's public API was already Number-only, but parser progress
+callbacks still passed a raw `const char*` through `EM_JS`. Emscripten 3.1.56
+represents that wasm64 pointer as JavaScript `BigInt`, while `UTF8ToString`
+requires a `Number`. Pass 12.7 legalizes progress-stage pointers to `double` in
+C++ before entering JavaScript, so progress reporting uses the same JS-safe ABI
+as the parser's exported data/result/error paths. The browser Worker/core URLs
+are cache-busted to 12.7, and CI requires at least one decoded string progress
+stage during the generated Memory64 parser smoke test.

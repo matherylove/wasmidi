@@ -251,3 +251,14 @@ exact integer addresses internally to `uintptr_t`/`size_t`. The current 16 GiB
 Memory64 ceiling is far below JavaScript's exact-integer limit (2^53), so no
 address precision is lost. The raw MIDI data and parser output remain in
 Memory64; this change only stabilizes the JS/WASM call ABI.
+
+## Pass 12.7 — Memory64 progress callback ABI hotfix
+
+The Memory64 parser's public API was already Number-only, but parser progress
+callbacks still passed a raw `const char*` through `EM_JS`. Emscripten 3.1.56
+represents that wasm64 pointer as JavaScript `BigInt`, while `UTF8ToString`
+requires a `Number`. Pass 12.7 legalizes progress-stage pointers to `double` in
+C++ before entering JavaScript, so progress reporting uses the same JS-safe ABI
+as the parser's exported data/result/error paths. The browser Worker/core URLs
+are cache-busted to 12.7, and CI requires at least one decoded string progress
+stage during the generated Memory64 parser smoke test.

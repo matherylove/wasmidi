@@ -133,7 +133,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 12.6 parser is not Memory64.");
+        throw new Error("Generated Pass 12.7 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -181,10 +181,24 @@ async function main() {
 
     Module._wmp_release_result();
 
-    if (!parserProgressMessages.some(message =>
-            message && message.type === "progress")) {
+    const validProgress = parserProgressMessages.some(message =>
+        message &&
+        message.type === "progress" &&
+        typeof message.stage === "string" &&
+        message.stage.length > 0 &&
+        Number.isFinite(Number(message.percent)));
+    if (!validProgress) {
         throw new Error(
-            "Parser smoke test completed without exercising progress callbacks.");
+            "Parser smoke test did not receive a decoded string progress stage.");
+    }
+
+    // Memory64 progress callbacks must legalize const char* to Number before
+    // entering EM_JS. A raw wasm64 pointer would surface as BigInt and make
+    // Emscripten's UTF8ToString assert before this point.
+    if (parserProgressMessages.some(message =>
+            message && typeof message.stage !== "string")) {
+        throw new Error(
+            "Parser progress callback leaked a non-string Memory64 stage value.");
     }
 
     // Exercise a real dense crashpoint after the bootstrap MIDI. Keeping this
@@ -230,7 +244,7 @@ async function main() {
     Module._wmp_release_result();
 
     console.log(
-        "MIDI parser Memory64 JS-safe ABI bootstrap/dense parse smoke test OK");
+        "MIDI parser Memory64 progress-ABI/bootstrap/dense parse smoke test OK");
 }
 
 main().catch(error => {

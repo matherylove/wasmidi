@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 12.6: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
+// Pass 12.7: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
 // memory to 16 GiB; physical pages are committed on demand, so the effective
 // limit below that is whatever the browser/OS can actually provide.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.6";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.7";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
@@ -143,7 +143,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 12.6 parser was built without Memory64 (pointer width " +
+                    "Pass 12.7 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 
