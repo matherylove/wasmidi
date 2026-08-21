@@ -194,22 +194,6 @@ void main()
             yTop,
             useTop);
 
-    // SharpMIDI's duration-depth trick dramatically reduces fragment overdraw
-    // on dense same-pitch rectangles. Shorter notes win the depth test.
-    float duration =
-        max(
-            0.0,
-            float(
-                endTick -
-                aStartTick));
-
-    float z =
-        clamp(
-            duration /
-            16777216.0,
-            0.0,
-            0.999);
-
     vColor =
         uPalette[
             int(colorIndex)];
@@ -226,7 +210,7 @@ void main()
         vec4(
             x,
             y,
-            z,
+            0.0,
             1.0);
 }
 )GLSL";
@@ -566,11 +550,11 @@ void main()
             neuralVertex,
             neuralFragment);
 
-    if (!noteProgram_ ||
-        !backgroundProgram_ ||
-        !neuralProgram_) {
+    // The horizontal note program is the only mandatory pipeline.
+    // Background/neural effects are optional accelerations and must never make
+    // the piano roll disappear if a browser/driver rejects one of their shaders.
+    if (!noteProgram_)
         return false;
-    }
 
     viewStartUniform_ =
         glGetUniformLocation(
@@ -592,30 +576,34 @@ void main()
             noteProgram_,
             "uPalette[0]");
 
-    backgroundHueUniform_ =
-        glGetUniformLocation(
-            backgroundProgram_,
-            "uHue");
+    if (backgroundProgram_) {
+        backgroundHueUniform_ =
+            glGetUniformLocation(
+                backgroundProgram_,
+                "uHue");
 
-    backgroundActivityUniform_ =
-        glGetUniformLocation(
-            backgroundProgram_,
-            "uActivity");
+        backgroundActivityUniform_ =
+            glGetUniformLocation(
+                backgroundProgram_,
+                "uActivity");
 
-    backgroundAspectUniform_ =
-        glGetUniformLocation(
-            backgroundProgram_,
-            "uAspect");
+        backgroundAspectUniform_ =
+            glGetUniformLocation(
+                backgroundProgram_,
+                "uAspect");
+    }
 
-    neuralHueUniform_ =
-        glGetUniformLocation(
-            neuralProgram_,
-            "uHue");
+    if (neuralProgram_) {
+        neuralHueUniform_ =
+            glGetUniformLocation(
+                neuralProgram_,
+                "uHue");
 
-    neuralPointModeUniform_ =
-        glGetUniformLocation(
-            neuralProgram_,
-            "uPointMode");
+        neuralPointModeUniform_ =
+            glGetUniformLocation(
+                neuralProgram_,
+                "uPointMode");
+    }
 
     return true;
 }
@@ -1260,31 +1248,48 @@ void GLRenderer::renderBackground()
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
 
-    glUseProgram(
-        backgroundProgram_);
+    if (backgroundProgram_) {
+        glUseProgram(
+            backgroundProgram_);
 
-    glUniform1f(
-        backgroundHueUniform_,
-        neuralHue_);
+        glUniform1f(
+            backgroundHueUniform_,
+            neuralHue_);
 
-    glUniform1f(
-        backgroundActivityUniform_,
-        neuralActivity_);
+        glUniform1f(
+            backgroundActivityUniform_,
+            neuralActivity_);
 
-    glUniform1f(
-        backgroundAspectUniform_,
-        float(width_) /
-        float(std::max(1, height_)));
+        glUniform1f(
+            backgroundAspectUniform_,
+            float(width_) /
+            float(std::max(1, height_)));
 
-    glBindVertexArray(
-        backgroundVao_);
+        glBindVertexArray(
+            backgroundVao_);
 
-    glDrawArrays(
-        GL_TRIANGLE_STRIP,
-        0,
-        4);
+        glDrawArrays(
+            GL_TRIANGLE_STRIP,
+            0,
+            4);
 
-    glBindVertexArray(0);
+        glBindVertexArray(0);
+        glUseProgram(0);
+    } else {
+        // Safe visual fallback: notes remain usable even if the optional
+        // background shader is rejected by a WebGL implementation.
+        glClearColor(
+            .010f,
+            .010f,
+            .026f,
+            1.0f);
+
+        glClear(
+            GL_COLOR_BUFFER_BIT);
+    }
+
+    if (!neuralProgram_)
+        return;
 
     glEnable(GL_BLEND);
 
@@ -2103,13 +2108,12 @@ void GLRenderer::renderRoll()
     if (openDirty_)
         uploadOpenNotes();
 
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
+    // Keep the note pipeline independent of a depth attachment. Qt/WASM's
+    // QQuickFramebufferObject composition is reliable with a color-only FBO;
+    // depth is an optional future optimization, not a rendering requirement.
+    glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
-
-    glClearDepthf(1.0f);
-    glClear(GL_DEPTH_BUFFER_BIT);
 
     glUseProgram(noteProgram_);
 
@@ -2230,8 +2234,6 @@ void GLRenderer::renderRoll()
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glUseProgram(0);
-
-    glDisable(GL_DEPTH_TEST);
 
     const float playheadFraction =
         std::clamp(

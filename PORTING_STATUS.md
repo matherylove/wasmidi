@@ -1,22 +1,24 @@
-# WASMIDI Pass 8.2.1 — horizontal visualizer restore
+# WASMIDI Pass 8.2.2 — horizontal roll pipeline recovery
 
-Apply on top of Pass 8.2.
+Apply on top of Pass 8.2.1.
 
-Pass 8.2 split the renderer into:
-- completedVao_/completedVbo_: main ring of completed notes
-- openVao_/openVbo_: at most 2048 currently held states
+A standalone renderer logic test proves the compact sweep/ring is producing
+non-zero note draw instances correctly. The remaining failure is therefore in
+the WebGL/FBO pipeline introduced by Pass 8.2.
 
-The open-note VAO was fully configured, but completedVao_ was only generated.
-Its StartTick, EndTick and PackedData arrays were never enabled and their
-divisors were never set.
+Changes:
+- Restores the proven color-only QQuickFramebufferObject used by the earlier
+  working renderer; CombinedDepthStencil is no longer required.
+- Disables depth testing for note rendering so depth attachment/state cannot
+  hide the horizontal roll.
+- Note shader uses explicit z=0.
+- The note shader is now the only mandatory GLSL program.
+- Background and neural shaders are optional. If either is rejected, notes
+  still initialize and render; background falls back to the original dark fill.
+- Keeps Pass 8/8.2 compact parser, TickGroup engine, scheduler removal, split
+  open/completed VBOs, contiguous uploads, GPU neural path when supported, and
+  single render-loop architecture.
 
-As a result, glDrawArraysInstanced() for the completed ring consumed constant
-zero vertex attributes and almost all normal MIDI notes were invisible.
-
-This overlay initializes completedVao_ with the same 12-byte RenderNote layout:
-- location 0: int StartTick, divisor 1
-- location 1: int EndTick, divisor 1
-- location 2: uint PackedData, divisor 1
-
-No parser, scheduler, layout, QML, background, keyboard, timing, color or FPS
-optimization is changed.
+Files:
+- src/renderer/gl_renderer.cpp
+- src/pianoroll.cpp

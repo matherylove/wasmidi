@@ -4,7 +4,6 @@
 #include "renderer/gl_renderer.hpp"
 
 #include <QOpenGLFramebufferObject>
-#include <QOpenGLFramebufferObjectFormat>
 #include <QQuickOpenGLUtils>
 #include <QQuickWindow>
 
@@ -47,21 +46,11 @@ public:
                     size.height() /
                     dpr_)));
 
-        // Pass 8 disabled depth entirely. Dense same-pitch notes therefore
-        // incurred full fragment overdraw. SharpMIDI relies on depth testing,
-        // so give the Qt FBO an actual depth/stencil attachment.
-        QOpenGLFramebufferObjectFormat
-            format;
-
-        format.setAttachment(
-            QOpenGLFramebufferObject::
-                CombinedDepthStencil);
-
-        format.setSamples(0);
-
+        // Color-only FBO is the proven Qt/WASM composition path used by the
+        // earlier working renderer. Depth/stencil must not be required for
+        // basic note visibility.
         return new QOpenGLFramebufferObject(
-            cssSize,
-            format);
+            cssSize);
     }
 
     void synchronize(
