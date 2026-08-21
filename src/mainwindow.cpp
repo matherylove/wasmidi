@@ -59,31 +59,111 @@ void wasmidi_browser_file_selected(
 // Stream the browser File directly into one WASM allocation instead of
 // File.arrayBuffer() + Uint8Array + HEAP copy. This removes the second full
 // file-sized JS allocation during loading and yields between stream chunks.
-EM_JS(void, wasmidi_browser_open_midi_picker, (), {
-    let input = document.getElementById('wasmidi-midi-file-input');
+EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
+    /*
+     * One single native browser file picker for BOTH MIDI and SF2.
+     *
+     * kind == 0 -> MIDI
+     * kind == 1 -> SoundFont 2
+     *
+     * This is deliberately the exact same DOM/user-gesture path for both
+     * formats. The only differences are the accept filter and what happens
+     * after a File has already been selected.
+     */
+    const isSf2 =
+        (kind | 0) === 1;
 
-    if (!input) {
-        input = document.createElement('input');
-        input.id = 'wasmidi-midi-file-input';
-        input.type = 'file';
-        input.accept = '.mid,.midi,audio/midi,audio/x-midi';
-        input.style.position = 'fixed';
-        input.style.left = '-10000px';
-        input.style.top = '-10000px';
-        input.style.width = '1px';
-        input.style.height = '1px';
-        input.style.opacity = '0';
-        document.body.appendChild(input);
-    }
+    console.debug(
+        '[WASMIDI picker] opening',
+        isSf2 ? 'SF2' : 'MIDI');
+
+    const input =
+        document.createElement(
+            'input');
+
+    input.type = 'file';
+
+    input.accept =
+        isSf2
+            ? '.sf2'
+            : '.mid,.midi,audio/midi,audio/x-midi';
+
+    input.style.position = 'fixed';
+    input.style.left = '-10000px';
+    input.style.top = '-10000px';
+    input.style.width = '1px';
+    input.style.height = '1px';
+    input.style.opacity = '0';
+
+    document.body.appendChild(
+        input);
+
+    const cleanup = () => {
+        try {
+            input.onchange = null;
+
+            if (input.parentNode)
+                input.parentNode.removeChild(
+                    input);
+        } catch (_) {}
+    };
 
     input.onchange = async () => {
         const file =
-            input.files && input.files.length
+            input.files &&
+            input.files.length
                 ? input.files[0]
                 : null;
 
         if (!file) {
-            input.value = null;
+            cleanup();
+            return;
+        }
+
+        if (isSf2) {
+            try {
+                let bridge =
+                    globalThis.WasmidiSnappyBridge;
+
+                if (!bridge) {
+                    await new Promise(
+                        (resolve, reject) => {
+                            const script =
+                                document.createElement(
+                                    'script');
+
+                            script.src =
+                                './snappysynth_bridge.js';
+
+                            script.async = false;
+                            script.onload = resolve;
+                            script.onerror = reject;
+
+                            document.head.appendChild(
+                                script);
+                        });
+
+                    bridge =
+                        globalThis.WasmidiSnappyBridge;
+                }
+
+                if (!bridge ||
+                    typeof bridge.loadSoundfontFile !==
+                        'function') {
+                    throw new Error(
+                        'SnappySynthV2 bridge is unavailable.');
+                }
+
+                await bridge.loadSoundfontFile(
+                    file);
+            } catch (error) {
+                console.error(
+                    '[WASMIDI] Could not load selected SF2:',
+                    error);
+            } finally {
+                cleanup();
+            }
+
             return;
         }
 
@@ -91,53 +171,74 @@ EM_JS(void, wasmidi_browser_open_midi_picker, (), {
         let namePtr = 0;
 
         try {
-            if (file.size > 0x7fffffff)
-                throw new Error('MIDI is too large for this wasm32 build.');
+            if (file.size > 0x7fffffff) {
+                throw new Error(
+                    'MIDI is too large for this wasm32 build.');
+            }
 
-            dataPtr = _malloc(Math.max(1, file.size));
+            dataPtr =
+                _malloc(
+                    Math.max(
+                        1,
+                        file.size));
 
-            if (!dataPtr)
-                throw new Error('Could not allocate WASM memory for MIDI.');
+            if (!dataPtr) {
+                throw new Error(
+                    'Could not allocate WASM memory for MIDI.');
+            }
 
             let offset = 0;
 
             if (file.stream) {
-                const reader = file.stream().getReader();
+                const reader =
+                    file.stream().getReader();
 
                 while (true) {
-                    const result = await reader.read();
+                    const result =
+                        await reader.read();
 
                     if (result.done)
                         break;
 
-                    const chunk = result.value;
+                    const chunk =
+                        result.value;
 
                     HEAPU8.set(
                         chunk,
                         dataPtr + offset);
 
-                    offset += chunk.byteLength;
+                    offset +=
+                        chunk.byteLength;
                 }
             } else {
-                // Compatibility fallback for older browsers.
                 const bytes =
                     new Uint8Array(
                         await file.arrayBuffer());
 
-                HEAPU8.set(bytes, dataPtr);
-                offset = bytes.length;
+                HEAPU8.set(
+                    bytes,
+                    dataPtr);
+
+                offset =
+                    bytes.length;
             }
 
             const nameBytes =
                 new TextEncoder().encode(
-                    file.name || 'browser.mid');
+                    file.name ||
+                    'browser.mid');
 
             namePtr =
                 _malloc(
-                    Math.max(1, nameBytes.length));
+                    Math.max(
+                        1,
+                        nameBytes.length));
 
-            if (nameBytes.length)
-                HEAPU8.set(nameBytes, namePtr);
+            if (nameBytes.length) {
+                HEAPU8.set(
+                    nameBytes,
+                    namePtr);
+            }
 
             _wasmidi_browser_file_selected(
                 dataPtr,
@@ -155,10 +256,14 @@ EM_JS(void, wasmidi_browser_open_midi_picker, (), {
             if (dataPtr)
                 _free(dataPtr);
 
-            input.value = null;
+            cleanup();
         }
     };
 
+    /*
+     * IMPORTANT: this is synchronous and happens before AudioContext,
+     * Worker creation, promises, bridge loading, or file processing.
+     */
     input.click();
 });
 
@@ -207,134 +312,7 @@ EM_JS(int, wasmidi_snappy_copy_string, (int which, char* dst, int capacity), {
     return lengthBytesUTF8(text);
 });
 
-EM_JS(void, wasmidi_snappy_open_soundfont, (), {
-    /*
-     * The native file picker MUST be opened synchronously from this call,
-     * because this call is reached directly from the QML button's user gesture.
-     *
-     * Do not depend on WasmidiSnappyBridge being loaded yet: the previous
-     * implementation simply did nothing when the bridge script had not
-     * initialized, which made "Load SF2" appear dead.
-     */
-    let input =
-        document.getElementById(
-            'wasmidi-snappysynth-sf2-input');
 
-    if (!input) {
-        input =
-            document.createElement(
-                'input');
-
-        input.id =
-            'wasmidi-snappysynth-sf2-input';
-
-        input.type = 'file';
-
-        input.accept =
-            '.sf2,audio/x-soundfont,application/octet-stream';
-
-        input.style.position = 'fixed';
-        input.style.left = '-10000px';
-        input.style.top = '-10000px';
-        input.style.width = '1px';
-        input.style.height = '1px';
-        input.style.opacity = '0';
-
-        document.body.appendChild(input);
-
-        input.onchange = async () => {
-            const file =
-                input.files &&
-                input.files.length
-                    ? input.files[0]
-                    : null;
-
-            // Allow selecting the same SF2 again later.
-            input.value = null;
-
-            if (!file)
-                return;
-
-            try {
-                let bridge =
-                    globalThis.WasmidiSnappyBridge;
-
-                // Recovery path if the deployment loaded Qt before the bridge
-                // script for any reason. The picker has already been opened
-                // under the original user gesture, so loading the bridge here
-                // cannot cause the browser to block the dialog.
-                if (!bridge) {
-                    await new Promise(
-                        (resolve, reject) => {
-                            const existing =
-                                document.querySelector(
-                                    'script[data-wasmidi-snappy-bridge]');
-
-                            if (existing) {
-                                if (globalThis.WasmidiSnappyBridge) {
-                                    resolve();
-                                    return;
-                                }
-
-                                existing.addEventListener(
-                                    'load',
-                                    resolve,
-                                    { once: true });
-
-                                existing.addEventListener(
-                                    'error',
-                                    reject,
-                                    { once: true });
-
-                                return;
-                            }
-
-                            const script =
-                                document.createElement(
-                                    'script');
-
-                            script.src =
-                                './snappysynth_bridge.js';
-
-                            script.async = false;
-
-                            script.dataset.wasmidiSnappyBridge =
-                                '1';
-
-                            script.onload = resolve;
-                            script.onerror = reject;
-
-                            document.head.appendChild(
-                                script);
-                        });
-
-                    bridge =
-                        globalThis.WasmidiSnappyBridge;
-                }
-
-                if (!bridge)
-                    throw new Error(
-                        'SnappySynthV2 bridge is not available.');
-
-                if (bridge.loadSoundfontFile) {
-                    await bridge.loadSoundfontFile(file);
-                } else if (bridge.openSoundfontWithFile) {
-                    await bridge.openSoundfontWithFile(file);
-                } else {
-                    throw new Error(
-                        'SnappySynthV2 bridge does not expose an SF2 loader.');
-                }
-            } catch (error) {
-                console.error(
-                    '[WASMIDI] Could not load selected SF2:',
-                    error);
-            }
-        };
-    }
-
-    // Keep click() synchronous with the QML user gesture.
-    input.click();
-});
 
 EM_JS(void, wasmidi_snappy_play, (double time, int reset), {
     const b = globalThis.WasmidiSnappyBridge;
@@ -564,7 +542,7 @@ bool MainWindow::loadMidiRaw(
 void MainWindow::openMidiPicker()
 {
 #ifdef __EMSCRIPTEN__
-    wasmidi_browser_open_midi_picker();
+    wasmidi_browser_open_file_picker(0);
 #else
     emit loadFailed(
         QStringLiteral(
@@ -575,7 +553,7 @@ void MainWindow::openMidiPicker()
 void MainWindow::openSoundfontPicker()
 {
 #ifdef __EMSCRIPTEN__
-    wasmidi_snappy_open_soundfont();
+    wasmidi_browser_open_file_picker(1);
 #else
     synthStatus_ = QStringLiteral("SnappySynthV2 SF2 picker is available in the WebAssembly build.");
     emit synthStateChanged();

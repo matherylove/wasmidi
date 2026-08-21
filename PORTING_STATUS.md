@@ -1,27 +1,30 @@
-# WASMIDI Pass 9.1 — SF2 native picker fix
+# WASMIDI Pass 9.2 — exact unified MIDI/SF2 picker
 
-Apply on top of Pass 9.
+Apply on top of Pass 9.1.
 
-## Fixed
+The separate SF2 picker path has been removed completely.
 
-The Load SF2 button previously called `WasmidiSnappyBridge.openSoundfont()`.
-If `snappysynth_bridge.js` had not initialized yet, the C++ EM_JS function
-silently returned and no Windows/browser file picker appeared.
+Both:
+- MainWindow::openMidiPicker()
+- MainWindow::openSoundfontPicker()
 
-Pass 9.1 makes the browser `<input type=file>` picker owned by the synchronous
-EM_JS call reached directly from the QML click gesture. Therefore the SF2
-dialog no longer depends on AudioContext, Worker, COI, or bridge readiness.
+now call the SAME Emscripten function:
 
-After a file is selected:
-1. the code uses `WasmidiSnappyBridge.loadSoundfontFile(file)`;
-2. if the bridge script is unexpectedly missing, it loads
-   `snappysynth_bridge.js` dynamically and then passes the already-selected
-   File object to it;
-3. selecting the same SF2 twice is supported.
+    wasmidi_browser_open_file_picker(kind)
 
-The bridge's existing `openSoundfont()` remains available as a compatibility
-fallback, but WASMIDI's QML button no longer relies on it.
+with:
+- kind=0 for MIDI
+- kind=1 for SF2
 
-Files:
-- src/mainwindow.cpp
-- web/snappysynth_bridge.js
+The DOM code, input creation, append-to-body, synchronous input.click(), and
+cleanup path are identical. Only the accept filter and post-selection handler
+differ.
+
+A fresh input element is created for every click. No input is shared with the
+SnappySynth bridge and there is no stale picker state.
+
+No AudioContext, Worker, Promise, or SnappySynth initialization happens before
+input.click().
+
+This means that if the MIDI browser prompt opens on a given browser, SF2 now
+uses exactly that same working prompt mechanism.
