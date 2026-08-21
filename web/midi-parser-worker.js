@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 12.5: parser is a Memory64 module. Chromium 133+ can grow one wasm64
+// Pass 12.6: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
 // memory to 16 GiB; physical pages are committed on demand, so the effective
 // limit below that is whatever the browser/OS can actually provide.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.5";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.6";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
@@ -52,12 +52,6 @@ function isMemory64() {
     return pointerBits === 64;
 }
 
-function abiSize(value) {
-    const n = Number(value);
-    if (!Number.isSafeInteger(n) || n < 0)
-        throw new Error("MIDI size exceeds JavaScript's exact integer range.");
-    return isMemory64() ? BigInt(n) : n;
-}
 
 function pointerToNumber(value, label) {
     const n = typeof value === "bigint" ? Number(value) : Number(value);
@@ -71,6 +65,29 @@ function sizeToNumber(value, label) {
     if (!Number.isSafeInteger(n) || n < 0)
         throw new Error((label || "WASM size") + " exceeds JavaScript's exact integer range.");
     return n;
+}
+
+
+function parserErrorText(Module, fallback) {
+    const address = Number(Module._wmp_error_ptr_js());
+    const byteLength = Number(Module._wmp_error_size_js());
+
+    if (!Number.isSafeInteger(address) || address < 0 ||
+        !Number.isSafeInteger(byteLength) || byteLength < 0 ||
+        !address || !byteLength) {
+        return String(fallback || "Could not parse MIDI");
+    }
+
+    const end = address + byteLength;
+    if (!Number.isSafeInteger(end) || end > Module.HEAPU8.length)
+        return String(fallback || "Could not parse MIDI");
+
+    try {
+        return new TextDecoder("utf-8", { fatal: false }).decode(
+            Module.HEAPU8.subarray(address, end));
+    } catch (_) {
+        return String(fallback || "Could not parse MIDI");
+    }
 }
 
 function getModule() {
@@ -108,15 +125,16 @@ function getModule() {
             })
         ).then(Module => {
             if (!Module ||
-                typeof Module._wmp_parse !== "function" ||
+                typeof Module._wmp_alloc_js !== "function" ||
+                typeof Module._wmp_free_js !== "function" ||
+                typeof Module._wmp_parse_js !== "function" ||
                 typeof Module._wmp_pack !== "function" ||
-                typeof Module._wmp_result_ptr !== "function" ||
-                typeof Module._wmp_result_size !== "function" ||
+                typeof Module._wmp_result_ptr_js !== "function" ||
+                typeof Module._wmp_result_size_js !== "function" ||
                 typeof Module._wmp_release_result !== "function" ||
-                typeof Module._wmp_error_ptr !== "function" ||
+                typeof Module._wmp_error_ptr_js !== "function" ||
+                typeof Module._wmp_error_size_js !== "function" ||
                 typeof Module._wmp_pointer_bits !== "function" ||
-                typeof Module._malloc !== "function" ||
-                typeof Module._free !== "function" ||
                 !Module.HEAPU8) {
                 throw new Error(
                     "parser WASM initialized without its complete exported API");
@@ -125,9 +143,19 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 12.5 parser was built without Memory64 (pointer width " +
+                    "Pass 12.6 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
+
+            // Probe the public ABI before accepting any user file. The facade
+            // must remain Number-only even though the module itself is wasm64.
+            const abiProbe = Module._wmp_alloc_js(1);
+            if (typeof abiProbe !== "number" ||
+                !Number.isSafeInteger(abiProbe) || abiProbe <= 0) {
+                throw new Error(
+                    "Memory64 parser JS facade did not return a Number address.");
+            }
+            Module._wmp_free_js(abiProbe);
 
             self.__wasmidiMidiParserStage = "Memory64 parser core ready";
             self.__wasmidiMidiParserPercent = 15;
@@ -260,7 +288,7 @@ self.onmessage = async event => {
         Module = await getModule();
 
         self.__wasmidiMidiParserStage = "Allocating parser memory on demand";
-        inputPtr = Module._malloc(abiSize(Math.max(1, total)));
+        inputPtr = Module._wmp_alloc_js(Math.max(1, total));
         if (!inputPtr) {
             throw new Error(
                 "The browser/OS could not commit enough Memory64 pages for this MIDI. " +
@@ -270,28 +298,22 @@ self.onmessage = async event => {
         await streamFileIntoWasm(file, Module, inputPtr);
 
         self.__wasmidiMidiParserStage = "Parsing MIDI";
-        const ok = Module._wmp_parse(inputPtr, abiSize(total));
+        const ok = Module._wmp_parse_js(inputPtr, total);
         if (!ok) {
-            const errorPtr = Module._wmp_error_ptr();
-            const error = errorPtr
-                ? Module.UTF8ToString(errorPtr)
-                : "Could not parse MIDI";
-            throw new Error(error);
+            throw new Error(
+                parserErrorText(Module, "Could not parse MIDI"));
         }
 
         // Parsing owns everything needed. Release the raw file allocation before
         // packing so input + document + wire image are never all resident.
-        Module._free(inputPtr);
+        Module._wmp_free_js(inputPtr);
         inputPtr = null;
 
         self.__wasmidiMidiParserStage = "Packing parsed MIDI";
         const packed = Module._wmp_pack();
         if (!packed) {
-            const errorPtr = Module._wmp_error_ptr();
-            const error = errorPtr
-                ? Module.UTF8ToString(errorPtr)
-                : "Could not pack parsed MIDI";
-            throw new Error(error);
+            throw new Error(
+                parserErrorText(Module, "Could not pack parsed MIDI"));
         }
         resultOwned = true;
 
@@ -300,8 +322,8 @@ self.onmessage = async event => {
         await streamPackedResult(
             Module,
             file,
-            Module._wmp_result_ptr(),
-            Module._wmp_result_size());
+            Module._wmp_result_ptr_js(),
+            Module._wmp_result_size_js());
 
         // Every chunk has been copied to a transferable buffer. Drop the giant
         // parser-side capacity immediately; the next MIDI starts from a clean
@@ -324,7 +346,7 @@ self.onmessage = async event => {
         });
     } finally {
         if (inputPtr && Module) {
-            try { Module._free(inputPtr); } catch (_) {}
+            try { Module._wmp_free_js(inputPtr); } catch (_) {}
         }
         if (resultOwned && Module) {
             try { Module._wmp_release_result(); } catch (_) {}

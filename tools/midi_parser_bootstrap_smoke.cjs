@@ -21,9 +21,6 @@ if (typeof globalThis.postMessage !== "function") {
 
 let parserPointerBits = 0;
 
-function abiSize(value) {
-    return parserPointerBits === 64 ? BigInt(value) : value;
-}
 
 function ptrNumber(value) {
     const n = typeof value === "bigint" ? Number(value) : Number(value);
@@ -37,6 +34,19 @@ function sizeNumber(value) {
     if (!Number.isSafeInteger(n) || n < 0)
         throw new Error("Generated parser returned an unsafe size.");
     return n;
+}
+
+
+function parserErrorText(Module, fallback) {
+    const address = Number(Module._wmp_error_ptr_js());
+    const byteLength = Number(Module._wmp_error_size_js());
+    if (!Number.isSafeInteger(address) || address < 0 ||
+        !Number.isSafeInteger(byteLength) || byteLength < 0 ||
+        !address || !byteLength) {
+        return fallback;
+    }
+    return new TextDecoder().decode(
+        Module.HEAPU8.subarray(address, address + byteLength));
 }
 
 function makeDenseCrashMidi(noteCount) {
@@ -106,15 +116,16 @@ async function main() {
         throw new Error("Parser aborted during bootstrap: " + abortReason);
 
     for (const name of [
-        "_wmp_parse",
+        "_wmp_alloc_js",
+        "_wmp_free_js",
+        "_wmp_parse_js",
         "_wmp_pack",
-        "_wmp_result_ptr",
-        "_wmp_result_size",
+        "_wmp_result_ptr_js",
+        "_wmp_result_size_js",
         "_wmp_release_result",
-        "_wmp_error_ptr",
+        "_wmp_error_ptr_js",
+        "_wmp_error_size_js",
         "_wmp_pointer_bits",
-        "_malloc",
-        "_free"
     ]) {
         if (typeof Module[name] !== "function")
             throw new Error("Missing generated export " + name);
@@ -122,7 +133,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 12.5 parser is not Memory64.");
+        throw new Error("Generated Pass 12.6 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -136,35 +147,35 @@ async function main() {
         0x00, 0xff, 0x2f, 0x00
     ]);
 
-    const ptr = Module._malloc(abiSize(midi.length));
-    if (!ptr)
-        throw new Error("Parser smoke test malloc failed.");
+    const ptr = Module._wmp_alloc_js(midi.length);
+    if (typeof ptr !== "number" || !Number.isSafeInteger(ptr) || ptr <= 0)
+        throw new Error(
+            "Parser JS-safe allocator did not return an exact Number address.");
 
     try {
         Module.HEAPU8.set(midi, ptrNumber(ptr));
-        if (!Module._wmp_parse(ptr, abiSize(midi.length))) {
-            const ep = Module._wmp_error_ptr();
-            const detail = ep
-                ? Module.UTF8ToString(ep)
-                : "unknown parse failure";
-            throw new Error("Parser rejected smoke-test MIDI: " + detail);
+        if (!Module._wmp_parse_js(ptr, midi.length)) {
+            throw new Error(
+                "Parser rejected smoke-test MIDI: " +
+                parserErrorText(Module, "unknown parse failure"));
         }
     } finally {
         // Production frees the raw MIDI allocation before packing too. Keep the
         // smoke test on the same lifetime boundary so CI exercises that API.
-        Module._free(ptr);
+        Module._wmp_free_js(ptr);
     }
 
     if (!Module._wmp_pack()) {
-        const ep = Module._wmp_error_ptr();
-        const detail = ep
-            ? Module.UTF8ToString(ep)
-            : "unknown pack failure";
-        throw new Error("Parser could not pack smoke-test MIDI: " + detail);
+        throw new Error(
+            "Parser could not pack smoke-test MIDI: " +
+            parserErrorText(Module, "unknown pack failure"));
     }
 
-    const resultPtr = Module._wmp_result_ptr();
-    const resultSize = sizeNumber(Module._wmp_result_size());
+    const resultPtr = Module._wmp_result_ptr_js();
+    const resultSizeRaw = Module._wmp_result_size_js();
+    if (typeof resultPtr !== "number" || typeof resultSizeRaw !== "number")
+        throw new Error("Parser result facade leaked a non-Number wasm64 value.");
+    const resultSize = sizeNumber(resultSizeRaw);
     if (!resultPtr || resultSize === 0)
         throw new Error("Parser produced an empty serialized document.");
 
@@ -181,31 +192,31 @@ async function main() {
     // starts/ends, zero-length minimum duration, phased parse/pack, and reuse
     // after releasing the previous serialized result.
     const denseMidi = makeDenseCrashMidi(250000);
-    const densePtr = Module._malloc(abiSize(denseMidi.length));
-    if (!densePtr)
-        throw new Error("Dense parser smoke-test malloc failed.");
+    const densePtr = Module._wmp_alloc_js(denseMidi.length);
+    if (typeof densePtr !== "number" ||
+        !Number.isSafeInteger(densePtr) || densePtr <= 0) {
+        throw new Error("Dense parser allocator leaked a non-Number address.");
+    }
 
     try {
         Module.HEAPU8.set(denseMidi, ptrNumber(densePtr));
-        if (!Module._wmp_parse(densePtr, abiSize(denseMidi.length))) {
-            const ep = Module._wmp_error_ptr();
+        if (!Module._wmp_parse_js(densePtr, denseMidi.length)) {
             throw new Error(
                 "Parser rejected dense smoke-test MIDI: " +
-                (ep ? Module.UTF8ToString(ep) : "unknown parse failure"));
+                parserErrorText(Module, "unknown parse failure"));
         }
     } finally {
-        Module._free(densePtr);
+        Module._wmp_free_js(densePtr);
     }
 
     if (!Module._wmp_pack()) {
-        const ep = Module._wmp_error_ptr();
         throw new Error(
             "Parser could not pack dense smoke-test MIDI: " +
-            (ep ? Module.UTF8ToString(ep) : "unknown pack failure"));
+            parserErrorText(Module, "unknown pack failure"));
     }
 
-    const denseResultSize = sizeNumber(Module._wmp_result_size());
-    if (!Module._wmp_result_ptr() || denseResultSize === 0)
+    const denseResultSize = sizeNumber(Module._wmp_result_size_js());
+    if (!Module._wmp_result_ptr_js() || denseResultSize === 0)
         throw new Error("Dense parser smoke test produced an empty document.");
 
     // 250k duplicated crashpoint notes should remain compact enough that the
@@ -219,7 +230,7 @@ async function main() {
     Module._wmp_release_result();
 
     console.log(
-        "MIDI parser Memory64 bootstrap/dense parse smoke test OK");
+        "MIDI parser Memory64 JS-safe ABI bootstrap/dense parse smoke test OK");
 }
 
 main().catch(error => {

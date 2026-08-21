@@ -236,3 +236,18 @@ pages, up to the current 16 GiB Memory64 per-memory engine limit. File input and
 parser-result transport are streamed/chunked to avoid duplicate file-sized JS
 buffers. The Qt UI module is still wasm32 and can use up to its 4 GiB address
 space; documents larger than that require the future segmented-residency path.
+
+### Memory64 JavaScript ABI stability (Pass 12.6)
+
+The dedicated parser no longer exposes raw Memory64 pointers or `size_t` values
+to JavaScript. Emscripten/wasm64 can represent some raw exported i64 pointer
+parameters as `BigInt` while helper-returned addresses may be ordinary Numbers;
+mixing those representations caused CI/browser failures such as `Cannot convert
+4218976 to a BigInt`.
+
+Pass 12.6 exposes a small Number-only facade (`wmp_alloc_js`, `wmp_free_js`,
+`wmp_parse_js`, and Number-returning result/error accessors). C++ converts those
+exact integer addresses internally to `uintptr_t`/`size_t`. The current 16 GiB
+Memory64 ceiling is far below JavaScript's exact-integer limit (2^53), so no
+address precision is lost. The raw MIDI data and parser output remain in
+Memory64; this change only stabilizes the JS/WASM call ABI.

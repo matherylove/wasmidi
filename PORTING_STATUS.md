@@ -162,3 +162,18 @@ removing the previous full result-sized JS staging allocation.
 Qt remains wasm32 but is explicitly allowed to grow to its 4 GiB address-space
 ceiling. A parsed wire image larger than that is reported as requiring segmented
 player residency rather than being silently truncated through a 32-bit ABI.
+
+## Pass 12.6 — Memory64 JS ABI facade
+
+Memory64 itself was working, but CI exposed an Emscripten ABI mismatch: the raw
+`wmp_parse(const uint8_t*, size_t)` export required i64/BigInt arguments while
+the address returned by the allocation path was observed as a JavaScript Number.
+The generated module therefore rejected a valid pointer before parsing began.
+
+The parser now exports a deliberately Number-only JavaScript facade. Allocation,
+free, parse pointer/length, result pointer/size and error pointer cross the wasm
+boundary as f64 values. C++ validates that every value is a finite exact
+non-negative integer, then converts it to `uintptr_t`/`size_t`. This is exact for
+the parser's <=16 GiB address space (well below 2^53), removes all JS BigInt
+coercion ambiguity, and leaves the internal parser fully Memory64. Raw pointer
+exports and `_malloc`/`_free` are no longer part of the parser's public JS ABI.

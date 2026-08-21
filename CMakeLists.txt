@@ -112,7 +112,7 @@ if(EMSCRIPTEN)
         # they do not affect the real-time renderer or SnappySynth hot paths.
         "-sASSERTIONS=1"
         "-sINCOMING_MODULE_JS_API=['noInitialRun','noExitRuntime','onAbort','print','printErr']"
-        "-sEXPORTED_FUNCTIONS=['_wmp_parse','_wmp_pack','_wmp_result_ptr','_wmp_result_size','_wmp_release_result','_wmp_error_ptr','_wmp_pointer_bits','_malloc','_free']"
+        "-sEXPORTED_FUNCTIONS=['_wmp_alloc_js','_wmp_free_js','_wmp_parse_js','_wmp_pack','_wmp_result_ptr_js','_wmp_result_size_js','_wmp_release_result','_wmp_error_ptr_js','_wmp_error_size_js','_wmp_pointer_bits']"
         "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
     )
 

@@ -108,3 +108,16 @@ future fatal runtime error reports its actual reason and stage instead of only
 - Local syntax/native checks do not substitute for the authoritative Emscripten
   Memory64 link; CI must compile and execute the generated parser module before
   deployment.
+
+## Pass 12.6 Memory64 ABI validation
+
+- Parser Worker and generated-module smoke test now use only the Number-safe
+  facade exports: `_wmp_alloc_js`, `_wmp_free_js`, `_wmp_parse_js`,
+  `_wmp_result_ptr_js`, `_wmp_result_size_js`, and `_wmp_error_ptr_js`.
+- Native C++17 facade round-trip validated allocation -> parse -> free raw MIDI
+  -> pack -> result pointer/size -> release.
+- `node --check` passes for the Worker and smoke test.
+- The Worker and Qt picker cache-busters were advanced to `12.6`.
+- The remaining mandatory CI check is execution of the *generated* Memory64
+  Emscripten module under Node 24; it must complete both the minimal MIDI and
+  dense 250k-note smoke parse without any BigInt conversion error.
