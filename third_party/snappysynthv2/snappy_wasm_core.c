@@ -520,27 +520,70 @@ void ssw_send_sysex(const uint8_t* data, int length, uint32_t offset) {
     dispatch_sysex_data_at_qpc(data, length, g_render_cursor + (int64_t)offset);
 }
 
-uintptr_t ssw_render(const uint32_t* messages, const uint32_t* offsets,
-                     int count, int frames) {
-    if (!g_ready || frames <= 0) return 0;
-    if (frames > g_out_capacity_frames) {
-        float* next = (float*)realloc(g_out, sizeof(float) * (size_t)frames * (size_t)g_cfg.num_channels);
-        if (!next) return 0;
-        g_out = next;
-        g_out_capacity_frames = frames;
-    }
+static int ssw_render_to_buffer(float* out_buffer,
+                                const uint32_t* messages,
+                                const uint32_t* offsets,
+                                int count,
+                                int frames) {
+    if (!g_ready || !out_buffer || frames <= 0)
+        return 0;
 
     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
     for (int i = 0; i < count; ++i) {
         uint32_t offset = offsets ? offsets[i] : 0u;
-        if (offset >= (uint32_t)frames) offset = (uint32_t)(frames - 1);
-        dispatch_short_at_qpc(messages[i], g_render_cursor + (int64_t)offset);
+        if (offset >= (uint32_t)frames)
+            offset = (uint32_t)(frames - 1);
+        dispatch_short_at_qpc(
+            messages[i],
+            g_render_cursor + (int64_t)offset);
     }
 
-    memset(g_out, 0, sizeof(float) * (size_t)frames * (size_t)g_cfg.num_channels);
-    voice_render_float(g_out, frames);
+    memset(out_buffer,
+           0,
+           sizeof(float) * (size_t)frames * (size_t)g_cfg.num_channels);
+    voice_render_float(out_buffer, frames);
     g_render_cursor += frames;
+    return 1;
+}
+
+uintptr_t ssw_render(const uint32_t* messages, const uint32_t* offsets,
+                     int count, int frames) {
+    if (!g_ready || frames <= 0)
+        return 0;
+
+    if (frames > g_out_capacity_frames) {
+        float* next = (float*)realloc(
+            g_out,
+            sizeof(float) * (size_t)frames * (size_t)g_cfg.num_channels);
+        if (!next)
+            return 0;
+        g_out = next;
+        g_out_capacity_frames = frames;
+    }
+
+    if (!ssw_render_to_buffer(g_out, messages, offsets, count, frames))
+        return 0;
+
     return (uintptr_t)g_out;
+}
+
+/*
+ * Browser hot path: render directly into a caller-owned region inside the
+ * module's Shared WebAssembly.Memory.  The AudioWorklet can read that same
+ * SharedArrayBuffer, eliminating the old Worker -> transferable ArrayBuffer
+ * PCM copy without changing one DSP operation in voice_render_float().
+ */
+int ssw_render_into(uintptr_t out_ptr,
+                    const uint32_t* messages,
+                    const uint32_t* offsets,
+                    int count,
+                    int frames) {
+    return ssw_render_to_buffer(
+        (float*)out_ptr,
+        messages,
+        offsets,
+        count,
+        frames);
 }
 
 int ssw_active_voices(void) { return GetVoiceStats().active_voices; }

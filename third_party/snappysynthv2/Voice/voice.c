@@ -58,6 +58,9 @@ extern sfz_instrument* instrument;
 #include <xmmintrin.h>
 #include <immintrin.h>
 #endif
+#if defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#endif
 
 // ==============================
 // Config (tuneable) - EXTREME PERFORMANCE MODE
@@ -3029,6 +3032,8 @@ static inline int render_fast_stereo_sustain_batch(LONG queue_start,
     return count;
 }
 
+
+
 static inline void vor_merge_voice_stacked(voice *v, int stack_count) {
     if (!v || stack_count <= 0) return;
     if (stack_count > INT_MAX - v->vor_stack_count) {
@@ -3044,6 +3049,133 @@ static inline void vor_merge_voice_stacked(voice *v, int stack_count) {
             update_voice_steal_score((int)(v - voices), v);
         }
     }
+}
+#endif
+
+#if defined(__wasm_simd128__)
+#define FAST_STEREO_BATCH_VOICES_WASM 16
+typedef struct {
+    voice *v;
+    const int16_t *data;
+    int position;
+    float next_position;
+    v128_t scale;
+} fast_stereo_batch_voice_wasm;
+
+static inline int render_fast_stereo_sustain_batch_wasm(LONG queue_start,
+                                                          LONG queue_end,
+                                                          float *mix,
+                                                          int frames,
+                                                          LONG render_cycle,
+                                                          int check_key_off_counter) {
+    fast_stereo_batch_voice_wasm batch[FAST_STEREO_BATCH_VOICES_WASM];
+    int count = 0;
+    if (frames <= 0 || (frames & 7) != 0 || !mix) return 0;
+
+    for (LONG k = queue_start;
+         k < queue_end && count < FAST_STEREO_BATCH_VOICES_WASM;
+         ++k) {
+        int vid = g_render_queue[k];
+        if (vid < 0 || vid >= max_voices) break;
+#ifdef GPUMIX
+        if (load_relaxed_long(&g_gpu_cycle_active) && g_gpu_voice_cycle &&
+            g_gpu_voice_cycle[vid] == render_cycle) break;
+#else
+        (void)render_cycle;
+#endif
+        voice *v = &voices[vid];
+        if (!v->region || v->env_state != ENV_SUSTAIN ||
+            v->note_off_received || v->kill_now ||
+            v->pending_note_off_samples >= 0 || v->startup_samples != 0 ||
+            v->loop_mode == 1 || v->loop_mode == 2 ||
+            v->region_filter_enabled) break;
+#ifdef VOR
+        if (fabsf(v->vor_gain_scale - v->vor_gain_target) > 0.00001f) break;
+#endif
+        int ch = v->owner_channel;
+        if (ch < 0 || ch >= MIDI_CHANNEL_COUNT) break;
+        const channel_render_state *ch_render = &g_channel_render[ch];
+        if (ch_render->filter_enabled ||
+            (fabsf(v->portamento_offset) > 0.0001f &&
+             fabsf(v->portamento_step) > 0.0f) ||
+            fabsf(v->pitch_multiplier * ch_render->bend_pitch_mul - 1.0f) >=
+                FASTPATH_NO_INTERP_EPS) break;
+        if (check_key_off_counter &&
+            v->key >= 0 && v->key < MIDI_KEY_COUNT &&
+            v->key_order_id > 0 && g_key_off_counter &&
+            g_key_off_counter[ch][v->key] >= v->key_order_id) break;
+
+        wav_data *sample =
+            v->region->is_resampled ? v->region->resampled_data
+                                    : v->region->sample_data;
+        if (!sample || !sample->data || sample->num_channels != 2) break;
+        int sample_start =
+            (v->sample_start >= 0 && v->sample_start < sample->num_samples)
+                ? v->sample_start : 0;
+        int sample_end =
+            (v->sample_end > sample_start && v->sample_end <= sample->num_samples)
+                ? v->sample_end : sample->num_samples;
+        int position = (int)v->position;
+        if (position < sample_start || position + frames > sample_end) break;
+
+        float base_gain = v->base_gain * ch_render->gain_mul;
+#ifdef VOR
+        base_gain *= v->vor_gain_target;
+#endif
+        float gain_l = base_gain * ch_render->pan_l * v->region_pan_l;
+        float gain_r = base_gain * ch_render->pan_r * v->region_pan_r;
+        float env = v->env_level;
+        batch[count].v = v;
+        batch[count].data = (const int16_t*)sample->data;
+        batch[count].position = position;
+        batch[count].next_position = v->position + (float)frames;
+        batch[count].scale = wasm_f32x4_make(
+            gain_l * env, gain_r * env,
+            gain_l * env, gain_r * env);
+        ++count;
+    }
+
+    if (count < 2) return 0;
+
+    /* Four stereo frames per v128 lane group, eight frames per outer step. */
+    for (int frame = 0; frame < frames; frame += 8) {
+        int out = frame * 2;
+        v128_t acc0 = wasm_v128_load(mix + out);
+        v128_t acc1 = wasm_v128_load(mix + out + 4);
+        v128_t acc2 = wasm_v128_load(mix + out + 8);
+        v128_t acc3 = wasm_v128_load(mix + out + 12);
+
+        for (int b = 0; b < count; ++b) {
+            const int16_t *src =
+                batch[b].data + (batch[b].position + frame) * 2;
+
+            v128_t s16a = wasm_v128_load(src);
+            v128_t s16b = wasm_v128_load(src + 8);
+            v128_t a0 = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_low_i16x8(s16a));
+            v128_t a1 = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_high_i16x8(s16a));
+            v128_t a2 = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_low_i16x8(s16b));
+            v128_t a3 = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_high_i16x8(s16b));
+
+            acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(a0, batch[b].scale));
+            acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(a1, batch[b].scale));
+            acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(a2, batch[b].scale));
+            acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(a3, batch[b].scale));
+        }
+
+        wasm_v128_store(mix + out, acc0);
+        wasm_v128_store(mix + out + 4, acc1);
+        wasm_v128_store(mix + out + 8, acc2);
+        wasm_v128_store(mix + out + 12, acc3);
+    }
+
+    for (int b = 0; b < count; ++b)
+        batch[b].v->position = batch[b].next_position;
+
+    return count;
 }
 #endif
 
@@ -3817,11 +3949,16 @@ LONG idx = InterlockedAdd(&g_render_pop, pop_chunk) - pop_chunk;
 if (idx >= render_size) break;
 LONG end = idx + pop_chunk; if (end > render_size) end = render_size;
 for (LONG k = idx; k < end; ++k) {
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__wasm_simd128__)
 int fast_batch = 0;
 if (channels == 2) {
+#if defined(__AVX2__)
 fast_batch = render_fast_stereo_sustain_batch(
     k, end, mix, frames, render_cycle, check_key_off_counter);
+#elif defined(__wasm_simd128__)
+fast_batch = render_fast_stereo_sustain_batch_wasm(
+    k, end, mix, frames, render_cycle, check_key_off_counter);
+#endif
 }
 if (fast_batch > 0) {
 k += (LONG)fast_batch - 1;
@@ -4354,6 +4491,100 @@ if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 #endif
+#if defined(__wasm_simd128__)
+// WASM SIMD128 equivalents of the source AVX2 no-interpolation sustain paths.
+// Operations remain lane-local multiply + add in the same voice order, so the
+// DSP result is unchanged while avoiding the scalar WebAssembly fallback.
+if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
+    channels == 1 && s_ch == 1 && no_interp && env_state == ENV_SUSTAIN &&
+    !filter_enabled && !loop_active) {
+    int pi = (int)pos;
+    int avail = sample_end - pi;
+    int todo = frames;
+    if (avail < todo) todo = avail;
+    int vec4 = todo & ~3;
+    if (vec4 > 0) {
+        v128_t scale = wasm_f32x4_splat(gainL * env);
+        for (int j = 0; j < vec4; j += 4) {
+            v128_t s32 = wasm_i32x4_load16x4(data + pi + j);
+            v128_t vf = wasm_f32x4_convert_i32x4(s32);
+            v128_t dst = wasm_v128_load(mix + j);
+            wasm_v128_store(
+                mix + j,
+                wasm_f32x4_add(dst, wasm_f32x4_mul(vf, scale)));
+        }
+        pos += (float)vec4;
+        f_start = vec4;
+    }
+}
+
+if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
+    channels == 2 && s_ch == 1 && no_interp && env_state == ENV_SUSTAIN &&
+    !filter_enabled && !loop_active) {
+    int pi = (int)pos;
+    int avail = sample_end - pi;
+    int todo = frames;
+    if (avail < todo) todo = avail;
+    int vec4 = todo & ~3;
+    if (vec4 > 0) {
+        v128_t scale_l = wasm_f32x4_splat(gainL * env);
+        v128_t scale_r = wasm_f32x4_splat(gainR * env);
+        for (int j = 0; j < vec4; j += 4) {
+            v128_t s32 = wasm_i32x4_load16x4(data + pi + j);
+            v128_t vf = wasm_f32x4_convert_i32x4(s32);
+            v128_t vl = wasm_f32x4_mul(vf, scale_l);
+            v128_t vr = wasm_f32x4_mul(vf, scale_r);
+            v128_t out0 = wasm_v32x4_shuffle(vl, vr, 0, 4, 1, 5);
+            v128_t out1 = wasm_v32x4_shuffle(vl, vr, 2, 6, 3, 7);
+            int o = j * 2;
+            wasm_v128_store(
+                mix + o,
+                wasm_f32x4_add(wasm_v128_load(mix + o), out0));
+            wasm_v128_store(
+                mix + o + 4,
+                wasm_f32x4_add(wasm_v128_load(mix + o + 4), out1));
+        }
+        pos += (float)vec4;
+        f_start = vec4;
+    }
+}
+
+if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
+    channels == 2 && s_ch == 2 && no_interp && env_state == ENV_SUSTAIN &&
+    !filter_enabled && !loop_active) {
+    int pi = (int)pos;
+    int avail = sample_end - pi;
+    int todo = frames;
+    if (avail < todo) todo = avail;
+    int vec4 = todo & ~3;
+    if (vec4 > 0) {
+        v128_t scale = wasm_f32x4_make(
+            gainL * env, gainR * env,
+            gainL * env, gainR * env);
+        for (int j = 0; j < vec4; j += 4) {
+            const int16_t *src = data + ((pi + j) * 2);
+            v128_t s16 = wasm_v128_load(src);
+            v128_t lo = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_low_i16x8(s16));
+            v128_t hi = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_high_i16x8(s16));
+            int o = j * 2;
+            wasm_v128_store(
+                mix + o,
+                wasm_f32x4_add(
+                    wasm_v128_load(mix + o),
+                    wasm_f32x4_mul(lo, scale)));
+            wasm_v128_store(
+                mix + o + 4,
+                wasm_f32x4_add(
+                    wasm_v128_load(mix + o + 4),
+                    wasm_f32x4_mul(hi, scale)));
+        }
+        pos += (float)vec4;
+        f_start = vec4;
+    }
+}
+#endif
 if (f_start >= frames && env_state == ENV_SUSTAIN && pending_note_off_samples < 0 &&
 !v->note_off_received && !v->kill_now && startup_samples == 0) {
 v->position = pos;
@@ -6045,6 +6276,11 @@ int n = samples & ~7;
 for (; i < n; i += 8) {
 _mm256_storeu_ps(out_buffer + i, _mm256_loadu_ps(mix + i));
 }
+#elif defined(__wasm_simd128__)
+int n = samples & ~3;
+for (; i < n; i += 4) {
+wasm_v128_store(out_buffer + i, wasm_v128_load(mix + i));
+}
 #endif
 for (; i < samples; ++i) out_buffer[i] = mix[i];
 accum_initialized = 1;
@@ -6064,6 +6300,13 @@ int n = samples & ~15; // multiple of 16
                                                                                                                                                                                                                                                                 __m256 b = _mm256_loadu_ps(out_buffer + i);
                                                                                                                                                                                                                                                                 _mm256_storeu_ps(out_buffer + i, _mm256_add_ps(a, b));
                                                                                                                                                                                                                                                                 }
+#elif defined(__wasm_simd128__)
+int n = samples & ~3;
+for (; i < n; i += 4) {
+v128_t a = wasm_v128_load(mix + i);
+v128_t b = wasm_v128_load(out_buffer + i);
+wasm_v128_store(out_buffer + i, wasm_f32x4_add(a, b));
+}
                                                                                                                                                                                                                                                                 #endif
                                                                                                                                                                                                                                                                 for (; i < samples; ++i) out_buffer[i] += mix[i];
                                                                                                                                                                                                                                                                 }

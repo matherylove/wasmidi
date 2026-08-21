@@ -96,7 +96,7 @@ if(EMSCRIPTEN)
         "-sSTACK_SIZE=8388608"
         "-sFILESYSTEM=1"
         "-sFORCE_FILESYSTEM=1"
-        "-sEXPORTED_FUNCTIONS=['_ssw_init','_ssw_init_ex','_ssw_load_sf2','_ssw_clear_soundfonts','_ssw_set_volume','_ssw_set_vor_mode','_ssw_set_soft_clip','_ssw_reset','_ssw_render','_ssw_send_sysex','_ssw_active_voices','_ssw_free_voices','_ssw_steals','_ssw_layer_count','_ssw_region_count','_ssw_channels','_ssw_sample_rate','_ssw_bits_per_sample','_ssw_num_buffers','_ssw_worker_count','_ssw_shutdown','_malloc','_free']"
+        "-sEXPORTED_FUNCTIONS=['_ssw_init','_ssw_init_ex','_ssw_load_sf2','_ssw_clear_soundfonts','_ssw_set_volume','_ssw_set_vor_mode','_ssw_set_soft_clip','_ssw_reset','_ssw_render','_ssw_render_into','_ssw_send_sysex','_ssw_active_voices','_ssw_free_voices','_ssw_steals','_ssw_layer_count','_ssw_region_count','_ssw_channels','_ssw_sample_rate','_ssw_bits_per_sample','_ssw_num_buffers','_ssw_worker_count','_ssw_shutdown','_malloc','_free']"
         "-sEXPORTED_RUNTIME_METHODS=['FS','WORKERFS','lengthBytesUTF8','stringToUTF8']"
         "-lworkerfs.js"
     )

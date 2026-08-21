@@ -41,16 +41,30 @@ let safeUntil = 0.0;
 let pendingNeedFrames = 0;
 
 let eventBatches = [];
+let eventBatchHead = 0;
 let messagePtr = 0;
 let offsetPtr = 0;
 let scratchCapacity = 0;
-let scratchMessages = new Uint32Array(0);
-let scratchOffsets = new Uint32Array(0);
 
 let pcmBlocksRendered = 0;
 let lastStatsReport = 0;
-const pcmBufferPool = [];
-const pcmBufferPoolLimit = 32;
+
+// Shared PCM ring lives directly inside SnappySynth's pthread WebAssembly.Memory.
+// AudioWorklet reads it in-place: no per-block ArrayBuffer allocation, copy,
+// transfer, recycle message, or queue object is required.
+const RING_READ = 0;
+const RING_WRITE = 1;
+const RING_AVAILABLE = 2;
+const RING_GENERATION = 3;
+const RING_CAPACITY = 4;
+const RING_CHANNELS = 5;
+const RING_BLOCK_FRAMES = 6;
+const RING_WORDS = 8;
+
+let audioRingHeaderPtr = 0;
+let audioRingPcmPtr = 0;
+let audioRingCapacityFrames = 0;
+let audioRingMemory = null;
 
 function postState(type, extra = {}) {
     postMessage(Object.assign({
@@ -87,8 +101,123 @@ function setError(error) {
     postState("error", { message });
 }
 
+function ringHeader() {
+    if (!Module || !audioRingHeaderPtr)
+        return null;
+    return new Int32Array(
+        Module.HEAPU8.buffer,
+        audioRingHeaderPtr,
+        RING_WORDS);
+}
+
+function resetAudioRing() {
+    const header = ringHeader();
+    if (!header)
+        return;
+
+    Atomics.add(header, RING_GENERATION, 1);
+    Atomics.store(header, RING_READ, 0);
+    Atomics.store(header, RING_WRITE, 0);
+    Atomics.store(header, RING_AVAILABLE, 0);
+}
+
+function freeAudioRing() {
+    if (!Module)
+        return;
+
+    if (audioRingHeaderPtr)
+        Module._free(audioRingHeaderPtr);
+    if (audioRingPcmPtr)
+        Module._free(audioRingPcmPtr);
+
+    audioRingHeaderPtr = 0;
+    audioRingPcmPtr = 0;
+    audioRingCapacityFrames = 0;
+    audioRingMemory = null;
+}
+
+function publishAudioRing(force = false) {
+    if (!Module || !audioPort || !audioRingHeaderPtr || !audioRingPcmPtr)
+        return;
+
+    const memory = Module.HEAPU8.buffer;
+
+    if (!(memory instanceof SharedArrayBuffer)) {
+        throw new Error(
+            "SnappySynthV2 pthread memory is not SharedArrayBuffer; " +
+            "cross-origin isolation/pthread initialization is incomplete.");
+    }
+
+    if (!force && memory === audioRingMemory)
+        return;
+
+    audioRingMemory = memory;
+
+    audioPort.postMessage({
+        type: "sharedRing",
+        memory,
+        headerPtr: audioRingHeaderPtr,
+        pcmPtr: audioRingPcmPtr,
+        capacityFrames: audioRingCapacityFrames,
+        channels: synthChannels,
+        blockFrames
+    });
+}
+
+function allocateAudioRing() {
+    if (!Module)
+        return;
+
+    freeAudioRing();
+
+    // WebAudio renders 128-frame quanta. Preserve the configured SnappySynth
+    // buffer pool, but guarantee enough transport space for two device quanta
+    // even if the user intentionally chooses tiny source buffer settings.
+    const minimumTransportFrames = 256;
+    const requestedFrames =
+        Math.max(1, blockFrames) *
+        Math.max(1, numBuffers);
+    const minimumBlocks =
+        Math.max(
+            1,
+            Math.ceil(
+                minimumTransportFrames /
+                Math.max(1, blockFrames)));
+    const configuredBlocks =
+        Math.max(1, numBuffers);
+    const ringBlocks =
+        Math.max(configuredBlocks, minimumBlocks);
+
+    audioRingCapacityFrames =
+        Math.max(1, blockFrames) * ringBlocks;
+
+    audioRingHeaderPtr =
+        Module._malloc(RING_WORDS * 4);
+    audioRingPcmPtr =
+        Module._malloc(
+            audioRingCapacityFrames *
+            Math.max(1, synthChannels) *
+            4);
+
+    if (!audioRingHeaderPtr || !audioRingPcmPtr) {
+        freeAudioRing();
+        throw new Error(
+            "Could not allocate the shared SnappySynth audio ring.");
+    }
+
+    const header = ringHeader();
+    for (let i = 0; i < RING_WORDS; ++i)
+        Atomics.store(header, i, 0);
+    Atomics.store(header, RING_CAPACITY, audioRingCapacityFrames);
+    Atomics.store(header, RING_CHANNELS, synthChannels);
+    Atomics.store(header, RING_BLOCK_FRAMES, blockFrames);
+
+    publishAudioRing(true);
+}
+
 function resetEventQueue() {
     eventBatches.length = 0;
+    eventBatchHead = 0;
     sysexEvents.length = 0;
     safeUntil = renderSongTime;
 }
@@ -105,43 +234,67 @@ function freeScratch() {
     messagePtr = 0;
     offsetPtr = 0;
     scratchCapacity = 0;
-    scratchMessages = new Uint32Array(0);
-    scratchOffsets = new Uint32Array(0);
 }
 
-function ensureScratch(required) {
+function ensureScratch(required, preserveCount = 0) {
     if (required <= scratchCapacity)
         return;
 
-    let capacity = Math.max(1024, scratchCapacity || 1024);
+    let capacity =
+        Math.max(
+            4096,
+            scratchCapacity || 4096);
 
     while (capacity < required)
         capacity *= 2;
 
-    freeScratch();
+    const oldMessagePtr = messagePtr;
+    const oldOffsetPtr = offsetPtr;
+    const oldCapacity = scratchCapacity;
 
-    messagePtr = Module._malloc(capacity * 4);
-    offsetPtr = Module._malloc(capacity * 4);
+    const newMessagePtr =
+        Module._malloc(capacity * 4);
+    const newOffsetPtr =
+        Module._malloc(capacity * 4);
 
-    if (!messagePtr || !offsetPtr)
-        throw new Error("Could not allocate SnappySynth event scratch buffers.");
+    if (!newMessagePtr || !newOffsetPtr) {
+        if (newMessagePtr)
+            Module._free(newMessagePtr);
+        if (newOffsetPtr)
+            Module._free(newOffsetPtr);
+        throw new Error(
+            "Could not allocate SnappySynth event scratch buffers.");
+    }
 
+    if (preserveCount > 0 &&
+        oldMessagePtr &&
+        oldOffsetPtr) {
+        const count =
+            Math.min(
+                preserveCount,
+                oldCapacity);
+
+        Module.HEAPU32.set(
+            Module.HEAPU32.subarray(
+                oldMessagePtr >>> 2,
+                (oldMessagePtr >>> 2) + count),
+            newMessagePtr >>> 2);
+
+        Module.HEAPU32.set(
+            Module.HEAPU32.subarray(
+                oldOffsetPtr >>> 2,
+                (oldOffsetPtr >>> 2) + count),
+            newOffsetPtr >>> 2);
+    }
+
+    if (oldMessagePtr)
+        Module._free(oldMessagePtr);
+    if (oldOffsetPtr)
+        Module._free(oldOffsetPtr);
+
+    messagePtr = newMessagePtr;
+    offsetPtr = newOffsetPtr;
     scratchCapacity = capacity;
-    scratchMessages = new Uint32Array(capacity);
-    scratchOffsets = new Uint32Array(capacity);
-}
-
-function copyScratchToWasm(count) {
-    if (count <= 0)
-        return;
-
-    Module.HEAPU32.set(
-        scratchMessages.subarray(0, count),
-        messagePtr >>> 2);
-
-    Module.HEAPU32.set(
-        scratchOffsets.subarray(0, count),
-        offsetPtr >>> 2);
 }
 
 function ensureDir(path) {
@@ -238,6 +391,7 @@ function initCore() {
 
     applyCoreSettings();
     coreReady = true;
+    allocateAudioRing();
 }
 
 function reinitializeCore() {
@@ -245,6 +399,7 @@ function reinitializeCore() {
         return;
 
     freeScratch();
+    freeAudioRing();
     coreReady = false;
 
     // ssw_init() reinitializes only the voice engine and deliberately preserves
@@ -279,32 +434,15 @@ function reinitializeCore() {
 }
 
 function collectEventsForBlock(blockStart, blockEnd, frames) {
-    let count = 0;
-
-    // First pass counts without creating per-event JS objects.
-    outerCount:
-    for (let b = 0; b < eventBatches.length; ++b) {
-        const batch = eventBatches[b];
-
-        for (let i = batch.index; i < batch.times.length; ++i) {
-            const time = batch.times[i];
-
-            if (time >= blockEnd)
-                break outerCount;
-
-            ++count;
-        }
-    }
-
-    if (count === 0)
-        return 0;
-
-    ensureScratch(count);
-
     let out = 0;
 
-    while (eventBatches.length > 0) {
-        const batch = eventBatches[0];
+    // One hot-path pass. Event ordering and sample-offset rounding are
+    // identical to Pass 10/11.
+    ensureScratch(4096, 0);
+
+    while (eventBatchHead < eventBatches.length) {
+        const batch =
+            eventBatches[eventBatchHead];
 
         while (batch.index < batch.times.length) {
             const time =
@@ -312,6 +450,9 @@ function collectEventsForBlock(blockStart, blockEnd, frames) {
 
             if (time >= blockEnd)
                 break;
+
+            if (out >= scratchCapacity)
+                ensureScratch(out + 1, out);
 
             const frame =
                 Math.max(
@@ -322,26 +463,36 @@ function collectEventsForBlock(blockStart, blockEnd, frames) {
                             (time - blockStart) *
                             sampleRateHz)));
 
-            scratchMessages[out] =
-                batch.messages[
-                    batch.index];
+            Module.HEAPU32[
+                (messagePtr >>> 2) + out] =
+                    batch.messages[
+                        batch.index];
 
-            scratchOffsets[out] =
-                frame >>> 0;
+            Module.HEAPU32[
+                (offsetPtr >>> 2) + out] =
+                    frame >>> 0;
 
             ++out;
             ++batch.index;
         }
 
         if (batch.index >= batch.times.length) {
-            eventBatches.shift();
+            ++eventBatchHead;
             continue;
         }
 
         break;
     }
 
-    copyScratchToWasm(out);
+    if (eventBatchHead > 64 &&
+        eventBatchHead * 2 >
+            eventBatches.length) {
+        eventBatches =
+            eventBatches.slice(
+                eventBatchHead);
+        eventBatchHead = 0;
+    }
+
     return out;
 }
 
@@ -381,6 +532,39 @@ function renderOneBlock(frames) {
     if (blockEnd > safeUntil + 1e-7)
         return false;
 
+    const header = ringHeader();
+    if (!header || !audioRingPcmPtr)
+        return false;
+
+    const available =
+        Atomics.load(
+            header,
+            RING_AVAILABLE);
+
+    const freeFrames =
+        audioRingCapacityFrames -
+        available;
+
+    if (freeFrames < frames)
+        return false;
+
+    const writeFrame =
+        Atomics.load(
+            header,
+            RING_WRITE);
+
+    // Capacity is an integer number of synth blocks, so a full synth render
+    // never straddles the ring boundary. Keep a defensive guard anyway.
+    if (writeFrame < 0 ||
+        writeFrame + frames > audioRingCapacityFrames) {
+        return false;
+    }
+
+    const generation =
+        Atomics.load(
+            header,
+            RING_GENERATION);
+
     dispatchSysexForBlock(
         blockStart,
         blockEnd,
@@ -392,72 +576,49 @@ function renderOneBlock(frames) {
             blockEnd,
             frames);
 
-    const pcmPtr =
-        Module._ssw_render(
+    const outPtr =
+        audioRingPcmPtr +
+        writeFrame *
+        Math.max(1, synthChannels) *
+        4;
+
+    const rendered =
+        Module._ssw_render_into(
+            outPtr,
             eventCount ? messagePtr : 0,
             eventCount ? offsetPtr : 0,
             eventCount,
             frames);
 
-    if (!pcmPtr)
-        throw new Error("SnappySynthV2 render returned a null PCM buffer.");
+    if (!rendered)
+        throw new Error(
+            "SnappySynthV2 shared-ring render failed.");
 
-    // Browser output remains stereo, but the synth engine itself honors the
-    // original NumChannels configuration. Mono is duplicated only at the
-    // Worker -> AudioWorklet boundary.
-    const sourceChannels =
-        Math.max(1, Module._ssw_channels() | 0);
-
-    const outputSamples =
-        frames * 2;
-
-    const bytes =
-        outputSamples * 4;
-
-    let buffer = null;
-
-    while (pcmBufferPool.length > 0 && !buffer) {
-        const candidate = pcmBufferPool.pop();
-        if (candidate && candidate.byteLength >= bytes)
-            buffer = candidate;
+    // A seek/flush can be issued by the AudioWorklet while pthread rendering
+    // is in progress. In that case discard this old-generation block. The
+    // worker's queued seek/reset will reset the synth state immediately after
+    // this synchronous render returns.
+    if (generation !==
+        Atomics.load(
+            header,
+            RING_GENERATION)) {
+        return false;
     }
 
-    if (!buffer)
-        buffer = new ArrayBuffer(bytes);
+    const nextWrite =
+        writeFrame + frames >= audioRingCapacityFrames
+            ? 0
+            : writeFrame + frames;
 
-    const pcm =
-        new Float32Array(
-            buffer,
-            0,
-            outputSamples);
-
-    const source =
-        Module.HEAPF32;
-
-    const sourceIndex =
-        pcmPtr >>> 2;
-
-    if (sourceChannels === 1) {
-        for (let i = 0; i < frames; ++i) {
-            const sample =
-                source[sourceIndex + i];
-
-            pcm[i * 2] = sample;
-            pcm[i * 2 + 1] = sample;
-        }
-    } else {
-        pcm.set(
-            source.subarray(
-                sourceIndex,
-                sourceIndex +
-                outputSamples));
-    }
-
-    audioPort.postMessage({
-        type: "pcm",
-        pcm,
-        frames
-    }, [pcm.buffer]);
+    // Atomics publish the already-written PCM with sequential consistency.
+    Atomics.store(
+        header,
+        RING_WRITE,
+        nextWrite);
+    Atomics.add(
+        header,
+        RING_AVAILABLE,
+        frames);
 
     renderSongTime = blockEnd;
     pendingNeedFrames =
@@ -487,24 +648,31 @@ function pump() {
         !coreReady ||
         !soundfontLoaded ||
         !playing ||
-        !audioPort) {
+        !audioPort ||
+        !audioRingHeaderPtr) {
         return;
     }
 
     try {
         let guard = 0;
+        let produced = 0;
 
+        // Preserve SnappySynth's configured render block size. The worklet
+        // requests demand rounded to whole blocks, so every render maps to one
+        // original AudioConfig.buffer_size block.
         while (pendingNeedFrames > 0 &&
                guard++ < 128) {
-            const frames =
-                Math.min(
-                    blockFrames,
-                    Math.max(
-                        128,
-                        pendingNeedFrames));
-
-            if (!renderOneBlock(frames))
+            if (!renderOneBlock(blockFrames))
                 break;
+            produced += blockFrames;
+        }
+
+        if (produced > 0) {
+            publishAudioRing();
+            audioPort.postMessage({
+                type: "filled",
+                frames: produced
+            });
         }
     } catch (error) {
         setError(error);
@@ -517,19 +685,24 @@ function onAudioPortMessage(data) {
         return;
 
     if (data.type === "need") {
-        pendingNeedFrames +=
+        // Repeated low-water notifications describe the same missing queue
+        // capacity; use max rather than addition to avoid duplicate demand.
+        pendingNeedFrames =
             Math.max(
-                0,
-                Number(data.frames) | 0);
+                pendingNeedFrames,
+                Math.max(
+                    0,
+                    Number(data.frames) | 0));
 
         pump();
-        return;
-    }
-
-    if (data.type === "recycle" &&
-        data.buffer instanceof ArrayBuffer) {
-        if (pcmBufferPool.length < pcmBufferPoolLimit)
-            pcmBufferPool.push(data.buffer);
+        // Always acknowledge the demand message. If another trigger filled the
+        // ring before this message ran, produced==0 is still healthy and the
+        // worklet must be allowed to request again after it drains.
+        if (audioPort) {
+            audioPort.postMessage({
+                type: "needAck"
+            });
+        }
         return;
     }
 
@@ -556,6 +729,7 @@ onmessage = async event => {
                     onAudioPortMessage(
                         e.data || {});
             audioPort.start();
+            publishAudioRing(true);
             pump();
             return;
         }
@@ -585,6 +759,10 @@ onmessage = async event => {
             soundfontLoaded = true;
             renderSongTime = 0.0;
             resetEventQueue();
+            resetAudioRing();
+            // SF2 sample/preset allocation may grow Shared WebAssembly.Memory.
+            // Refresh the AudioWorklet's memory object without copying PCM.
+            publishAudioRing(true);
 
             const layers = Module._ssw_layer_count();
             postState("soundfont", {
@@ -607,6 +785,7 @@ onmessage = async event => {
             unmountAllSoundfonts();
             soundfontLoaded = false;
             renderSongTime = 0.0;
+            resetAudioRing();
             postState("soundfont", {
                 loaded: false,
                 name: "",
@@ -669,6 +848,7 @@ onmessage = async event => {
             if (data.reset) {
                 Module._ssw_reset();
                 renderSongTime = time;
+                resetAudioRing();
                 // Do not clear pendingNeedFrames here. The AudioWorklet sends
                 // its fresh request on a different MessagePort and that request
                 // may arrive just before this reset. Clearing it would leave the
@@ -694,6 +874,7 @@ onmessage = async event => {
 
             Module._ssw_reset();
             renderSongTime = time;
+            resetAudioRing();
             // Preserve cross-port demand for the same reason as play(reset).
             resetEventQueue();
             return;
@@ -703,6 +884,7 @@ onmessage = async event => {
             playing = false;
             Module._ssw_reset();
             renderSongTime = 0.0;
+            resetAudioRing();
             pendingNeedFrames = 0;
             resetEventQueue();
             return;

@@ -7,6 +7,8 @@
 #else
 
 #include <errno.h>
+#include <math.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -18,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 #include <emscripten/threading.h>
 #endif
 
@@ -136,10 +139,18 @@ typedef struct ss_handle {
     int type;
     union {
         struct {
+#ifdef __EMSCRIPTEN__
+            // Emscripten hot path: events are futex-backed atomics. This avoids
+            // a pthread mutex + condition-variable lock/unlock pair for every
+            // worker start/done signal in every synth render block.
+            volatile uint32_t signaled;
+            int manual_reset;
+#else
             pthread_mutex_t mutex;
             pthread_cond_t cond;
             int manual_reset;
             int signaled;
+#endif
         } event;
         pthread_mutex_t mutex;
         pthread_t thread;
@@ -153,10 +164,17 @@ static inline HANDLE CreateEvent(void *attr, BOOL manual_reset, BOOL initial_sta
     HANDLE h = (HANDLE)calloc(1, sizeof(*h));
     if (!h) return NULL;
     h->type = SS_HANDLE_EVENT;
+#ifdef __EMSCRIPTEN__
+    h->u.event.manual_reset = manual_reset ? 1 : 0;
+    __atomic_store_n(&h->u.event.signaled,
+                     initial_state ? 1u : 0u,
+                     __ATOMIC_SEQ_CST);
+#else
     pthread_mutex_init(&h->u.event.mutex, NULL);
     pthread_cond_init(&h->u.event.cond, NULL);
     h->u.event.manual_reset = manual_reset ? 1 : 0;
     h->u.event.signaled = initial_state ? 1 : 0;
+#endif
     return h;
 }
 
@@ -172,23 +190,83 @@ static inline HANDLE CreateMutex(void *attr, BOOL initial_owner, const char *nam
 
 static inline BOOL SetEvent(HANDLE h) {
     if (!h || h->type != SS_HANDLE_EVENT) return FALSE;
+#ifdef __EMSCRIPTEN__
+    const uint32_t was_signaled =
+        __atomic_exchange_n(&h->u.event.signaled, 1u, __ATOMIC_SEQ_CST);
+    // Win32 SetEvent on an already-signaled event is a no-op. Avoid redundant
+    // futex broadcasts when every render worker re-signals the manual producer
+    // barrier after waking.
+    if (!was_signaled) {
+        emscripten_futex_wake((void*)&h->u.event.signaled,
+                              h->u.event.manual_reset ? INT_MAX : 1);
+    }
+#else
     pthread_mutex_lock(&h->u.event.mutex);
     h->u.event.signaled = 1;
     if (h->u.event.manual_reset) pthread_cond_broadcast(&h->u.event.cond);
     else pthread_cond_signal(&h->u.event.cond);
     pthread_mutex_unlock(&h->u.event.mutex);
+#endif
     return TRUE;
 }
 
 static inline BOOL ResetEvent(HANDLE h) {
     if (!h || h->type != SS_HANDLE_EVENT) return FALSE;
+#ifdef __EMSCRIPTEN__
+    __atomic_store_n(&h->u.event.signaled, 0u, __ATOMIC_SEQ_CST);
+#else
     pthread_mutex_lock(&h->u.event.mutex);
     h->u.event.signaled = 0;
     pthread_mutex_unlock(&h->u.event.mutex);
+#endif
     return TRUE;
 }
 
+#ifdef __EMSCRIPTEN__
+static inline int ss_event_try_acquire(HANDLE h) {
+    if (h->u.event.manual_reset)
+        return __atomic_load_n(&h->u.event.signaled, __ATOMIC_SEQ_CST) != 0u;
+
+    uint32_t expected = 1u;
+    return __atomic_compare_exchange_n(&h->u.event.signaled,
+                                       &expected,
+                                       0u,
+                                       0,
+                                       __ATOMIC_SEQ_CST,
+                                       __ATOMIC_SEQ_CST);
+}
+#endif
+
 static inline DWORD ss_wait_event(HANDLE h, DWORD ms) {
+#ifdef __EMSCRIPTEN__
+    if (ss_event_try_acquire(h))
+        return WAIT_OBJECT_0;
+    if (ms == 0)
+        return WAIT_TIMEOUT;
+
+    const double deadline =
+        ms == INFINITE
+            ? 0.0
+            : emscripten_get_now() + (double)ms;
+
+    for (;;) {
+        if (ss_event_try_acquire(h))
+            return WAIT_OBJECT_0;
+
+        double timeout_ms = INFINITY;
+        if (ms != INFINITE) {
+            timeout_ms = deadline - emscripten_get_now();
+            if (timeout_ms <= 0.0)
+                return WAIT_TIMEOUT;
+        }
+
+        // Waiting on value 0 is safe even if SetEvent races between the check
+        // and this call: futex_wait returns immediately when the value differs.
+        emscripten_futex_wait((void*)&h->u.event.signaled,
+                              0u,
+                              timeout_ms);
+    }
+#else
     DWORD rc = WAIT_OBJECT_0;
     pthread_mutex_lock(&h->u.event.mutex);
     if (!h->u.event.signaled) {
@@ -213,6 +291,7 @@ static inline DWORD ss_wait_event(HANDLE h, DWORD ms) {
     if (rc == WAIT_OBJECT_0 && !h->u.event.manual_reset) h->u.event.signaled = 0;
     pthread_mutex_unlock(&h->u.event.mutex);
     return rc;
+#endif
 }
 
 static inline DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
@@ -247,8 +326,10 @@ static inline BOOL ReleaseMutex(HANDLE h) {
 static inline BOOL CloseHandle(HANDLE h) {
     if (!h) return FALSE;
     if (h->type == SS_HANDLE_EVENT) {
+#ifndef __EMSCRIPTEN__
         pthread_mutex_destroy(&h->u.event.mutex);
         pthread_cond_destroy(&h->u.event.cond);
+#endif
     } else if (h->type == SS_HANDLE_MUTEX) {
         pthread_mutex_destroy(&h->u.mutex);
     }

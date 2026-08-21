@@ -661,8 +661,8 @@
                     Number(percent) /
                     100.0));
 
-        // UI volume is an output gain after SnappySynth. This does not overwrite
-        // the synth's MIDI Universal Master Volume / GS state.
+        // Preserve Pass 10 exactly: UI volume is post-synth AudioWorklet gain
+        // and never overwrites MIDI Universal Master Volume / GS state.
         if (node) {
             node.port.postMessage({
                 type: "volume",
