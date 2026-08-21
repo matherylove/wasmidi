@@ -70,6 +70,13 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 2
 
+      # Memory64 shipped in Node 24. Use the same 64-bit Wasm memory model in
+      # CI that Chromium uses for the production parser Worker.
+      - name: Setup Node 24 for Memory64 smoke test
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Validate generated MIDI parser runtime
         run: |
           node --check build/wasmidi-midi-parser.js
