@@ -2,6 +2,7 @@
 #include <QPointer>
 #include <QQuickFramebufferObject>
 #include <QQmlEngine>
+#include <QTimer>
 
 class Keyboard : public QQuickFramebufferObject {
     Q_OBJECT
@@ -12,8 +13,11 @@ public:
     QObject* controller() const { return controller_.data(); }
     void setController(QObject* controller);
     Renderer* createRenderer() const override;
+protected:
+    void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override;
 signals:
     void controllerChanged();
 private:
     QPointer<QObject> controller_;
+    QTimer resizeSettleTimer_;
 };

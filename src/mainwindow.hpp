@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "midi/midi_parser.hpp"
@@ -48,6 +49,9 @@ class MainWindow : public QObject {
     Q_PROPERTY(int skippedVelocity READ skippedVelocity NOTIFY skippedVelocityChanged)
     Q_PROPERTY(QVariantList npsTimeline READ npsTimeline NOTIFY timelineChanged)
     Q_PROPERTY(quint64 documentRevision READ documentRevision NOTIFY documentRevisionChanged)
+    Q_PROPERTY(bool midiLoading READ midiLoading NOTIFY midiLoadingChanged)
+    Q_PROPERTY(int midiLoadingProgress READ midiLoadingProgress NOTIFY midiLoadingChanged)
+    Q_PROPERTY(QString midiLoadingStage READ midiLoadingStage NOTIFY midiLoadingChanged)
 
     Q_PROPERTY(bool synthReady READ synthReady NOTIFY synthStateChanged)
     Q_PROPERTY(bool soundfontLoaded READ soundfontLoaded NOTIFY synthStateChanged)
@@ -64,6 +68,8 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthMinVoices READ synthMinVoices WRITE setSynthMinVoices NOTIFY synthConfigChanged)
     Q_PROPERTY(int synthBufferFrames READ synthBufferFrames WRITE setSynthBufferFrames NOTIFY synthConfigChanged)
     Q_PROPERTY(int synthNumBuffers READ synthNumBuffers WRITE setSynthNumBuffers NOTIFY synthConfigChanged)
+    Q_PROPERTY(float synthPrebufferSeconds READ synthPrebufferSeconds WRITE setSynthPrebufferSeconds NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthVelocityFloor READ synthVelocityFloor WRITE setSynthVelocityFloor NOTIFY synthConfigChanged)
     Q_PROPERTY(int synthRequestedSampleRate READ synthRequestedSampleRate WRITE setSynthRequestedSampleRate NOTIFY synthConfigChanged)
     Q_PROPERTY(int synthChannels READ synthChannels WRITE setSynthChannels NOTIFY synthConfigChanged)
     Q_PROPERTY(int synthBitsPerSample READ synthBitsPerSample WRITE setSynthBitsPerSample NOTIFY synthConfigChanged)
@@ -113,6 +119,9 @@ public:
     int skippedVelocity() const { return skippedVelocity_; }
     QVariantList npsTimeline() const { return npsTimeline_; }
     quint64 documentRevision() const { return documentRevision_; }
+    bool midiLoading() const { return midiLoading_; }
+    int midiLoadingProgress() const { return midiLoadingProgress_; }
+    QString midiLoadingStage() const { return midiLoadingStage_; }
 
     bool synthReady() const { return synthReady_; }
     bool soundfontLoaded() const { return soundfontLoaded_; }
@@ -129,6 +138,8 @@ public:
     int synthMinVoices() const { return synthMinVoices_; }
     int synthBufferFrames() const { return synthBufferFrames_; }
     int synthNumBuffers() const { return synthNumBuffers_; }
+    float synthPrebufferSeconds() const { return synthPrebufferSeconds_; }
+    int synthVelocityFloor() const { return synthVelocityFloor_; }
     int synthRequestedSampleRate() const { return synthRequestedSampleRate_; }
     int synthChannels() const { return synthChannels_; }
     int synthBitsPerSample() const { return synthBitsPerSample_; }
@@ -160,11 +171,21 @@ public:
     Q_INVOKABLE bool loadMidiFile(const QByteArray& data);
     Q_INVOKABLE bool loadMidiFileNamed(const QByteArray& data, const QString& fileName);
     bool loadMidiRaw(const uint8_t* data, std::size_t size, const QString& fileName);
+    bool loadMidiSerializedRaw(const uint8_t* data, std::size_t size, const QString& fileName);
+    void setMidiLoadingProgress(int progress, const QString& stage);
+    void failMidiLoading(const QString& message);
+    void receiveKeyboardVisualPage(
+        uint32_t generation,
+        uint32_t spanTicks,
+        uint32_t pageIndex,
+        const uint32_t* words,
+        uint32_t wordCount);
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
     Q_INVOKABLE void openMidiPicker();
     Q_INVOKABLE void openSoundfontPicker();
     Q_INVOKABLE void clearSoundfonts();
     Q_INVOKABLE void clearFile();
+    Q_INVOKABLE void notifyVisualizerFramePresented();
     Q_INVOKABLE void play();
     Q_INVOKABLE void pause();
     Q_INVOKABLE void stop();
@@ -180,6 +201,8 @@ public:
     void setSynthMinVoices(int value);
     void setSynthBufferFrames(int value);
     void setSynthNumBuffers(int value);
+    void setSynthPrebufferSeconds(float value);
+    void setSynthVelocityFloor(int value);
     void setSynthRequestedSampleRate(int value);
     void setSynthChannels(int value);
     void setSynthBitsPerSample(int value);
@@ -219,6 +242,7 @@ signals:
     void skippedVelocityChanged();
     void timelineChanged();
     void documentRevisionChanged();
+    void midiLoadingChanged();
     void synthStateChanged();
     void synthConfigChanged();
     void channelColorsChanged();
@@ -235,18 +259,27 @@ private:
     void updateNeuralVisuals();
     void dispatchScheduler();
     void publishDocumentMetadata();
+    bool adoptParsedDocument(wasmidi::MidiDocument&& parsed, const QString& fileName);
 
     void invalidateLiveTrackers();
     void clearVisualState();
     void syncVisualState(double targetTick, bool forceRebuild = false);
     void rebuildVisualStateAt(double targetTick);
+    bool restoreVisualStateFromPage(double targetTick);
+    void advanceVisualStateTo(double targetTick);
+    void clearKeyboardVisualPageCache();
     void addVisualNote(std::size_t sourceIndex);
-    void removeVisualNote(uint8_t pitch, uint8_t color);
+    void addVisualCount(uint8_t pitch, uint8_t color, uint32_t count);
+    void removeVisualCount(uint8_t pitch, uint8_t color, uint32_t count);
+    void applyVisualKeyEvent(const wasmidi::VisualKeyEvent& event, bool add);
 
     void pollSynthState();
     void applySynthConfig();
     void resetSynthSchedule(float seconds);
     void scheduleSynthAhead();
+    void updateSynthSynchronization();
+    void updateEffectiveVelocityFloor(double synthLagSeconds);
+    void publishSynthPrebufferConfig();
     uint32_t packSynthMessage(const wasmidi::CompactEvent& event) const;
 
     wasmidi::MidiParser parser_;
@@ -280,10 +313,16 @@ private:
     int skippedVelocity_ = 0;
     QVariantList npsTimeline_;
     quint64 documentRevision_ = 0;
+    bool midiLoading_ = false;
+    int midiLoadingProgress_ = 0;
+    QString midiLoadingStage_;
 
     QVector<QColor> channelColors_;
     QElapsedTimer playbackClock_;
     float playbackAnchorSeconds_ = 0.0f;
+    qint64 playbackLastElapsedMs_ = 0;
+    quint64 visualFrameSerial_ = 0;
+    quint64 playbackConsumedVisualFrameSerial_ = 0;
 
     std::vector<float> tempoTimes_;
     std::vector<float> tempoBpms_;
@@ -297,27 +336,46 @@ private:
     uint64_t liveNpsCount_ = 0;
     uint64_t liveCcCount_ = 0;
 
-    // Exact keyboard state from Pass 8.3's independent VisualNote intervals.
-    // Only currently-active note endings live in the heap; steady-state cost is
-    // O(polyphony), not O(total notes).
-    struct VisualActiveEnd {
-        uint32_t endTick = 0;
-        uint32_t sourceIndex = 0;
-        uint8_t pitch = 0;
-        uint8_t color = 0;
-    };
-
+    // Exact keyboard state from the parser-worker-built compressed start/end
+    // timeline. Dense identical notes advance as counted deltas instead of one
+    // heap operation per note on the UI thread.
     bool visualStateValid_ = false;
     double visualTick_ = 0.0;
-    std::size_t visualStartCursor_ = 0;
+    std::size_t visualKeyStartCursor_ = 0;
+    std::size_t visualKeyEndCursor_ = 0;
+    std::size_t visualKeyOwnerCursor_ = 0;
     int visualActiveVoices_ = 0;
 
-    std::vector<VisualActiveEnd> visualEndHeap_;
     std::array<uint32_t, 128> visualPitchCount_{};
     std::array<uint8_t, 128> visualPitchMask_{};
     std::array<int8_t, 128> visualPitchColor_{};
     std::array<std::array<uint32_t, 16>, 128> visualPitchColorCounts_{};
     std::array<uint32_t, 16> visualColorVoices_{};
+
+    // The horizontal visual-cache Worker also prepares exact keyboard state at
+    // the same rolling 64 screen boundaries. A seek can restore one of these
+    // compact snapshots and replay only the tiny residual event interval. This
+    // is the keyboard equivalent of the roll's pre-render page cache and keeps
+    // dense crashpoints off Qt's UI thread while still retaining a raw-index
+    // recovery path if the requested page has not finished yet.
+    struct KeyboardVisualPage {
+        uint32_t generation = 0;
+        uint32_t spanTicks = 0;
+        uint32_t pageIndex = 0;
+        uint32_t startCursor = 0;
+        uint32_t endCursor = 0;
+        uint32_t ownerCursor = 0;
+        std::array<std::array<uint32_t, 16>, 128> globalCounts{};
+        std::array<std::array<uint32_t, 16>, 128> trackCounts{};
+        std::array<uint32_t, 128> ownerColors{};
+
+        uint64_t startTick() const {
+            return uint64_t(spanTicks) * uint64_t(pageIndex);
+        }
+    };
+
+    std::vector<KeyboardVisualPage> keyboardVisualPages_;
+    uint32_t keyboardVisualGeneration_ = 0;
 
     // Dedicated SnappySynthV2 browser worker state.
     bool synthReady_ = false;
@@ -337,6 +395,10 @@ private:
     int synthMinVoices_ = 0;
     int synthBufferFrames_ = 512;
     int synthNumBuffers_ = 16;
+    float synthPrebufferSeconds_ = 8.0f; // 0 = up to the full MIDI duration
+    int synthVelocityFloor_ = 0;         // user floor; 127 leaves only velocity 127
+    int synthEffectiveVelocityFloor_ = 0;
+    qint64 synthLastHardResyncElapsedMs_ = -100000;
     int synthRequestedSampleRate_ = 44100; // supplied SnappySynth.cfg default
     int synthChannels_ = 2;
     int synthBitsPerSample_ = 32;
@@ -351,6 +413,7 @@ private:
     bool synthOverlapGain_ = false;
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;
+    bool synthWasStarved_ = false;
     std::size_t synthGroupCursor_ = 0;
     std::size_t synthSysExCursor_ = 0;
     double synthScheduledUntil_ = 0.0;

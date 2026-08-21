@@ -35,6 +35,15 @@ ApplicationWindow {
     ColorDialog {
         id: colorDialog
         title: "Custom channel color"
+
+        // Qt Quick Dialogs updates selectedColor while the browser color picker
+        // is being manipulated. Push every preview change directly into both GPU
+        // renderers instead of waiting for Accept.
+        onSelectedColorChanged: {
+            if (visible)
+                mainWindow.setChannelColor(window.colorChannel, selectedColor)
+        }
+
         onAccepted: {
             mainWindow.setChannelColor(window.colorChannel, selectedColor)
             colorPopup.close()
@@ -228,6 +237,122 @@ ApplicationWindow {
         }
     }
 
+    Rectangle {
+        id: midiLoadingOverlay
+        anchors.fill: parent
+        visible: mainWindow.midiLoading
+        z: 1000
+        color: "#e607071a"
+
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+        }
+
+        Rectangle {
+            width: Math.min(520, parent.width - 48)
+            height: 196
+            anchors.centerIn: parent
+            radius: 16
+            color: "#0d0b1e"
+            border.color: "#4c347d"
+            border.width: 1
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 24
+                spacing: 13
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 12
+
+                    Rectangle {
+                        width: 38
+                        height: 38
+                        radius: 9
+                        color: "#1b1237"
+                        border.color: "#6846ad"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "◇"
+                            color: "#c4b5fd"
+                            font.pixelSize: 23
+                            font.bold: true
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 2
+
+                        Text {
+                            text: "Loading MIDI"
+                            color: "#e9e5ff"
+                            font.pixelSize: 18
+                            font.bold: true
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: mainWindow.midiLoadingStage.length
+                                  ? mainWindow.midiLoadingStage
+                                  : "Preparing parser"
+                            color: "#9d94b5"
+                            font.pixelSize: 11
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    Text {
+                        text: mainWindow.midiLoadingProgress + "%"
+                        color: "#c4b5fd"
+                        font.pixelSize: 19
+                        font.bold: true
+                    }
+                }
+
+                Item { Layout.preferredHeight: 2 }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 14
+                    radius: 7
+                    color: "#17122a"
+                    border.color: "#2e2349"
+                    clip: true
+
+                    Rectangle {
+                        width: parent.width * Math.max(0, Math.min(1, mainWindow.midiLoadingProgress / 100.0))
+                        height: parent.height
+                        radius: parent.radius
+                        color: "#7c5ce0"
+
+                        Behavior on width {
+                            NumberAnimation { duration: 90; easing.type: Easing.OutCubic }
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "Parsing runs in a background worker"
+                        color: "#766d89"
+                        font.pixelSize: 10
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: "UI stays responsive"
+                        color: "#766d89"
+                        font.pixelSize: 10
+                    }
+                }
+            }
+        }
+    }
+
     Popup {
         id: colorPopup
         parent: Overlay.overlay
@@ -296,7 +421,14 @@ ApplicationWindow {
                 color: "#17122a"
                 border.color: "#33264e"
                 Text { anchors.centerIn: parent; text: "Custom color…"; color: "#a78bfa"; font.pixelSize: 10; font.bold: true }
-                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: colorDialog.open() }
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        colorDialog.selectedColor = mainWindow.channelColorList[window.colorChannel]
+                        colorDialog.open()
+                    }
+                }
             }
         }
     }

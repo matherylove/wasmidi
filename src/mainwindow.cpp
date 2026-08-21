@@ -1,5 +1,7 @@
 #include "mainwindow.hpp"
 
+#include "midi/midi_document_codec.hpp"
+
 #include <QFile>
 #include <QFileInfo>
 #include <QTimer>
@@ -54,6 +56,82 @@ void wasmidi_browser_file_selected(
         data,
         static_cast<std::size_t>(dataSize),
         name);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_browser_loading_progress(
+    int percent,
+    const char* stage,
+    int stageSize)
+{
+    if (!g_browserMainWindow)
+        return;
+
+    const QString text =
+        stage && stageSize > 0
+            ? QString::fromUtf8(stage, stageSize)
+            : QStringLiteral("Loading MIDI");
+
+    g_browserMainWindow->setMidiLoadingProgress(
+        percent,
+        text);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_browser_loading_failed(
+    const char* message,
+    int messageSize)
+{
+    if (!g_browserMainWindow)
+        return;
+
+    g_browserMainWindow->failMidiLoading(
+        message && messageSize > 0
+            ? QString::fromUtf8(message, messageSize)
+            : QStringLiteral("Could not parse MIDI"));
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_browser_parsed_midi_selected(
+    const unsigned char* data,
+    int dataSize,
+    const char* fileName,
+    int fileNameSize)
+{
+    if (!g_browserMainWindow ||
+        !data ||
+        dataSize <= 0) {
+        return;
+    }
+
+    const QString name =
+        fileName && fileNameSize > 0
+            ? QString::fromUtf8(fileName, fileNameSize)
+            : QStringLiteral("browser.mid");
+
+    g_browserMainWindow->loadMidiSerializedRaw(
+        data,
+        static_cast<std::size_t>(dataSize),
+        name);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_visual_key_page_ready(
+    uint32_t generation,
+    uint32_t spanTicks,
+    uint32_t pageIndex,
+    const uint32_t* words,
+    uint32_t wordCount)
+{
+    if (!g_browserMainWindow)
+        return;
+
+    g_browserMainWindow->receiveKeyboardVisualPage(
+        generation,
+        spanTicks,
+        pageIndex,
+        words,
+        wordCount);
 }
 
 // Stream the browser File directly into one WASM allocation instead of
@@ -167,94 +245,178 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             return;
         }
 
-        let dataPtr = 0;
-        let namePtr = 0;
+        const callWithUtf8 =
+            (callback, first, text) => {
+                const bytes =
+                    new TextEncoder().encode(
+                        String(text || ''));
+
+                const ptr =
+                    _malloc(
+                        Math.max(1, bytes.length));
+
+                if (!ptr)
+                    return;
+
+                if (bytes.length)
+                    HEAPU8.set(bytes, ptr);
+
+                try {
+                    callback(first, ptr, bytes.length);
+                } finally {
+                    _free(ptr);
+                }
+            };
+
+        const setProgress =
+            (percent, stage) => {
+                callWithUtf8(
+                    _wasmidi_browser_loading_progress,
+                    Math.max(0, Math.min(100, percent | 0)),
+                    stage || 'Loading MIDI');
+            };
+
+        const failLoading =
+            (text) => {
+                const bytes =
+                    new TextEncoder().encode(
+                        String(text || 'Could not parse MIDI'));
+                const ptr = _malloc(Math.max(1, bytes.length));
+                if (!ptr) {
+                    _wasmidi_browser_loading_failed(0, 0);
+                    return;
+                }
+                if (bytes.length)
+                    HEAPU8.set(bytes, ptr);
+                try {
+                    _wasmidi_browser_loading_failed(ptr, bytes.length);
+                } finally {
+                    _free(ptr);
+                }
+            };
+
+        let worker = null;
 
         try {
-            if (file.size > 0x7fffffff) {
+            if (typeof Worker !== 'function') {
                 throw new Error(
-                    'MIDI is too large for this wasm32 build.');
+                    'This browser does not support the MIDI parser Worker.');
             }
 
-            dataPtr =
-                _malloc(
-                    Math.max(
-                        1,
-                        file.size));
+            setProgress(0, 'Starting MIDI loader');
 
-            if (!dataPtr) {
-                throw new Error(
-                    'Could not allocate WASM memory for MIDI.');
-            }
+            worker =
+                new Worker(
+                    './midi-parser-worker.js');
 
-            let offset = 0;
+            worker.onmessage =
+                (event) => {
+                    const message =
+                        event.data || {};
 
-            if (file.stream) {
-                const reader =
-                    file.stream().getReader();
+                    if (message.type === 'progress') {
+                        setProgress(
+                            Number(message.percent) || 0,
+                            message.stage || 'Loading MIDI');
+                        return;
+                    }
 
-                while (true) {
-                    const result =
-                        await reader.read();
+                    if (message.type === 'error') {
+                        failLoading(
+                            message.message || 'Could not parse MIDI');
 
-                    if (result.done)
-                        break;
+                        if (worker) {
+                            worker.terminate();
+                            worker = null;
+                        }
+                        cleanup();
+                        return;
+                    }
 
-                    const chunk =
-                        result.value;
+                    if (message.type !== 'result' ||
+                        !(message.data instanceof ArrayBuffer)) {
+                        return;
+                    }
 
-                    HEAPU8.set(
-                        chunk,
-                        dataPtr + offset);
+                    const bytes =
+                        new Uint8Array(message.data);
 
-                    offset +=
-                        chunk.byteLength;
-                }
-            } else {
-                const bytes =
-                    new Uint8Array(
-                        await file.arrayBuffer());
+                    const dataPtr =
+                        _malloc(
+                            Math.max(1, bytes.length));
 
-                HEAPU8.set(
-                    bytes,
-                    dataPtr);
+                    if (!dataPtr) {
+                        failLoading(
+                            'Could not allocate WASM memory for parsed MIDI.');
+                        if (worker) worker.terminate();
+                        worker = null;
+                        cleanup();
+                        return;
+                    }
 
-                offset =
-                    bytes.length;
-            }
+                    const nameBytes =
+                        new TextEncoder().encode(
+                            message.name || file.name || 'browser.mid');
 
-            const nameBytes =
-                new TextEncoder().encode(
-                    file.name ||
-                    'browser.mid');
+                    const namePtr =
+                        _malloc(
+                            Math.max(1, nameBytes.length));
 
-            namePtr =
-                _malloc(
-                    Math.max(
-                        1,
-                        nameBytes.length));
+                    if (!namePtr) {
+                        _free(dataPtr);
+                        failLoading(
+                            'Could not allocate MIDI filename memory.');
+                        if (worker) worker.terminate();
+                        worker = null;
+                        cleanup();
+                        return;
+                    }
 
-            if (nameBytes.length) {
-                HEAPU8.set(
-                    nameBytes,
-                    namePtr);
-            }
+                    HEAPU8.set(bytes, dataPtr);
+                    if (nameBytes.length)
+                        HEAPU8.set(nameBytes, namePtr);
 
-            _wasmidi_browser_file_selected(
-                dataPtr,
-                offset,
-                namePtr,
-                nameBytes.length);
+                    setProgress(96, 'Installing parsed MIDI');
+
+                    try {
+                        _wasmidi_browser_parsed_midi_selected(
+                            dataPtr,
+                            bytes.length,
+                            namePtr,
+                            nameBytes.length);
+                    } finally {
+                        _free(namePtr);
+                        _free(dataPtr);
+                        if (worker) worker.terminate();
+                        worker = null;
+                        cleanup();
+                    }
+                };
+
+            worker.onerror =
+                (event) => {
+                    failLoading(
+                        event && event.message
+                            ? event.message
+                            : 'MIDI parser Worker failed.');
+                    if (worker) worker.terminate();
+                    worker = null;
+                    cleanup();
+                };
+
+            worker.postMessage({
+                type: 'parse',
+                file,
+                name: file.name || 'browser.mid'
+            });
         } catch (error) {
-            console.error(
-                '[WASMIDI] Could not load selected MIDI:',
-                error);
-        } finally {
-            if (namePtr)
-                _free(namePtr);
+            failLoading(
+                error && error.message
+                    ? error.message
+                    : String(error));
 
-            if (dataPtr)
-                _free(dataPtr);
+            if (worker)
+                worker.terminate();
 
             cleanup();
         }
@@ -323,6 +485,17 @@ EM_JS(double, wasmidi_snappy_audio_clock, (), {
     return b && b.getAudioClock ? Number(b.getAudioClock()) : -1.0;
 });
 
+EM_JS(int, wasmidi_snappy_starved, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state && b.state.starved ? 1 : 0;
+});
+
+EM_JS(void, wasmidi_snappy_sync_visual_clock, (double time), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.syncVisualClock)
+        b.syncVisualClock(Number(time) || 0.0);
+});
+
 EM_JS(int, wasmidi_snappy_copy_string, (int which, char* dst, int capacity), {
     if (!dst || capacity <= 0)
         return 0;
@@ -377,6 +550,12 @@ EM_JS(void, wasmidi_snappy_seek, (double time), {
     const b = globalThis.WasmidiSnappyBridge;
     if (b && b.seek)
         b.seek(time);
+});
+
+EM_JS(void, wasmidi_snappy_set_prebuffer, (double seconds, double duration), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.setPrebuffer)
+        b.setPrebuffer(Number(seconds) || 0.0, Number(duration) || 0.0);
 });
 
 EM_JS(void, wasmidi_snappy_set_volume, (int percent), {
@@ -495,6 +674,7 @@ MainWindow::MainWindow(QObject* parent)
 
 #ifdef __EMSCRIPTEN__
     wasmidi_snappy_set_volume(volume_);
+    publishSynthPrebufferConfig();
 #endif
 }
 
@@ -570,6 +750,35 @@ bool MainWindow::loadMidiFileNamed(
         fileName);
 }
 
+bool MainWindow::adoptParsedDocument(
+    wasmidi::MidiDocument&& parsed,
+    const QString& fileName)
+{
+    clearKeyboardVisualPageCache();
+    document_ = std::move(parsed);
+    scheduler_.setDocument(&document_);
+
+    if (!fileName.isEmpty()) {
+        fileName_ = fileName;
+        emit fileNameChanged();
+    }
+
+    publishDocumentMetadata();
+    rebuildDerivedStats();
+
+    invalidateLiveTrackers();
+    visualStateValid_ = false;
+
+    ++documentRevision_;
+    emit documentRevisionChanged();
+
+    publishSynthPrebufferConfig();
+    updateLiveStats();
+    emit fileLoaded();
+
+    return true;
+}
+
 bool MainWindow::loadMidiRaw(
     const uint8_t* data,
     std::size_t size,
@@ -589,6 +798,77 @@ bool MainWindow::loadMidiRaw(
         return false;
     }
 
+    return adoptParsedDocument(
+        std::move(parsed),
+        fileName);
+}
+
+void MainWindow::setMidiLoadingProgress(
+    int progress,
+    const QString& stage)
+{
+    const int clamped =
+        std::clamp(progress, 0, 100);
+
+    const bool starting =
+        !midiLoading_ && clamped < 100;
+
+    if (starting)
+        stop();
+
+    const bool nextLoading =
+        clamped < 100;
+
+    const bool changed =
+        midiLoading_ != nextLoading ||
+        midiLoadingProgress_ != clamped ||
+        midiLoadingStage_ != stage;
+
+    midiLoading_ = nextLoading;
+    midiLoadingProgress_ = clamped;
+    midiLoadingStage_ = stage;
+
+    if (changed)
+        emit midiLoadingChanged();
+}
+
+void MainWindow::failMidiLoading(
+    const QString& message)
+{
+    midiLoading_ = false;
+    midiLoadingProgress_ = 0;
+    midiLoadingStage_.clear();
+    emit midiLoadingChanged();
+    emit loadFailed(message);
+}
+
+bool MainWindow::loadMidiSerializedRaw(
+    const uint8_t* data,
+    std::size_t size,
+    const QString& fileName)
+{
+    stop();
+    setMidiLoadingProgress(
+        97,
+        QStringLiteral("Installing MIDI document"));
+
+    wasmidi::MidiDocument parsed;
+    std::string error;
+
+    if (!wasmidi::deserializeMidiDocument(
+            data,
+            size,
+            parsed,
+            error)) {
+        failMidiLoading(
+            QString::fromStdString(error));
+        return false;
+    }
+
+    // Install the large compact arrays immediately, then yield once before the
+    // derived-stat pass. That yield lets Qt paint the 98% loading state instead
+    // of making the final main-thread work look like another browser freeze.
+    clearKeyboardVisualPageCache();
     document_ = std::move(parsed);
     scheduler_.setDocument(&document_);
 
@@ -598,16 +878,34 @@ bool MainWindow::loadMidiRaw(
     }
 
     publishDocumentMetadata();
-    rebuildDerivedStats();
+    setMidiLoadingProgress(
+        98,
+        QStringLiteral("Building playback statistics"));
 
-    invalidateLiveTrackers();
-    visualStateValid_ = false;
+    QTimer::singleShot(
+        0,
+        this,
+        [this]() {
+            rebuildDerivedStats();
 
-    ++documentRevision_;
-    emit documentRevisionChanged();
+            invalidateLiveTrackers();
+            visualStateValid_ = false;
 
-    updateLiveStats();
-    emit fileLoaded();
+            setMidiLoadingProgress(
+                99,
+                QStringLiteral("Preparing visualizers"));
+
+            ++documentRevision_;
+            emit documentRevisionChanged();
+
+            publishSynthPrebufferConfig();
+            updateLiveStats();
+            emit fileLoaded();
+
+            setMidiLoadingProgress(
+                100,
+                QStringLiteral("Ready"));
+        });
 
     return true;
 }
@@ -653,7 +951,6 @@ void MainWindow::clearSoundfonts()
 
 void MainWindow::clearVisualState()
 {
-    visualEndHeap_.clear();
     visualPitchCount_.fill(0);
     visualPitchMask_.fill(0);
     visualPitchColor_.fill(-1);
@@ -663,8 +960,95 @@ void MainWindow::clearVisualState()
 
     visualActiveVoices_ = 0;
     visualTick_ = 0.0;
-    visualStartCursor_ = 0;
+    visualKeyStartCursor_ = 0;
+    visualKeyEndCursor_ = 0;
+    visualKeyOwnerCursor_ = 0;
     visualStateValid_ = false;
+}
+
+void MainWindow::clearKeyboardVisualPageCache()
+{
+    keyboardVisualPages_.clear();
+    keyboardVisualGeneration_ = 0;
+}
+
+void MainWindow::receiveKeyboardVisualPage(
+    uint32_t generation,
+    uint32_t spanTicks,
+    uint32_t pageIndex,
+    const uint32_t* words,
+    uint32_t wordCount)
+{
+    constexpr uint32_t HeaderWords = 3;
+    constexpr uint32_t CountWords = 128u * 16u;
+    constexpr uint32_t OwnerWords = 128u;
+    constexpr uint32_t ExpectedWords =
+        HeaderWords + CountWords * 2u + OwnerWords;
+
+    if (!words || spanTicks == 0 || wordCount != ExpectedWords)
+        return;
+
+    if (keyboardVisualGeneration_ != generation) {
+        keyboardVisualPages_.clear();
+        keyboardVisualGeneration_ = generation;
+    }
+
+    KeyboardVisualPage page;
+    page.generation = generation;
+    page.spanTicks = spanTicks;
+    page.pageIndex = pageIndex;
+    page.startCursor = words[0];
+    page.endCursor = words[1];
+    page.ownerCursor = words[2];
+
+    uint32_t offset = HeaderWords;
+    for (std::size_t pitch = 0; pitch < 128; ++pitch) {
+        for (std::size_t color = 0; color < 16; ++color)
+            page.globalCounts[pitch][color] = words[offset++];
+    }
+    for (std::size_t pitch = 0; pitch < 128; ++pitch) {
+        for (std::size_t color = 0; color < 16; ++color)
+            page.trackCounts[pitch][color] = words[offset++];
+    }
+    for (std::size_t pitch = 0; pitch < 128; ++pitch)
+        page.ownerColors[pitch] = words[offset++];
+
+    auto existing = std::find_if(
+        keyboardVisualPages_.begin(),
+        keyboardVisualPages_.end(),
+        [generation, spanTicks, pageIndex](const KeyboardVisualPage& item) {
+            return item.generation == generation &&
+                   item.spanTicks == spanTicks &&
+                   item.pageIndex == pageIndex;
+        });
+
+    if (existing != keyboardVisualPages_.end()) {
+        *existing = std::move(page);
+        return;
+    }
+
+    if (keyboardVisualPages_.size() >= 64) {
+        // Keep the 64 snapshots nearest the newest page. This mirrors the roll
+        // worker's rolling page cache without tying keyboard correctness to it:
+        // a missing page simply falls back to the parser's exact seek index.
+        auto victim = keyboardVisualPages_.begin();
+        uint64_t farthest = 0;
+        const uint64_t incomingTick = page.startTick();
+        for (auto it = keyboardVisualPages_.begin();
+             it != keyboardVisualPages_.end();
+             ++it) {
+            const uint64_t tick = it->startTick();
+            const uint64_t distance =
+                tick > incomingTick ? tick - incomingTick : incomingTick - tick;
+            if (it == keyboardVisualPages_.begin() || distance > farthest) {
+                victim = it;
+                farthest = distance;
+            }
+        }
+        keyboardVisualPages_.erase(victim);
+    }
+
+    keyboardVisualPages_.push_back(std::move(page));
 }
 
 void MainWindow::invalidateLiveTrackers()
@@ -688,6 +1072,7 @@ void MainWindow::clearFile()
     stop();
 
     scheduler_.setDocument(nullptr);
+    clearKeyboardVisualPageCache();
     document_ = wasmidi::MidiDocument{};
 
     fileName_.clear();
@@ -708,7 +1093,8 @@ void MainWindow::clearFile()
     peakNpsTime_ = 0.0f;
     peakPolyphony_ = 0;
     pitchRange_ = QStringLiteral("—");
-    skippedVelocity_ = 0;
+    synthEffectiveVelocityFloor_ = synthVelocityFloor_;
+    skippedVelocity_ = synthEffectiveVelocityFloor_;
 
     npsTimeline_.clear();
     tempoTimes_.clear();
@@ -863,6 +1249,40 @@ void MainWindow::rebuildDerivedStats()
 
     bpm_ = tempoBpms_.front();
 
+    if (document_.derivedStatsReady) {
+        peakNps_ = static_cast<int>(
+            std::min<uint32_t>(
+                document_.derivedPeakNps,
+                static_cast<uint32_t>(std::numeric_limits<int>::max())));
+        peakNpsTime_ = document_.derivedPeakNpsTime;
+        peakPolyphony_ = static_cast<int>(
+            std::min<uint32_t>(
+                document_.derivedPeakPolyphony,
+                static_cast<uint32_t>(std::numeric_limits<int>::max())));
+
+        npsTimeline_.reserve(
+            static_cast<int>(
+                std::min<std::size_t>(
+                    document_.derivedNpsTimeline.size(),
+                    std::size_t(std::numeric_limits<int>::max()))));
+        for (uint32_t value : document_.derivedNpsTimeline) {
+            npsTimeline_.push_back(
+                static_cast<int>(
+                    std::min<uint32_t>(
+                        value,
+                        static_cast<uint32_t>(std::numeric_limits<int>::max()))));
+        }
+
+        emit bpmChanged();
+        emit peakNpsChanged();
+        emit peakPolyphonyChanged();
+        emit timelineChanged();
+        return;
+    }
+
+    // Fallback for hand-constructed/legacy in-process documents. Browser-loaded
+    // MIDI files arrive with these expensive statistics already built in the
+    // parser Worker, so Qt never performs this sort on the UI thread.
     // Half-second NPS timeline: same visual data as before, now accumulated
     // directly from TickGroup::noteOnCount instead of per-note start arrays.
     if (duration_ > 0.0f) {
@@ -1040,6 +1460,11 @@ void MainWindow::rebuildDerivedStats()
     emit timelineChanged();
 }
 
+void MainWindow::notifyVisualizerFramePresented()
+{
+    ++visualFrameSerial_;
+}
+
 void MainWindow::play()
 {
     if (!hasMidi())
@@ -1050,6 +1475,10 @@ void MainWindow::play()
 
     playbackAnchorSeconds_ = currentTime_;
     playbackClock_.restart();
+    playbackLastElapsedMs_ = 0;
+    playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
+    synthLastHardResyncElapsedMs_ = -100000;
+    synthWasStarved_ = false;
 
     scheduler_.seek(currentTime_);
     scheduler_.start();
@@ -1076,6 +1505,7 @@ void MainWindow::play()
             scheduleSynthAhead();
         }
     }
+    wasmidi_snappy_sync_visual_clock(currentTime_);
 #endif
 }
 
@@ -1105,6 +1535,9 @@ void MainWindow::stop()
     setPlaying(false);
 
     playbackAnchorSeconds_ = 0.0f;
+    playbackLastElapsedMs_ = 0;
+    playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
+    synthWasStarved_ = false;
     playbackClock_.invalidate();
 
     if (currentTime_ != 0.0f) {
@@ -1146,8 +1579,11 @@ void MainWindow::seek(float seconds)
     currentTime_ = clamped;
     playbackAnchorSeconds_ = clamped;
 
-    if (isPlaying_)
+    if (isPlaying_) {
         playbackClock_.restart();
+        playbackLastElapsedMs_ = 0;
+        playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
+    }
 
     scheduler_.seek(clamped);
     invalidateLiveTrackers();
@@ -1160,6 +1596,7 @@ void MainWindow::seek(float seconds)
         synthPlaybackPrimed_ = true;
         scheduleSynthAhead();
     }
+    wasmidi_snappy_sync_visual_clock(currentTime_);
 #endif
 
     emit currentTimeChanged();
@@ -1255,6 +1692,15 @@ void MainWindow::setVolume(int value)
     emit volumeChanged();
 #ifdef __EMSCRIPTEN__
     wasmidi_snappy_set_volume(volume_);
+
+    // PCM already sitting in the rolling pre-render ring was generated with
+    // the old gain. Audio-setting changes must never leak stale cached audio.
+    if (soundfontLoaded_ && isPlaying_) {
+        wasmidi_snappy_seek(currentTime_);
+        resetSynthSchedule(currentTime_);
+        synthPlaybackPrimed_ = true;
+        scheduleSynthAhead();
+    }
 #endif
 }
 
@@ -1361,6 +1807,76 @@ void MainWindow::setSynthNumBuffers(int value)
     synthNumBuffers_ = clamped;
     emit synthConfigChanged();
     applySynthConfig();
+}
+
+void MainWindow::setSynthPrebufferSeconds(float value)
+{
+    // 0 means "up to the remaining/full MIDI duration". Keep a generous
+    // explicit upper bound for user-entered values; the worker additionally
+    // applies a memory-safe byte cap before allocating the shared PCM ring.
+    const float clamped =
+        value <= 0.0f
+            ? 0.0f
+            : std::clamp(value, 0.25f, 3600.0f);
+
+    if (std::abs(synthPrebufferSeconds_ - clamped) < 0.0001f)
+        return;
+
+    synthPrebufferSeconds_ = clamped;
+    emit synthConfigChanged();
+    publishSynthPrebufferConfig();
+
+    // A buffer-size/audio-cache policy change invalidates already rendered PCM
+    // exactly like an audio setting change requested by the user.
+#ifdef __EMSCRIPTEN__
+    if (soundfontLoaded_ && isPlaying_) {
+        wasmidi_snappy_seek(currentTime_);
+        resetSynthSchedule(currentTime_);
+        synthPlaybackPrimed_ = true;
+        scheduleSynthAhead();
+    }
+#endif
+}
+
+void MainWindow::setSynthVelocityFloor(int value)
+{
+    const int clamped = std::clamp(value, 0, 127);
+    if (synthVelocityFloor_ == clamped)
+        return;
+
+    synthVelocityFloor_ = clamped;
+    synthEffectiveVelocityFloor_ =
+        std::max(synthEffectiveVelocityFloor_, synthVelocityFloor_);
+
+    if (!isPlaying_)
+        synthEffectiveVelocityFloor_ = synthVelocityFloor_;
+
+    if (skippedVelocity_ != synthEffectiveVelocityFloor_) {
+        skippedVelocity_ = synthEffectiveVelocityFloor_;
+        emit skippedVelocityChanged();
+    }
+
+    emit synthConfigChanged();
+
+#ifdef __EMSCRIPTEN__
+    // The velocity floor changes the actual MIDI stream sent to the synth, so
+    // already rendered PCM is invalid just like after a seek or DSP change.
+    if (soundfontLoaded_ && isPlaying_) {
+        wasmidi_snappy_seek(currentTime_);
+        resetSynthSchedule(currentTime_);
+        synthPlaybackPrimed_ = true;
+        scheduleSynthAhead();
+    }
+#endif
+}
+
+void MainWindow::publishSynthPrebufferConfig()
+{
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_set_prebuffer(
+        synthPrebufferSeconds_,
+        duration_);
+#endif
 }
 
 void MainWindow::setSynthRequestedSampleRate(int value)
@@ -1506,6 +2022,13 @@ void MainWindow::setSynthOverlapGain(bool enabled)
 #ifdef __EMSCRIPTEN__
     wasmidi_snappy_set_overlap_gain(
         enabled ? 1 : 0);
+
+    if (soundfontLoaded_ && isPlaying_) {
+        wasmidi_snappy_seek(currentTime_);
+        resetSynthSchedule(currentTime_);
+        synthPlaybackPrimed_ = true;
+        scheduleSynthAhead();
+    }
 #endif
 }
 
@@ -1537,34 +2060,55 @@ void MainWindow::addVisualNote(std::size_t sourceIndex)
     const uint8_t pitch = static_cast<uint8_t>((note.packedData >> 8) & 0x7f);
     const uint8_t color = document_.visualColorIndex(note, perTrackColors_) & 0x0f;
 
-    ++visualPitchCount_[pitch];
-    ++visualPitchColorCounts_[pitch][color];
-    ++visualColorVoices_[color];
-    ++visualActiveVoices_;
+    addVisualCount(pitch, color, 1);
 
-    visualPitchMask_[pitch] = 1;
-    // VisualNote is start-ordered, so the newest active note owns the key color.
+    // VisualNote is source/start ordered, so a seek rebuild naturally leaves
+    // the newest still-active note as the representative keyboard color.
     visualPitchColor_[pitch] = static_cast<int8_t>(color);
-
-    visualEndHeap_.push_back({note.endTick, static_cast<uint32_t>(sourceIndex), pitch, color});
-    std::push_heap(
-        visualEndHeap_.begin(), visualEndHeap_.end(),
-        [](const VisualActiveEnd& left, const VisualActiveEnd& right) {
-            if (left.endTick != right.endTick)
-                return left.endTick > right.endTick;
-            return left.sourceIndex > right.sourceIndex;
-        });
 }
 
-void MainWindow::removeVisualNote(uint8_t pitch, uint8_t color)
+void MainWindow::addVisualCount(uint8_t pitch, uint8_t color, uint32_t count)
 {
-    if (visualPitchCount_[pitch] != 0)
-        --visualPitchCount_[pitch];
-    if (visualPitchColorCounts_[pitch][color] != 0)
-        --visualPitchColorCounts_[pitch][color];
-    if (visualColorVoices_[color] != 0)
-        --visualColorVoices_[color];
-    visualActiveVoices_ = std::max(0, visualActiveVoices_ - 1);
+    if (pitch >= 128 || color >= 16 || count == 0)
+        return;
+
+    const auto addClamped = [](uint32_t current, uint32_t amount) {
+        const uint64_t sum = uint64_t(current) + uint64_t(amount);
+        return static_cast<uint32_t>(
+            std::min<uint64_t>(sum, std::numeric_limits<uint32_t>::max()));
+    };
+
+    visualPitchCount_[pitch] = addClamped(visualPitchCount_[pitch], count);
+    visualPitchColorCounts_[pitch][color] =
+        addClamped(visualPitchColorCounts_[pitch][color], count);
+    visualColorVoices_[color] = addClamped(visualColorVoices_[color], count);
+
+    visualActiveVoices_ = static_cast<int>(
+        std::min<int64_t>(
+            int64_t(std::numeric_limits<int>::max()),
+            int64_t(visualActiveVoices_) + int64_t(count)));
+
+    visualPitchMask_[pitch] = 1;
+}
+
+void MainWindow::removeVisualCount(uint8_t pitch, uint8_t color, uint32_t count)
+{
+    if (pitch >= 128 || color >= 16 || count == 0)
+        return;
+
+    const uint32_t removed =
+        std::min(count, visualPitchColorCounts_[pitch][color]);
+
+    visualPitchColorCounts_[pitch][color] -= removed;
+    visualPitchCount_[pitch] -=
+        std::min(removed, visualPitchCount_[pitch]);
+    visualColorVoices_[color] -=
+        std::min(removed, visualColorVoices_[color]);
+
+    visualActiveVoices_ = static_cast<int>(
+        std::max<int64_t>(
+            0,
+            int64_t(visualActiveVoices_) - int64_t(removed)));
 
     if (visualPitchCount_[pitch] == 0) {
         visualPitchMask_[pitch] = 0;
@@ -1574,9 +2118,10 @@ void MainWindow::removeVisualNote(uint8_t pitch, uint8_t color)
 
     if (visualPitchColor_[pitch] == static_cast<int8_t>(color) &&
         visualPitchColorCounts_[pitch][color] == 0) {
-        // The original key visual ultimately only needs one representative
-        // active color. Prefer the highest currently populated palette slot;
-        // held-state correctness is independent of this tie-break.
+        // This is the same deterministic fallback used by the old heap path.
+        // Exact held-state is represented by counts; the owner stream restores
+        // the newest color whenever another start for this pitch is crossed.
+        visualPitchColor_[pitch] = -1;
         for (int candidate = 15; candidate >= 0; --candidate) {
             if (visualPitchColorCounts_[pitch][candidate] != 0) {
                 visualPitchColor_[pitch] = static_cast<int8_t>(candidate);
@@ -1586,9 +2131,44 @@ void MainWindow::removeVisualNote(uint8_t pitch, uint8_t color)
     }
 }
 
-void MainWindow::rebuildVisualStateAt(double targetTick)
+void MainWindow::applyVisualKeyEvent(
+    const wasmidi::VisualKeyEvent& event,
+    bool add)
 {
-    visualEndHeap_.clear();
+    const uint8_t pitch = document_.visualKeyPitch(event.packedData);
+    const uint8_t color = document_.visualKeyColor(event.packedData, perTrackColors_) & 0x0f;
+
+    if (add)
+        addVisualCount(pitch, color, event.count);
+    else
+        removeVisualCount(pitch, color, event.count);
+}
+
+bool MainWindow::restoreVisualStateFromPage(double targetTick)
+{
+    if (keyboardVisualPages_.empty())
+        return false;
+
+    const KeyboardVisualPage* best = nullptr;
+    uint64_t bestTick = 0;
+
+    for (const auto& page : keyboardVisualPages_) {
+        if (page.generation != keyboardVisualGeneration_ || page.spanTicks == 0)
+            continue;
+
+        const uint64_t tick = page.startTick();
+        if (double(tick) > targetTick)
+            continue;
+
+        if (!best || tick >= bestTick) {
+            best = &page;
+            bestTick = tick;
+        }
+    }
+
+    if (!best)
+        return false;
+
     visualPitchCount_.fill(0);
     visualPitchMask_.fill(0);
     visualPitchColor_.fill(-1);
@@ -1597,6 +2177,113 @@ void MainWindow::rebuildVisualStateAt(double targetTick)
     visualColorVoices_.fill(0);
     visualActiveVoices_ = 0;
 
+    const auto& sourceCounts =
+        perTrackColors_ ? best->trackCounts : best->globalCounts;
+
+    for (std::size_t pitch = 0; pitch < 128; ++pitch) {
+        uint64_t pitchTotal = 0;
+        for (std::size_t color = 0; color < 16; ++color) {
+            const uint32_t count = sourceCounts[pitch][color];
+            visualPitchColorCounts_[pitch][color] = count;
+            pitchTotal += count;
+            visualColorVoices_[color] = static_cast<uint32_t>(
+                std::min<uint64_t>(
+                    uint64_t(std::numeric_limits<uint32_t>::max()),
+                    uint64_t(visualColorVoices_[color]) + count));
+        }
+
+        visualPitchCount_[pitch] = static_cast<uint32_t>(
+            std::min<uint64_t>(pitchTotal, std::numeric_limits<uint32_t>::max()));
+        visualPitchMask_[pitch] = pitchTotal != 0 ? 1 : 0;
+
+        if (pitchTotal == 0)
+            continue;
+
+        const uint32_t ownerWord = best->ownerColors[pitch];
+        int owner = perTrackColors_
+            ? int((ownerWord >> 8) & 0xffu)
+            : int(ownerWord & 0xffu);
+
+        if (owner < 0 || owner >= 16 ||
+            visualPitchColorCounts_[pitch][std::size_t(owner)] == 0) {
+            owner = -1;
+            for (int candidate = 15; candidate >= 0; --candidate) {
+                if (visualPitchColorCounts_[pitch][std::size_t(candidate)] != 0) {
+                    owner = candidate;
+                    break;
+                }
+            }
+        }
+
+        visualPitchColor_[pitch] = static_cast<int8_t>(owner);
+        visualActiveVoices_ = static_cast<int>(
+            std::min<int64_t>(
+                int64_t(std::numeric_limits<int>::max()),
+                int64_t(visualActiveVoices_) +
+                    int64_t(std::min<uint64_t>(
+                        pitchTotal,
+                        uint64_t(std::numeric_limits<int>::max())))));
+    }
+
+    visualKeyStartCursor_ = std::min<std::size_t>(
+        best->startCursor, document_.visualKeyStarts.size());
+    visualKeyEndCursor_ = std::min<std::size_t>(
+        best->endCursor, document_.visualKeyEnds.size());
+    visualKeyOwnerCursor_ = std::min<std::size_t>(
+        best->ownerCursor, document_.visualKeyOwners.size());
+    visualTick_ = double(bestTick);
+    visualStateValid_ = true;
+
+    advanceVisualStateTo(targetTick);
+    return true;
+}
+
+void MainWindow::advanceVisualStateTo(double targetTick)
+{
+    // Forward playback advances compact counted streams built by the MIDI
+    // parser worker. A million identical starts at one crashpoint can now be
+    // one add instead of one million heap pushes on the UI thread.
+    while (visualKeyStartCursor_ < document_.visualKeyStarts.size() &&
+           double(document_.visualKeyStarts[visualKeyStartCursor_].tick) <= targetTick) {
+        applyVisualKeyEvent(document_.visualKeyStarts[visualKeyStartCursor_], true);
+        ++visualKeyStartCursor_;
+    }
+
+    while (visualKeyOwnerCursor_ < document_.visualKeyOwners.size() &&
+           double(document_.visualKeyOwners[visualKeyOwnerCursor_].tick) <= targetTick) {
+        const auto& owner = document_.visualKeyOwners[visualKeyOwnerCursor_];
+        const uint8_t pitch = document_.visualKeyPitch(owner.packedData);
+        if (pitch < 128 && visualPitchCount_[pitch] != 0) {
+            visualPitchColor_[pitch] = static_cast<int8_t>(
+                document_.visualKeyColor(owner.packedData, perTrackColors_) & 0x0f);
+        }
+        ++visualKeyOwnerCursor_;
+    }
+
+    while (visualKeyEndCursor_ < document_.visualKeyEnds.size() &&
+           double(document_.visualKeyEnds[visualKeyEndCursor_].tick) < targetTick) {
+        applyVisualKeyEvent(document_.visualKeyEnds[visualKeyEndCursor_], false);
+        ++visualKeyEndCursor_;
+    }
+
+    visualTick_ = targetTick;
+}
+
+void MainWindow::rebuildVisualStateAt(double targetTick)
+{
+    if (restoreVisualStateFromPage(targetTick))
+        return;
+
+    visualPitchCount_.fill(0);
+    visualPitchMask_.fill(0);
+    visualPitchColor_.fill(-1);
+    for (auto& counts : visualPitchColorCounts_)
+        counts.fill(0);
+    visualColorVoices_.fill(0);
+    visualActiveVoices_ = 0;
+
+    // Arbitrary seeks use the exact source stream plus its block max-end index.
+    // This scans only blocks that can still contain a held note at targetTick.
     const std::size_t hi = document_.upperBoundVisualStart(targetTick);
     const std::size_t blockSize = wasmidi::MidiDocument::VisualSeekBlockSize;
     const std::size_t blockCount = (hi + blockSize - 1) / blockSize;
@@ -1616,7 +2303,38 @@ void MainWindow::rebuildVisualStateAt(double targetTick)
         }
     }
 
-    visualStartCursor_ = hi;
+    const auto startIt = std::upper_bound(
+        document_.visualKeyStarts.begin(),
+        document_.visualKeyStarts.end(),
+        targetTick,
+        [](double tick, const wasmidi::VisualKeyEvent& event) {
+            return tick < double(event.tick);
+        });
+    visualKeyStartCursor_ = static_cast<std::size_t>(
+        startIt - document_.visualKeyStarts.begin());
+
+    // A note is active at its exact end tick, so only end events strictly
+    // before targetTick have already been consumed.
+    const auto endIt = std::lower_bound(
+        document_.visualKeyEnds.begin(),
+        document_.visualKeyEnds.end(),
+        targetTick,
+        [](const wasmidi::VisualKeyEvent& event, double tick) {
+            return double(event.tick) < tick;
+        });
+    visualKeyEndCursor_ = static_cast<std::size_t>(
+        endIt - document_.visualKeyEnds.begin());
+
+    const auto ownerIt = std::upper_bound(
+        document_.visualKeyOwners.begin(),
+        document_.visualKeyOwners.end(),
+        targetTick,
+        [](double tick, const wasmidi::VisualKeyOwner& owner) {
+            return tick < double(owner.tick);
+        });
+    visualKeyOwnerCursor_ = static_cast<std::size_t>(
+        ownerIt - document_.visualKeyOwners.begin());
+
     visualTick_ = targetTick;
     visualStateValid_ = true;
 }
@@ -1634,32 +2352,7 @@ void MainWindow::syncVisualState(double targetTick, bool forceRebuild)
     if (forceRebuild || !visualStateValid_ || targetTick < visualTick_) {
         rebuildVisualStateAt(targetTick);
     } else {
-        const auto heapCompare =
-            [](const VisualActiveEnd& left, const VisualActiveEnd& right) {
-                if (left.endTick != right.endTick)
-                    return left.endTick > right.endTick;
-                return left.sourceIndex > right.sourceIndex;
-            };
-
-        // A note remains held at its exact MIDI end tick, matching the visual
-        // interval test endTick >= currentTick. Remove it on the first later tick.
-        while (!visualEndHeap_.empty() &&
-               double(visualEndHeap_.front().endTick) < targetTick) {
-            std::pop_heap(visualEndHeap_.begin(), visualEndHeap_.end(), heapCompare);
-            const VisualActiveEnd ended = visualEndHeap_.back();
-            visualEndHeap_.pop_back();
-            removeVisualNote(ended.pitch, ended.color);
-        }
-
-        while (visualStartCursor_ < document_.visualNotes.size() &&
-               double(document_.visualNotes[visualStartCursor_].startTick) <= targetTick) {
-            const auto& note = document_.visualNotes[visualStartCursor_];
-            if (double(note.endTick) >= targetTick)
-                addVisualNote(visualStartCursor_);
-            ++visualStartCursor_;
-        }
-
-        visualTick_ = targetTick;
+        advanceVisualStateTo(targetTick);
     }
 
     if (oldMask != visualPitchMask_ || oldColors != visualPitchColor_)
@@ -1675,7 +2368,8 @@ void MainWindow::updateNeuralVisuals()
             std::min<double>(duration_, double(currentTime_) + 0.15);
         const double futureTick = document_.secondsToTick(futureSeconds);
 
-        const std::size_t targetLo = visualStartCursor_;
+        const std::size_t targetLo = document_.upperBoundVisualStart(
+            document_.secondsToTick(currentTime_));
         const std::size_t targetHi = document_.upperBoundVisualStart(futureTick);
 
         const bool rebuild =
@@ -1949,27 +2643,154 @@ void MainWindow::updateCurrentTime()
     if (!isPlaying_)
         return;
 
-    float nextTime =
-        playbackAnchorSeconds_ +
-        static_cast<float>(playbackClock_.elapsed()) / 1000.0f;
+    // Advance the master timeline only after the horizontal visualizer has
+    // actually completed another frame. This turns renderer slowdown into
+    // transport slowdown instead of letting keyboard/audio run ahead.
+    if (visualFrameSerial_ == playbackConsumedVisualFrameSerial_)
+        return;
 
-#ifdef __EMSCRIPTEN__
-    if (soundfontLoaded_) {
-        const double audioTime = wasmidi_snappy_audio_clock();
-        if (audioTime >= 0.0 && std::isfinite(audioTime))
-            nextTime = static_cast<float>(audioTime);
-    }
-#endif
+    playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
 
-    currentTime_ = std::clamp(nextTime, 0.0f, duration_);
+    // The visual timeline is authoritative. Advance it from GUI-frame time,
+    // never from SnappySynth's AudioWorklet clock. A long browser/UI stall is
+    // deliberately clamped instead of being converted into a giant visual
+    // jump; keyboard and roll therefore remain together and the synth is
+    // resynchronized to this clock after the UI recovers.
+    const qint64 elapsedMs =
+        playbackClock_.isValid()
+            ? playbackClock_.elapsed()
+            : 0;
+
+    qint64 deltaMs =
+        std::max<qint64>(
+            0,
+            elapsedMs - playbackLastElapsedMs_);
+
+    playbackLastElapsedMs_ = elapsedMs;
+
+    constexpr qint64 MaxVisualStepMs = 50;
+    deltaMs = std::min(deltaMs, MaxVisualStepMs);
+
+    const float nextTime =
+        currentTime_ +
+        static_cast<float>(deltaMs) / 1000.0f;
+
+    currentTime_ =
+        std::clamp(
+            nextTime,
+            0.0f,
+            duration_);
 
     if (currentTime_ >= duration_) {
         stop();
         return;
     }
 
+#ifdef __EMSCRIPTEN__
+    if (soundfontLoaded_)
+        wasmidi_snappy_sync_visual_clock(currentTime_);
+#endif
+
+    updateSynthSynchronization();
+
     emit currentTimeChanged();
     updateLiveStats();
+}
+
+void MainWindow::updateEffectiveVelocityFloor(double synthLagSeconds)
+{
+    int target = synthVelocityFloor_;
+
+    // While audio is behind, progressively drop quiet NoteOns. The user's
+    // configured floor is always the minimum. At >=350 ms lag the adaptive
+    // floor reaches 127, leaving only maximum-velocity NoteOns until recovery.
+    if (synthLagSeconds > 0.025) {
+        const double pressure =
+            std::clamp(
+                (synthLagSeconds - 0.025) / 0.325,
+                0.0,
+                1.0);
+
+        target =
+            synthVelocityFloor_ +
+            static_cast<int>(
+                std::lround(
+                    pressure *
+                    double(127 - synthVelocityFloor_)));
+    }
+
+    target = std::clamp(target, synthVelocityFloor_, 127);
+
+    if (target > synthEffectiveVelocityFloor_) {
+        // Catch-up pressure takes effect immediately.
+        synthEffectiveVelocityFloor_ = target;
+    } else if (target < synthEffectiveVelocityFloor_) {
+        // Recover gradually so an oscillating deadline does not chatter the
+        // audible velocity cutoff on every 16 ms GUI tick.
+        synthEffectiveVelocityFloor_ =
+            std::max(
+                target,
+                synthEffectiveVelocityFloor_ - 2);
+    }
+
+    if (skippedVelocity_ != synthEffectiveVelocityFloor_) {
+        skippedVelocity_ = synthEffectiveVelocityFloor_;
+        emit skippedVelocityChanged();
+    }
+}
+
+void MainWindow::updateSynthSynchronization()
+{
+#ifdef __EMSCRIPTEN__
+    if (!soundfontLoaded_) {
+        updateEffectiveVelocityFloor(0.0);
+        return;
+    }
+
+    const double audioTime = wasmidi_snappy_audio_clock();
+    if (audioTime < 0.0 || !std::isfinite(audioTime))
+        return;
+
+    const double lag =
+        double(currentTime_) - audioTime;
+
+    updateEffectiveVelocityFloor(lag);
+
+    const bool starved =
+        wasmidi_snappy_starved() != 0;
+
+    // Audio follows the visual timeline, never the reverse. During starvation
+    // the background renderer is allowed to refill without forcing the UI to
+    // wait. As soon as the AudioWorklet becomes healthy again, rebuild at the
+    // exact visual position so playback never resumes from an old lagged clock.
+    const bool recoveredFromStarvation =
+        synthWasStarved_ && !starved;
+    synthWasStarved_ = starved;
+
+    constexpr double HardResyncLagSeconds = 0.10;
+    constexpr qint64 HardResyncCooldownMs = 100;
+
+    const qint64 elapsedMs =
+        playbackClock_.isValid()
+            ? playbackClock_.elapsed()
+            : 0;
+
+    if (!starved &&
+        (recoveredFromStarvation ||
+         std::abs(lag) >= HardResyncLagSeconds) &&
+        elapsedMs - synthLastHardResyncElapsedMs_ >=
+            HardResyncCooldownMs) {
+        synthLastHardResyncElapsedMs_ = elapsedMs;
+
+        wasmidi_snappy_seek(currentTime_);
+        resetSynthSchedule(currentTime_);
+        synthPlaybackPrimed_ = true;
+        scheduleSynthAhead();
+        wasmidi_snappy_sync_visual_clock(currentTime_);
+    }
+#else
+    updateEffectiveVelocityFloor(0.0);
+#endif
 }
 
 uint32_t MainWindow::packSynthMessage(const wasmidi::CompactEvent& event) const
@@ -2095,6 +2916,8 @@ void MainWindow::resetSynthSchedule(float seconds)
             if (note.endTick < tick)
                 continue;
             const uint8_t velocity = note.packedData & 0x7f;
+            if (velocity < synthEffectiveVelocityFloor_)
+                continue;
             const uint8_t pitch = (note.packedData >> 8) & 0x7f;
             const uint8_t channel = (note.packedData >> 24) & 0x0f;
             appendState(uint32_t(0x90 | channel) |
@@ -2120,10 +2943,20 @@ void MainWindow::scheduleSynthAhead()
     if (!isPlaying_ || !soundfontLoaded_ || document_.tickGroups.empty())
         return;
 
-    constexpr double LookAheadSeconds = 0.40;
     constexpr std::size_t BatchLimit = 65536;
 
-    const double target = std::min<double>(duration_, double(currentTime_) + LookAheadSeconds);
+    const double requestedAhead =
+        synthPrebufferSeconds_ <= 0.0f
+            ? std::max(0.0, double(duration_) - double(currentTime_))
+            : double(synthPrebufferSeconds_);
+
+    // Keep the worker's rolling PCM cache supplied through its full requested
+    // horizon. A small guard gives the worker one additional render quantum so
+    // it never reaches the safeUntil boundary exactly at the worklet deadline.
+    const double target =
+        std::min<double>(
+            duration_,
+            double(currentTime_) + requestedAhead + 0.10);
     if (target <= synthScheduledUntil_ + 0.015)
         return;
 
@@ -2170,6 +3003,12 @@ void MainWindow::scheduleSynthAhead()
                         break;
                     ++run;
                 }
+
+                if (event.data2 < synthEffectiveVelocityFloor_) {
+                    i += run - 1;
+                    continue;
+                }
+
                 if (run > 1) {
                     message |= uint32_t(run - 1) << 24;
                     i += run - 1;

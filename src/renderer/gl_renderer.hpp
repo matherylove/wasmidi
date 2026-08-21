@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace wasmidi {
@@ -32,6 +33,12 @@ public:
     void setNeuralVisual(float hue, float activity);
 
     void renderRoll();
+
+    // Called only by the browser visual-cache Worker bridge.
+    void receiveVisualPage(uint32_t generation, uint32_t spanTicks,
+                           uint32_t pageIndex, const uint32_t* words,
+                           uint32_t noteCount, uint32_t sourceCount,
+                           double difficulty);
 
 private:
     struct NeuralNode {
@@ -69,7 +76,27 @@ private:
     void uploadSourceRange(std::size_t begin, std::size_t end);
     void rebuildVisualCache(std::size_t begin, std::size_t end);
     void syncVisualCache(uint32_t viewStart, uint32_t viewEnd);
+    void rebuildCarryCache(uint32_t viewStart, std::size_t desiredBegin);
+    void advanceCarryCache(uint32_t viewStart, std::size_t oldBegin, std::size_t desiredBegin);
+    void uploadCarryCache();
     void setInstanceBase(std::size_t physicalIndex);
+
+    struct VisualPage {
+        uint32_t spanTicks = 0;
+        uint32_t pageIndex = 0;
+        uint32_t sourceCount = 0;
+        double difficulty = 0.0;
+        std::vector<VisualNote> notes;
+    };
+
+    void resetVisualPageCache(bool reinstallDocument);
+    void primeVisualPageCache(uint32_t viewStart, uint32_t viewEnd);
+    bool collectCachedPageNotes(uint32_t searchStart, uint32_t viewEnd,
+                                std::vector<VisualNote>& output) const;
+    bool buildDenseDrawList(uint32_t viewStart, uint32_t viewEnd,
+                            std::size_t desiredBegin, std::size_t desiredEnd);
+    void uploadDenseDrawList();
+    void drawDenseNotes();
 
     void calculateView(uint32_t& currentTick,
                        uint32_t& viewStart,
@@ -96,6 +123,10 @@ private:
     GLuint noteProgram_ = 0;
     GLuint noteVao_ = 0;
     GLuint noteVbo_ = 0;
+    GLuint carryVao_ = 0;
+    GLuint carryVbo_ = 0;
+    GLuint denseVao_ = 0;
+    GLuint denseVbo_ = 0;
 
     GLint viewStartUniform_ = -1;
     GLint viewEndUniform_ = -1;
@@ -123,6 +154,25 @@ private:
 
     // CPU mirror of only the cached start-ordered visual range.
     std::vector<VisualNote> ring_;
+    // Notes whose starts have left the rolling start-time cache but whose ends
+    // still intersect the visible history. Kept in source order and drawn first.
+    std::vector<VisualNote> carryNotes_;
+    // Resolution-dependent dense draw list. It is rebuilt only for MIDI views
+    // large enough to benefit, and contains only notes that can contribute at
+    // least one currently visible pixel after source-order occlusion.
+    std::vector<VisualNote> denseNotes_;
+    std::vector<VisualNote> denseSourceScratch_;
+    // One bit per snapped horizontal pixel per pitch. Bitset coverage makes
+    // full-occlusion queries O(width/64) instead of scanning every pixel for
+    // every rejected note at Black-MIDI crashpoints.
+    std::vector<uint64_t> denseCoverage_;
+    std::unordered_map<uint32_t, VisualPage> visualPages_;
+    uint32_t visualCacheGeneration_ = 1;
+    uint32_t visualPageSpanTicks_ = 0;
+    uint32_t visualWantedFirstPage_ = 0;
+    uint32_t visualWantedPageCount_ = 0;
+    uint32_t visualCurrentPage_ = 0;
+    int visualPrimeWidth_ = 0;
     std::size_t ringCapacity_ = 0;
     std::size_t ringMask_ = 0;
 

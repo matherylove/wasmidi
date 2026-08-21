@@ -1,69 +1,56 @@
-# WASMIDI Pass 11 — Validation
+# WASMIDI Pass 12 — Validation
 
-## Passed
+## Local checks passed
 
+- `sha256sum -c MANIFEST.sha256` for all manifest-tracked critical files.
+- `git diff --check`.
 - `node --check`:
-  - web/snappysynth-worker.js
-  - web/snappysynth-audio-worklet.js
-  - web/snappysynth_bridge.js
-- Native compatibility-event smoke test:
-  - timeout while unsignaled
-  - SetEvent
-  - successful auto-reset wait
-  - timeout after automatic reset
-- WASM SIMD intrinsic compile test:
-  - `clang --target=wasm32 -msimd128`
-  - i16->i32->f32 conversion
-  - f32x4 multiply/add
-  - vector shuffle
-  - v128 load/store
-- Shared-ring AudioWorklet functional test:
-  - 128 known interleaved stereo Float32 frames
-  - exact L/R values delivered from SharedArrayBuffer
-  - correct read/available atomic counters
-- CMake exports `_ssw_render_into` and retains `-msimd128`.
-- No `-ffast-math`.
-- `ssw_render()` and `ssw_render_into()` both use the same
-  `ssw_render_to_buffer()` path containing:
-  - voice_set_render_timing
-  - original MIDI dispatch
-  - memset
-  - voice_render_float
-  - identical render cursor advancement
-- No Pass 10 transferable PCM pool remains in the Worker.
-- No `type: "pcm"` Worker -> AudioWorklet block transfer remains.
-- MIDI event messages/offsets are written directly into WASM HEAPU32.
-- Pass 10 `mainScriptUrlOrBlob`, pthread startup, layers, source voice stealing,
-  VOR, SysEx and full configuration paths remain in place.
+  - `web/midi-parser-worker.js`
+  - `web/visual-cache-worker.js`
+  - `web/snappysynth_bridge.js`
+  - `web/snappysynth-worker.js`
+  - `web/snappysynth-audio-worklet.js`
+- Native C++17 compilation of:
+  - `src/midi/midi_parser.cpp`
+  - `src/midi/midi_document_codec.cpp`
+  - `src/midi/midi_worker_core.cpp`
+- `MidiDocument` wire-codec round trip, including corruption rejection.
+- Synthetic 50,000-note same-tick MIDI parser stress test:
+  - 50,000 source/visual notes retained;
+  - key start/end streams compressed to 88 counted entries each;
+  - peak polyphony and peak NPS both detected as 50,000;
+  - serialized/deserialized document retained counts and visual data.
+- Visual-cache Worker functional test:
+  - 4 requested roll pages emitted;
+  - 4 matching keyboard snapshots emitted;
+  - current page prioritized first;
+  - keyboard state at page boundaries matched inclusive note-end semantics.
+- AudioWorklet visual-clock gate functional test:
+  - PCM consumption stopped at the visual lead ceiling;
+  - intentional visual gating did not increment underrun count;
+  - advancing the visual clock released PCM consumption again.
 
-## Fidelity boundary
+## Fidelity rules exercised by the implementation
 
-The optimization changes execution/transport, not SoundFont parsing or DSP
-algorithms.
-
-At unity UI gain, the shared-memory transport test is exact Float32 value for
-value. Pass 10's outputGain multiplication is retained for non-unity UI volume.
-
-WASM SIMD is used only in source-equivalent sustain/no-interpolation fast-path
-cases. Other cases continue through the existing code.
+- SnappySynth synthesis still enters the existing `ssw_render_to_buffer()` /
+  `voice_render_float()` path.
+- Larger browser render calls retain sample-accurate MIDI offsets inside each
+  call.
+- No `-ffast-math` or relaxed DSP mode is added.
+- Dense-note removal is full-pixel-occlusion-only; partially visible notes are
+  not split or discarded.
+- Horizontal source/draw order is retained after dense reduction.
+- Long-note lifetime uses `endTick`, not only `startTick` cache residency.
+- Missing background visual pages fall back to the authoritative source index.
+- Keyboard snapshot recovery has an exact parser-index fallback.
+- SnappySynth audio clock is not allowed to advance the visual timeline.
 
 ## Environment limitation
 
-The exact Qt 6.8.3 + Emscripten 3.1.56 final link is not available in this
-container. The included repository GitHub Actions workflow remains the
-authoritative WebAssembly build/runtime check.
+This container does not provide Qt 6.8 or Emscripten (`emcc`), so the final Qt
+WebAssembly compile/link cannot be executed locally. The GitHub Actions workflow
+is configured for that authoritative build.
 
-Actual speedup depends on workload. Dense sustained voices with unfiltered
-no-interpolation samples benefit most; heavily pitched/interpolated or filtered
-voices still spend more time in scalar code.
-
-
-## Final hot-path validation
-
-- Worker, AudioWorklet and bridge: `node --check` PASS.
-- wasm32 SIMD128 A/B:
-  - scalar float accumulation vs SIMD accumulation: bit-exact PASS.
-  - scalar int16->float scale/add vs SIMD scale/add: bit-exact PASS.
-- Shared-memory AudioWorklet: 128 stereo Float32 frames delivered
-  value-for-value at unity gain: PASS.
-- No `-ffast-math`; existing source DSP and render cadence are unchanged.
+The connected GitHub integration in this session can read the repository but
+returned HTTP 403 `Resource not accessible by integration` for branch/blob write
+operations, so this pass could not be pushed to a CI branch from the session.

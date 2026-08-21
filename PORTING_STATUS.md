@@ -1,85 +1,112 @@
-# WASMIDI Pass 11 — SnappySynthV2 WASM Hot Path
+# WASMIDI Pass 12 — Buffered Playback and Visual Pipeline
 
-Apply on top of Pass 10 Full Fidelity.
+This pass keeps the supplied SnappySynthV2 DSP/voice engine and changes the
+browser scheduling, transport, loading and visual-cache architecture around it.
 
-This pass is performance-only. It does not replace the supplied SnappySynthV2
-voice engine and does not change MIDI dispatch, voice stealing, VOR, filters,
-envelopes, interpolation rules, SoundFont layering, controller state, SysEx
-behavior, or the configured SnappySynth render-block cadence.
+## SnappySynthV2
 
-## Main bottlenecks found
+A source comparison against the supplied native SnappySynthV2 tree found the
+WASM `Voice/voice.c` to be overwhelmingly source-equivalent; the largest browser
+penalty was the execution model around it rather than a replacement DSP engine.
 
-The native source contains AVX2/AVX512 fast paths. Although the WASM target was
-compiled with `-msimd128`, those x86-only feature guards left WebAssembly on
-scalar paths.
+The browser backend now:
 
-The browser integration also added costs absent in the native driver:
-- pthread mutex+condition-variable event emulation for worker barriers;
-- a full PCM copy from WASM heap to a temporary transferable ArrayBuffer;
-- one Worker -> AudioWorklet PCM transfer per rendered block;
-- temporary JS event/offset TypedArrays followed by copies into WASM;
-- front removal/compaction overhead in dense event batches.
+- writes PCM directly into a Shared WebAssembly.Memory ring read by the
+  AudioWorklet;
+- uses that ring as a configurable rolling pre-render cache (default 8 s,
+  `0` = up to the MIDI duration, with a browser-memory cap);
+- renders several configured source blocks in one `ssw_render_into()` call
+  (normally about 4096 frames) while retaining sample offsets for events inside
+  the larger call, amortizing pthread worker barriers;
+- proactively fills the ring instead of waiting for a shallow realtime queue;
+- invalidates pre-rendered PCM on seek and audio/MIDI-stream settings changes;
+- keeps the user velocity floor as the minimum adaptive floor and can raise the
+  effective floor toward 127 under audio catch-up pressure.
 
-## Optimizations
+The AudioWorklet is transport-following, not transport-leading. The horizontal
+visualizer is the master clock. Audio consumption is bounded by the most recent
+visual clock sample, and recovered/starved audio is rebuilt at the current
+visual position instead of resuming from an old lagged position.
 
-### WASM SIMD128
-`Voice/voice.c` now includes WebAssembly SIMD equivalents for:
-- multi-voice stereo sustain batching;
-- mono -> mono no-interpolation sustain;
-- mono -> stereo no-interpolation sustain;
-- stereo -> stereo no-interpolation sustain;
-- final worker-buffer copy/add accumulation.
+## Master visual clock
 
-They retain the source eligibility conditions and per-sample voice addition
-order. Pitched/interpolated, filtered and envelope-transition paths continue to
-use the original code.
+Playback time advances only after the horizontal renderer reports another
+completed frame. Each accepted step is bounded, so a renderer slowdown becomes
+a transport slowdown instead of allowing the keyboard/audio to run ahead while
+visual frames are dropped.
 
-No `-ffast-math` or relaxed DSP option was added.
+The keyboard consumes the same MainWindow timeline. SnappySynth may prepare PCM
+ahead in the background, but the AudioWorklet cannot consume indefinitely past
+the visual clock.
 
-### Futex-backed Emscripten events
-Only on Emscripten, Win32-compatible events use an atomic 32-bit state plus
-`emscripten_futex_wait/wake` instead of mutex+cond locking on every synth worker
-start/done signal. Native/POSIX behavior outside Emscripten is unchanged.
+## Non-blocking MIDI loading
 
-### Shared-memory PCM ring
-`ssw_render_into()` enters the exact same `ssw_render_to_buffer()` implementation
-as `ssw_render()`, but writes directly into a ring in the pthread Shared
-WebAssembly.Memory.
+Browser MIDI loading uses a dedicated non-pthread Emscripten parser module in a
+Web Worker:
 
-The AudioWorklet reads that same SharedArrayBuffer. The hot path no longer
-performs:
-- HEAPF32 -> temporary PCM Float32Array copy;
-- transferable PCM ArrayBuffer allocation/pool;
-- PCM postMessage transfer;
-- buffer-recycle messages.
+- file reading reports progress;
+- parsing, visual-index construction and density statistics are performed in the
+  Worker;
+- a compact `MidiDocument` wire representation is transferred to Qt;
+- QML presents a modal program-styled percentage/progress overlay throughout the
+  browser loading path.
 
-A generation counter rejects stale in-progress blocks after seek/flush.
+The normal native/direct `loadMidiRaw()` path remains available outside the
+browser Worker picker path.
 
-The user-configured SnappySynth BufferSize is still the actual synth render
-block size. It was deliberately not enlarged for benchmarks because that could
-change block-boundary behavior.
+## Horizontal visualizer
 
-### Event path
-Final MIDI messages and sample offsets are written directly into Emscripten
-HEAPU32. The two temporary JS scratch TypedArrays and their per-block heap copies
-are removed.
+The renderer keeps two complementary caches:
 
-Consumed event batches use a cursor plus occasional compaction instead of
-repeated front removal.
+1. the persistent start-ordered GPU ring for immediate/recovery rendering;
+2. a background 64-page rolling render cache built by `visual-cache-worker.js`.
 
-### Output semantics
-Pass 10's post-synth AudioWorklet `outputGain` multiply is retained exactly.
-It was not moved to a GainNode, specifically to avoid an unnecessary audible
-behavior change while optimizing unrelated transport work.
+A note is no longer discarded merely because its start left the rolling window.
+Long notes move into a carry cache and remain drawable until their end leaves the
+visible history. Reverse seeks and discontinuous jumps explicitly rebuild the
+ring and carry set using the parser's 4096-note max-end seek index.
 
+The page Worker scores upcoming screen pages from note density, same-tick
+crashpoints, pitch concentration and duration pressure. The current page is
+prepared first, then the hardest pages. Difficulty results are cached while the
+page span remains unchanged.
 
-## Final hot-path cleanup
+Missing/unfinished pages never block playback: the renderer falls back to the
+persistent source GPU ring.
 
-- Added WASM SIMD128 to subsequent worker mix-buffer accumulation.
-- Removed the dense-event count pass; events are written directly into
-  persistent WASM scratch arrays in one traversal.
-- Removed normal-case AudioWorklet full-buffer clearing and bypassed only the
-  exact `* 1.0` UI gain operation at unity.
-- No interpolation, filters, envelopes, VOR, steals, SoundFont behavior,
-  limiter/soft clip, MIDI timing formula, render block size, or worker ordering
-  was changed.
+## Keyboard visual cache
+
+The parser builds counted key-start/key-end streams and a newest-owner stream.
+The same visual-cache Worker prepares exact keyboard snapshots at the rolling
+screen boundaries, in the same difficult-page priority order as the roll.
+
+A seek restores the nearest cached snapshot and replays only the residual event
+range. If the snapshot is unavailable, the existing exact source/block-index
+recovery path is used.
+
+## Dense-note reduction
+
+For dense views, note intervals are projected to the current horizontal pixel
+columns and processed in reverse source/draw order. An earlier same-pitch note is
+removed only when every pixel column it could contribute is already covered by a
+later opaque note. Zero-width sub-pixel notes are also removed.
+
+Partial overlaps are retained whole. Source order is restored before drawing, so
+stacking, clipping and visible density are unchanged. Coverage uses a 64-bit
+per-pitch bitset to keep full-occlusion queries cheap at crashpoints.
+
+## Resize and live colors
+
+During live resize, the old FBO texture is reused/stretched and final-resolution
+FBO recreation is delayed until geometry has been stable for 140 ms. The
+keyboard instance buffer is only rebuilt when key state or palette data changes.
+
+Custom channel color changes are forwarded while the color dialog is changing,
+not only when it is accepted; presets remain immediate.
+
+## Build note
+
+The repository workflow has been extended to build/deploy the standalone MIDI
+parser WASM/JS and both hand-written browser Workers. A full Qt 6.8/Emscripten
+link still requires the repository CI/toolchain; the local execution environment
+used for this pass does not contain Qt or `emcc`.

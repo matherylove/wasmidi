@@ -36,6 +36,25 @@ struct VisualNote {
 };
 static_assert(sizeof(VisualNote) == 12, "VisualNote must stay 12 bytes");
 
+// Playback-time keyboard index. A single event represents COUNT notes with the
+// same tick/pitch/global-color/per-track-color signature, so a million-note
+// crashpoint can advance the keyboard with a handful of counted operations.
+// packedData: bits 0..7 pitch, 8..11 global color, 12..15 per-track color.
+struct VisualKeyEvent {
+    uint32_t tick = 0;
+    uint32_t count = 0;
+    uint32_t packedData = 0;
+};
+static_assert(sizeof(VisualKeyEvent) == 12, "VisualKeyEvent must stay 12 bytes");
+
+// Last-started color owner for one pitch at a tick. Counts live in the event
+// tables above; this tiny stream preserves the keyboard's newest-note color.
+struct VisualKeyOwner {
+    uint32_t tick = 0;
+    uint32_t packedData = 0;
+};
+static_assert(sizeof(VisualKeyOwner) == 8, "VisualKeyOwner must stay 8 bytes");
+
 // Sparse timing index. There is one entry only for ticks that contain
 // channel events, rather than allocating maxTick+1 entries.
 struct TickGroup {
@@ -72,6 +91,14 @@ struct MidiDocument {
     uint8_t maxPitch = 0;
     bool hasPitch = false;
 
+    // Worker-precomputed UI statistics. Keeping the expensive peak-polyphony
+    // sort here prevents the final 98% loading stage from blocking Qt.
+    uint32_t derivedPeakNps = 0;
+    float derivedPeakNpsTime = 0.0f;
+    uint32_t derivedPeakPolyphony = 0;
+    bool derivedStatsReady = false;
+    std::vector<uint32_t> derivedNpsTimeline;
+
     // Single authoritative playback/control stream, already ordered by tick.
     std::vector<CompactEvent> events;
     std::vector<TickGroup> tickGroups;
@@ -86,6 +113,13 @@ struct MidiDocument {
     // A seek can skip entire historical blocks whose notes all ended already.
     static constexpr std::size_t VisualSeekBlockSize = 4096;
     std::vector<uint32_t> visualBlockMaxEnd;
+
+    // Compressed keyboard timeline built in the parser Worker. Starts are
+    // active at tick <= currentTick; ends are removed only when endTick <
+    // currentTick, matching the roll's inclusive VisualNote interval.
+    std::vector<VisualKeyEvent> visualKeyStarts;
+    std::vector<VisualKeyEvent> visualKeyEnds;
+    std::vector<VisualKeyOwner> visualKeyOwners;
 
     std::vector<TempoChange> tempoMap;
     // Seconds corresponding to tempoMap[i].tick. Tiny compared with MIDI data
@@ -120,11 +154,29 @@ struct MidiDocument {
             ? static_cast<uint8_t>((note.packedData >> 20) & 0x0f)
             : static_cast<uint8_t>((note.packedData >> 16) & 0x0f);
     }
+
+    uint8_t visualKeyPitch(uint32_t packedData) const {
+        return static_cast<uint8_t>(packedData & 0x7f);
+    }
+
+    uint8_t visualKeyColor(uint32_t packedData, bool perTrack) const {
+        return perTrack
+            ? static_cast<uint8_t>((packedData >> 12) & 0x0f)
+            : static_cast<uint8_t>((packedData >> 8) & 0x0f);
+    }
 };
+
+using MidiParseProgress =
+    void (*)(void* user, int percent, const char* stage);
 
 class MidiParser {
 public:
-    bool parse(const uint8_t* data, std::size_t size, MidiDocument& output);
+    bool parse(
+        const uint8_t* data,
+        std::size_t size,
+        MidiDocument& output,
+        MidiParseProgress progress = nullptr,
+        void* progressUser = nullptr);
     const char* error() const { return errorMessage_; }
 
 private:

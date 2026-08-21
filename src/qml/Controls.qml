@@ -638,7 +638,7 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: root.synthAdvancedVisible ? 336 : 188
+            Layout.preferredHeight: root.synthAdvancedVisible ? 366 : 218
             radius: 6
             color: "#0c0a1a"
             border.color: "#211834"
@@ -738,6 +738,51 @@ Item {
                                 root.mainWindow.synthNumBuffers = n
                             text = String(root.mainWindow.synthNumBuffers)
                         }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text { text: "Prebuf"; color: "#6c627d"; font.pixelSize: 8 }
+                    ConfigField {
+                        Layout.preferredWidth: 47
+                        minValue: 0
+                        maxValue: 3600
+                        text: String(Math.round(root.mainWindow.synthPrebufferSeconds))
+                        onEditingFinished: {
+                            var n = parseInt(text)
+                            if (isFinite(n))
+                                root.mainWindow.synthPrebufferSeconds = n
+                            text = String(Math.round(root.mainWindow.synthPrebufferSeconds))
+                        }
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Rolling audio pre-render seconds. 0 = up to the MIDI duration (memory-capped)."
+                    }
+
+                    Text { text: "Vel ≥"; color: "#6c627d"; font.pixelSize: 8 }
+                    ConfigField {
+                        Layout.preferredWidth: 38
+                        minValue: 0
+                        maxValue: 127
+                        text: String(root.mainWindow.synthVelocityFloor)
+                        onEditingFinished: {
+                            var n = parseInt(text)
+                            if (isFinite(n))
+                                root.mainWindow.synthVelocityFloor = n
+                            text = String(root.mainWindow.synthVelocityFloor)
+                        }
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Minimum NoteOn velocity sent to SnappySynth. The live Skipped vel meter rises automatically while audio catches up."
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "effective " + root.mainWindow.skippedVelocity
+                        color: root.mainWindow.skippedVelocity > root.mainWindow.synthVelocityFloor ? "#fb7185" : "#70667e"
+                        font.pixelSize: 7
+                        horizontalAlignment: Text.AlignRight
                     }
                 }
 

@@ -64,8 +64,12 @@ public:
             qobject_cast<MainWindow*>(
                 roll->controller());
 
-        if (!controller)
+        if (!controller) {
+            controller_.clear();
             return;
+        }
+
+        controller_ = controller;
 
         renderer_.setNoteSpeed(
             controller->noteSpeed());
@@ -101,12 +105,6 @@ public:
         syncedTimeSeconds_ =
             controller->currentTime();
 
-        syncedPlaying_ =
-            controller->isPlaying();
-
-        syncWallClock_ =
-            Clock::now();
-
         if (revision_ !=
             controller->
                 documentRevision()) {
@@ -129,26 +127,26 @@ public:
                 fbo->size().height());
         }
 
-        float renderTime =
-            syncedTimeSeconds_;
-
-        if (syncedPlaying_) {
-            const std::chrono::duration<float>
-                elapsed =
-                    Clock::now() -
-                    syncWallClock_;
-
-            renderTime +=
-                elapsed.count();
-        }
-
+        // MainWindow owns the authoritative visual clock. Never extrapolate
+        // independently here: keyboard state and roll geometry must always
+        // represent the exact same timeline sample.
         renderer_.setCurrentTime(
-            renderTime);
+            syncedTimeSeconds_);
 
         renderer_.renderRoll();
 
         QQuickOpenGLUtils::
             resetOpenGLState();
+
+        // Playback is frame-paced by the actual horizontal renderer rather
+        // than by a free-running GUI/audio clock. Queue the acknowledgement
+        // back to MainWindow so native render-thread builds stay thread-safe.
+        if (controller_) {
+            QMetaObject::invokeMethod(
+                controller_.data(),
+                "notifyVisualizerFramePresented",
+                Qt::QueuedConnection);
+        }
 
         updateFps();
 
@@ -191,6 +189,7 @@ private:
 
     qreal dpr_ = 1.0;
     std::atomic<int>* fps_ = nullptr;
+    QPointer<MainWindow> controller_;
 
     wasmidi::GLRenderer renderer_;
 
@@ -199,10 +198,6 @@ private:
             quint64>::max();
 
     float syncedTimeSeconds_ = 0.0f;
-    bool syncedPlaying_ = false;
-
-    Clock::time_point syncWallClock_ =
-        Clock::now();
 
     Clock::time_point fpsWindowStart_ =
         Clock::now();
@@ -219,6 +214,37 @@ PianoRoll::PianoRoll(
 {
     setMirrorVertically(false);
     setTextureFollowsItemSize(true);
+
+    resizeSettleTimer_.setSingleShot(true);
+    resizeSettleTimer_.setInterval(140);
+
+    connect(
+        &resizeSettleTimer_,
+        &QTimer::timeout,
+        this,
+        [this]() {
+            // Recreate exactly once at the settled dimensions. During a live
+            // browser resize Qt stretches the previous FBO instead of allocating
+            // and destroying a new WebGL texture for every geometry event.
+            setTextureFollowsItemSize(true);
+            update();
+        });
+}
+
+void PianoRoll::geometryChange(
+    const QRectF& newGeometry,
+    const QRectF& oldGeometry)
+{
+    QQuickFramebufferObject::geometryChange(
+        newGeometry,
+        oldGeometry);
+
+    if (newGeometry.size() == oldGeometry.size())
+        return;
+
+    setTextureFollowsItemSize(false);
+    resizeSettleTimer_.start();
+    update();
 }
 
 void PianoRoll::setController(
@@ -287,17 +313,14 @@ void PianoRoll::setController(
             this,
             request);
 
-        // Normal animation is driven exclusively by Renderer::update().
-        // Paused seeks need an immediate synchronization.
+        // Synchronize every authoritative visual-clock update. Renderer::update
+        // still drives the animated background between clock samples.
         connect(
             player,
             &MainWindow::
                 currentTimeChanged,
             this,
-            [this, player]() {
-                if (!player->isPlaying())
-                    update();
-            });
+            request);
     }
 
     emit controllerChanged();

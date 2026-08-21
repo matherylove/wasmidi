@@ -3,6 +3,173 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstring>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
+#ifdef __EMSCRIPTEN__
+namespace {
+wasmidi::GLRenderer* g_visualCacheRenderer = nullptr;
+}
+
+EM_JS(void, wasmidi_visual_cache_install,
+      (const uint32_t* words, uint32_t noteCount,
+       const uint32_t* keyStarts, uint32_t keyStartCount,
+       const uint32_t* keyEnds, uint32_t keyEndCount,
+       const uint32_t* keyOwners, uint32_t keyOwnerCount,
+       uint32_t generation, uint32_t maxTick), {
+    const root = globalThis;
+    const previous = root.__wasmidiVisualCache;
+    if (previous && previous.worker) {
+        try { previous.worker.terminate(); } catch (_) {}
+    }
+
+    const state = {
+        worker: null,
+        generation: generation >>> 0
+    };
+    root.__wasmidiVisualCache = state;
+
+    if (typeof Worker !== 'function' || !noteCount) return;
+
+    try {
+        const copyBytes = (ptr, byteLength) => {
+            const copy = new Uint8Array(byteLength >>> 0);
+            if (byteLength)
+                copy.set(HEAPU8.subarray(ptr, ptr + byteLength));
+            return copy;
+        };
+
+        const noteBytes = (noteCount >>> 0) * 12;
+        const startBytes = (keyStartCount >>> 0) * 12;
+        const endBytes = (keyEndCount >>> 0) * 12;
+        const ownerBytes = (keyOwnerCount >>> 0) * 8;
+
+        const copy = copyBytes(words, noteBytes);
+        const startsCopy = copyBytes(keyStarts, startBytes);
+        const endsCopy = copyBytes(keyEnds, endBytes);
+        const ownersCopy = copyBytes(keyOwners, ownerBytes);
+
+        const worker = new Worker('./visual-cache-worker.js');
+        state.worker = worker;
+
+        worker.onmessage = event => {
+            const message = event.data || {};
+            if ((message.generation >>> 0) !== state.generation)
+                return;
+
+            if (message.type === 'keyPage') {
+                const payload = new Uint8Array(
+                    message.data || new ArrayBuffer(0));
+                const wordCount = Math.floor(payload.byteLength / 4);
+                let ptr = 0;
+                try {
+                    if (payload.byteLength) {
+                        ptr = _malloc(payload.byteLength);
+                        if (!ptr) return;
+                        HEAPU8.set(payload, ptr);
+                    }
+                    _wasmidi_visual_key_page_ready(
+                        message.generation >>> 0,
+                        message.spanTicks >>> 0,
+                        message.pageIndex >>> 0,
+                        ptr,
+                        wordCount >>> 0);
+                } finally {
+                    if (ptr) _free(ptr);
+                }
+                return;
+            }
+
+            if (message.type !== 'page')
+                return;
+
+            const payload = new Uint8Array(message.data || new ArrayBuffer(0));
+            const count = Math.floor(payload.byteLength / 12);
+            let ptr = 0;
+            try {
+                if (payload.byteLength) {
+                    ptr = _malloc(payload.byteLength);
+                    if (!ptr) return;
+                    HEAPU8.set(payload, ptr);
+                }
+                _wasmidi_visual_page_ready(
+                    message.generation >>> 0,
+                    message.spanTicks >>> 0,
+                    message.pageIndex >>> 0,
+                    ptr,
+                    count >>> 0,
+                    message.sourceCount >>> 0,
+                    Number(message.difficulty) || 0.0);
+            } finally {
+                if (ptr) _free(ptr);
+            }
+        };
+
+        worker.onerror = event => {
+            console.error('[WASMIDI visual cache worker]',
+                          event && event.message ? event.message : event);
+        };
+
+        worker.postMessage({
+            type: 'install',
+            generation: state.generation,
+            maxTick: maxTick >>> 0,
+            notes: copy.buffer,
+            keyStarts: startsCopy.buffer,
+            keyEnds: endsCopy.buffer,
+            keyOwners: ownersCopy.buffer
+        }, [copy.buffer, startsCopy.buffer, endsCopy.buffer, ownersCopy.buffer]);
+    } catch (error) {
+        console.error('[WASMIDI visual cache]', error);
+    }
+});
+
+EM_JS(void, wasmidi_visual_cache_shutdown, (), {
+    const state = globalThis.__wasmidiVisualCache;
+    if (state && state.worker) {
+        try { state.worker.terminate(); } catch (_) {}
+    }
+    globalThis.__wasmidiVisualCache = null;
+});
+
+EM_JS(void, wasmidi_visual_cache_prime,
+      (uint32_t generation, uint32_t spanTicks, uint32_t firstPage,
+       uint32_t pageCount, uint32_t currentPage), {
+    const state = globalThis.__wasmidiVisualCache;
+    if (!state || !state.worker ||
+        state.generation !== (generation >>> 0))
+        return;
+
+    state.worker.postMessage({
+        type: 'prime',
+        generation: generation >>> 0,
+        spanTicks: spanTicks >>> 0,
+        firstPage: firstPage >>> 0,
+        count: pageCount >>> 0,
+        currentPage: currentPage >>> 0
+    });
+});
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_visual_page_ready(
+    uint32_t generation,
+    uint32_t spanTicks,
+    uint32_t pageIndex,
+    const uint32_t* words,
+    uint32_t noteCount,
+    uint32_t sourceCount,
+    double difficulty)
+{
+    if (g_visualCacheRenderer) {
+        g_visualCacheRenderer->receiveVisualPage(
+            generation, spanTicks, pageIndex, words,
+            noteCount, sourceCount, difficulty);
+    }
+}
+#endif
 
 namespace wasmidi {
 namespace {
@@ -77,6 +244,10 @@ float wrapHue(float value)
 
 GLRenderer::GLRenderer()
 {
+#ifdef __EMSCRIPTEN__
+    g_visualCacheRenderer = this;
+#endif
+
     static const uint8_t defaults[16][4] = {
         {129,140,248,255},{167,139,250,255},{196,181,253,255},{251,146, 60,255},
         { 74,222,128,255},{ 56,189,248,255},{244,114,182,255},{250,204, 21,255},
@@ -712,6 +883,54 @@ bool GLRenderer::initialize()
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
+    glGenVertexArrays(1, &carryVao_);
+    glGenBuffers(1, &carryVbo_);
+    glBindVertexArray(carryVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, carryVbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(VisualNote), nullptr, GL_DYNAMIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
+        reinterpret_cast<void*>(offsetof(VisualNote, startTick)));
+    glVertexAttribDivisor(0, 1);
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
+        reinterpret_cast<void*>(offsetof(VisualNote, endTick)));
+    glVertexAttribDivisor(1, 1);
+
+    glEnableVertexAttribArray(2);
+    glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
+        reinterpret_cast<void*>(offsetof(VisualNote, packedData)));
+    glVertexAttribDivisor(2, 1);
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    glGenVertexArrays(1, &denseVao_);
+    glGenBuffers(1, &denseVbo_);
+    glBindVertexArray(denseVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, denseVbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(VisualNote), nullptr, GL_STREAM_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
+        reinterpret_cast<void*>(offsetof(VisualNote, startTick)));
+    glVertexAttribDivisor(0, 1);
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
+        reinterpret_cast<void*>(offsetof(VisualNote, endTick)));
+    glVertexAttribDivisor(1, 1);
+
+    glEnableVertexAttribArray(2);
+    glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, sizeof(VisualNote),
+        reinterpret_cast<void*>(offsetof(VisualNote, packedData)));
+    glVertexAttribDivisor(2, 1);
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
     glGenVertexArrays(
         1,
         &backgroundVao_);
@@ -802,6 +1021,8 @@ void GLRenderer::destroy()
 {
     const GLuint buffers[] = {
         noteVbo_,
+        carryVbo_,
+        denseVbo_,
         neuralLineVbo_,
         neuralPointVbo_
     };
@@ -813,6 +1034,8 @@ void GLRenderer::destroy()
 
     const GLuint vaos[] = {
         noteVao_,
+        carryVao_,
+        denseVao_,
         backgroundVao_,
         neuralLineVao_,
         neuralPointVao_
@@ -835,10 +1058,14 @@ void GLRenderer::destroy()
     }
 
     noteVbo_ = 0;
+    carryVbo_ = 0;
+    denseVbo_ = 0;
     neuralLineVbo_ = 0;
     neuralPointVbo_ = 0;
 
     noteVao_ = 0;
+    carryVao_ = 0;
+    denseVao_ = 0;
     backgroundVao_ = 0;
     neuralLineVao_ = 0;
     neuralPointVao_ = 0;
@@ -848,10 +1075,22 @@ void GLRenderer::destroy()
     neuralProgram_ = 0;
 
     ring_.clear();
+    carryNotes_.clear();
+    denseNotes_.clear();
+    denseSourceScratch_.clear();
+    denseCoverage_.clear();
+    visualPages_.clear();
     ringCapacity_ = 0;
     ringMask_ = 0;
     sourceBegin_ = 0;
     sourceEnd_ = 0;
+
+#ifdef __EMSCRIPTEN__
+    if (g_visualCacheRenderer == this) {
+        wasmidi_visual_cache_shutdown();
+        g_visualCacheRenderer = nullptr;
+    }
+#endif
 
     initialized_ = false;
 }
@@ -867,12 +1106,25 @@ void GLRenderer::setDocument(const MidiDocument* document)
     document_ = document;
     sourceBegin_ = 0;
     sourceEnd_ = 0;
+    carryNotes_.clear();
     forceCacheReset_ = true;
+    resetVisualPageCache(true);
 }
 
 void GLRenderer::setCurrentTime(float seconds)
 {
-    currentTime_ = std::max(0.0f, seconds);
+    const float value = std::max(0.0f, seconds);
+    const float delta = value - currentTime_;
+
+    // Reverse seeks and large forward jumps must rebuild both the start-ordered
+    // ring and the historical carry set. Incrementally walking every skipped
+    // note on a seek is both slower and a common source of stale visual state.
+    if (delta < -0.0005f ||
+        std::abs(delta) > std::max(0.25f, noteSpeed_ * 0.50f)) {
+        forceCacheReset_ = true;
+    }
+
+    currentTime_ = value;
 }
 
 void GLRenderer::setNoteSpeed(float secondsPerWindow)
@@ -1282,6 +1534,426 @@ void GLRenderer::renderBackground()
 
     glDisable(GL_BLEND);
 }
+
+void GLRenderer::resetVisualPageCache(bool reinstallDocument)
+{
+    visualPages_.clear();
+    visualPageSpanTicks_ = 0;
+    visualWantedFirstPage_ = 0;
+    visualWantedPageCount_ = 0;
+    visualCurrentPage_ = 0;
+    visualPrimeWidth_ = 0;
+    denseNotes_.clear();
+    denseSourceScratch_.clear();
+
+    if (!reinstallDocument)
+        return;
+
+    ++visualCacheGeneration_;
+    if (visualCacheGeneration_ == 0)
+        ++visualCacheGeneration_;
+
+#ifdef __EMSCRIPTEN__
+    if (document_ && !document_->visualNotes.empty()) {
+        const std::size_t count = document_->visualNotes.size();
+        const uint32_t safeCount =
+            static_cast<uint32_t>(
+                std::min<std::size_t>(
+                    count,
+                    std::numeric_limits<uint32_t>::max()));
+
+        wasmidi_visual_cache_install(
+            reinterpret_cast<const uint32_t*>(
+                document_->visualNotes.data()),
+            safeCount,
+            reinterpret_cast<const uint32_t*>(
+                document_->visualKeyStarts.data()),
+            static_cast<uint32_t>(
+                std::min<std::size_t>(
+                    document_->visualKeyStarts.size(),
+                    std::numeric_limits<uint32_t>::max())),
+            reinterpret_cast<const uint32_t*>(
+                document_->visualKeyEnds.data()),
+            static_cast<uint32_t>(
+                std::min<std::size_t>(
+                    document_->visualKeyEnds.size(),
+                    std::numeric_limits<uint32_t>::max())),
+            reinterpret_cast<const uint32_t*>(
+                document_->visualKeyOwners.data()),
+            static_cast<uint32_t>(
+                std::min<std::size_t>(
+                    document_->visualKeyOwners.size(),
+                    std::numeric_limits<uint32_t>::max())),
+            visualCacheGeneration_,
+            document_->maxTick);
+    }
+#endif
+}
+
+void GLRenderer::receiveVisualPage(
+    uint32_t generation,
+    uint32_t spanTicks,
+    uint32_t pageIndex,
+    const uint32_t* words,
+    uint32_t noteCount,
+    uint32_t sourceCount,
+    double difficulty)
+{
+    if (generation != visualCacheGeneration_ ||
+        spanTicks == 0 ||
+        spanTicks != visualPageSpanTicks_ ||
+        visualWantedPageCount_ == 0 ||
+        pageIndex < visualWantedFirstPage_ ||
+        pageIndex >= visualWantedFirstPage_ + visualWantedPageCount_) {
+        return;
+    }
+
+    VisualPage page;
+    page.spanTicks = spanTicks;
+    page.pageIndex = pageIndex;
+    page.sourceCount = sourceCount;
+    page.difficulty = difficulty;
+    page.notes.resize(noteCount);
+
+    if (noteCount && words) {
+        std::memcpy(
+            page.notes.data(),
+            words,
+            std::size_t(noteCount) * sizeof(VisualNote));
+    }
+
+    if (visualPages_.size() >= 64 &&
+        visualPages_.find(pageIndex) == visualPages_.end()) {
+        auto victim = visualPages_.end();
+        uint32_t farthest = 0;
+        for (auto it = visualPages_.begin(); it != visualPages_.end(); ++it) {
+            const uint32_t distance =
+                it->first > visualCurrentPage_
+                    ? it->first - visualCurrentPage_
+                    : visualCurrentPage_ - it->first;
+            if (victim == visualPages_.end() || distance > farthest) {
+                victim = it;
+                farthest = distance;
+            }
+        }
+        if (victim != visualPages_.end())
+            visualPages_.erase(victim);
+    }
+
+    visualPages_[pageIndex] = std::move(page);
+}
+
+void GLRenderer::primeVisualPageCache(
+    uint32_t viewStart,
+    uint32_t viewEnd)
+{
+    if (!document_ || document_->visualNotes.empty())
+        return;
+
+    const uint32_t actualSpan =
+        std::max<uint32_t>(1, viewEnd - viewStart);
+
+    if (visualPageSpanTicks_ == 0) {
+        visualPageSpanTicks_ = actualSpan;
+        visualPages_.clear();
+    } else {
+        const uint32_t difference =
+            actualSpan > visualPageSpanTicks_
+                ? actualSpan - visualPageSpanTicks_
+                : visualPageSpanTicks_ - actualSpan;
+        const uint32_t tolerance =
+            std::max<uint32_t>(8, visualPageSpanTicks_ / 16);
+
+        // Tempo changes can alter ticks-per-screen. Keep pages stable through
+        // +/-1 tick rounding noise, but rebuild when the scale really changes.
+        if (difference > tolerance) {
+            visualPageSpanTicks_ = actualSpan;
+            visualPages_.clear();
+            visualWantedPageCount_ = 0;
+        }
+    }
+
+    const uint32_t span = std::max<uint32_t>(1, visualPageSpanTicks_);
+    const uint32_t currentPage = viewStart / span;
+    const uint32_t firstPage = currentPage > 2 ? currentPage - 2 : 0;
+    const uint32_t maxPage = document_->maxTick / span;
+    const uint32_t available =
+        maxPage >= firstPage ? maxPage - firstPage + 1 : 1;
+    const uint32_t pageCount = std::min<uint32_t>(64, available);
+
+    const bool changed =
+        firstPage != visualWantedFirstPage_ ||
+        pageCount != visualWantedPageCount_ ||
+        currentPage != visualCurrentPage_;
+
+    visualWantedFirstPage_ = firstPage;
+    visualWantedPageCount_ = pageCount;
+    visualCurrentPage_ = currentPage;
+
+    for (auto it = visualPages_.begin(); it != visualPages_.end();) {
+        if (it->second.spanTicks != span ||
+            it->first < firstPage ||
+            it->first >= firstPage + pageCount) {
+            it = visualPages_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+#ifdef __EMSCRIPTEN__
+    if (changed) {
+        wasmidi_visual_cache_prime(
+            visualCacheGeneration_,
+            span,
+            firstPage,
+            pageCount,
+            currentPage);
+    }
+#else
+    (void)changed;
+#endif
+}
+
+bool GLRenderer::collectCachedPageNotes(
+    uint32_t searchStart,
+    uint32_t viewEnd,
+    std::vector<VisualNote>& output) const
+{
+    output.clear();
+
+    if (visualPageSpanTicks_ == 0 || visualPages_.empty())
+        return false;
+
+    const uint32_t span = visualPageSpanTicks_;
+    const uint32_t firstPage = searchStart / span;
+    const uint32_t lastPage = viewEnd / span;
+
+    // A normal viewport touches at most three screen pages (one history page
+    // plus the visible/future range). Refuse pathological stale-scale cases.
+    if (lastPage < firstPage || lastPage - firstPage > 6)
+        return false;
+
+    std::size_t reserveCount = 0;
+    for (uint32_t pageIndex = firstPage;
+         pageIndex <= lastPage;
+         ++pageIndex) {
+        const auto it = visualPages_.find(pageIndex);
+        if (it == visualPages_.end() ||
+            it->second.spanTicks != span) {
+            return false;
+        }
+        reserveCount += it->second.notes.size();
+    }
+
+    output.reserve(reserveCount);
+
+    for (uint32_t pageIndex = firstPage;
+         pageIndex <= lastPage;
+         ++pageIndex) {
+        const auto& page = visualPages_.at(pageIndex);
+        for (const VisualNote& note : page.notes) {
+            if (note.startTick < searchStart || note.startTick > viewEnd)
+                continue;
+            output.push_back(note);
+        }
+    }
+
+    return true;
+}
+
+bool GLRenderer::buildDenseDrawList(
+    uint32_t viewStart,
+    uint32_t viewEnd,
+    std::size_t desiredBegin,
+    std::size_t desiredEnd)
+{
+    if (!document_ || viewEnd <= viewStart)
+        return false;
+
+    constexpr std::size_t DenseThreshold = 8192;
+    constexpr std::size_t MaxRawRecoveryNotes = 1000000;
+
+    const std::size_t rawVisibleCount =
+        carryNotes_.size() +
+        (desiredEnd > desiredBegin ? desiredEnd - desiredBegin : 0);
+
+    if (rawVisibleCount < DenseThreshold)
+        return false;
+
+    const uint32_t span = viewEnd - viewStart;
+    const uint32_t searchStart = viewStart > span ? viewStart - span : 0;
+
+    std::vector<VisualNote> pageNotes;
+    const bool pagesReady =
+        collectCachedPageNotes(searchStart, viewEnd, pageNotes);
+
+    if (!pagesReady && rawVisibleCount > MaxRawRecoveryNotes) {
+        // Recovery path: do not replace a GPU-heavy frame with a million-note
+        // CPU copy while the background page Worker is still finishing it.
+        return false;
+    }
+
+    denseSourceScratch_.clear();
+    denseSourceScratch_.reserve(
+        carryNotes_.size() +
+        (pagesReady
+            ? pageNotes.size()
+            : (desiredEnd > desiredBegin ? desiredEnd - desiredBegin : 0)));
+
+    denseSourceScratch_.insert(
+        denseSourceScratch_.end(),
+        carryNotes_.begin(),
+        carryNotes_.end());
+
+    if (pagesReady) {
+        denseSourceScratch_.insert(
+            denseSourceScratch_.end(),
+            pageNotes.begin(),
+            pageNotes.end());
+    } else {
+        const auto& notes = document_->visualNotes;
+        const std::size_t begin = std::min(desiredBegin, notes.size());
+        const std::size_t end = std::min(desiredEnd, notes.size());
+        denseSourceScratch_.insert(
+            denseSourceScratch_.end(),
+            notes.begin() + static_cast<std::ptrdiff_t>(begin),
+            notes.begin() + static_cast<std::ptrdiff_t>(end));
+    }
+
+    if (denseSourceScratch_.empty())
+        return false;
+
+    const int columns = std::max(1, width_ - 1);
+    const std::size_t wordsPerPitch =
+        (std::size_t(columns) + 63u) / 64u;
+    denseCoverage_.assign(
+        std::size_t(128) * wordsPerPitch,
+        uint64_t(0));
+    denseNotes_.clear();
+    denseNotes_.reserve(
+        std::min<std::size_t>(
+            denseSourceScratch_.size(),
+            std::size_t(columns) * 128u));
+
+    const double tickSpan = double(viewEnd - viewStart);
+
+    auto snappedColumn = [&](uint32_t tick) -> int {
+        const double normalized =
+            (double(tick) - double(viewStart)) / tickSpan;
+        return static_cast<int>(
+            std::floor(normalized * double(columns) + 0.5));
+    };
+
+    // Reverse source order: later notes are opaque and therefore define which
+    // pixels an earlier note could still possibly contribute. We never split a
+    // partially visible note; only fully hidden/sub-pixel-equivalent notes are
+    // removed, preserving stacking, clipping and any per-note shading.
+    for (auto it = denseSourceScratch_.rbegin();
+         it != denseSourceScratch_.rend();
+         ++it) {
+        const VisualNote& note = *it;
+        const int pitch = int((note.packedData >> 8) & 0x7f);
+
+        int left = snappedColumn(note.startTick);
+        int right = snappedColumn(note.endTick);
+        if (right < left)
+            std::swap(left, right);
+
+        left = std::clamp(left, 0, columns);
+        right = std::clamp(right, 0, columns);
+
+        // Equal snapped endpoints create a zero-area triangle strip in the
+        // current shader, so dropping them is exactly raster-equivalent.
+        if (right <= left)
+            continue;
+
+        const std::size_t rowBase = std::size_t(pitch) * wordsPerPitch;
+        const std::size_t firstWord = std::size_t(left) >> 6u;
+        const std::size_t lastWord = std::size_t(right - 1) >> 6u;
+        bool contributes = false;
+
+        for (std::size_t word = firstWord; word <= lastWord; ++word) {
+            const unsigned lo =
+                word == firstWord
+                    ? unsigned(std::size_t(left) & 63u)
+                    : 0u;
+            const unsigned hi =
+                word == lastWord
+                    ? unsigned((std::size_t(right - 1) & 63u) + 1u)
+                    : 64u;
+
+            const uint64_t lowMask =
+                lo == 0u ? ~uint64_t(0) : (~uint64_t(0) << lo);
+            const uint64_t highMask =
+                hi == 64u ? ~uint64_t(0) : ((uint64_t(1) << hi) - 1u);
+            const uint64_t mask = lowMask & highMask;
+
+            if ((~denseCoverage_[rowBase + word] & mask) != 0u) {
+                contributes = true;
+                break;
+            }
+        }
+
+        if (!contributes)
+            continue;
+
+        denseNotes_.push_back(note);
+
+        for (std::size_t word = firstWord; word <= lastWord; ++word) {
+            const unsigned lo =
+                word == firstWord
+                    ? unsigned(std::size_t(left) & 63u)
+                    : 0u;
+            const unsigned hi =
+                word == lastWord
+                    ? unsigned((std::size_t(right - 1) & 63u) + 1u)
+                    : 64u;
+            const uint64_t lowMask =
+                lo == 0u ? ~uint64_t(0) : (~uint64_t(0) << lo);
+            const uint64_t highMask =
+                hi == 64u ? ~uint64_t(0) : ((uint64_t(1) << hi) - 1u);
+            denseCoverage_[rowBase + word] |= lowMask & highMask;
+        }
+    }
+
+    std::reverse(denseNotes_.begin(), denseNotes_.end());
+
+    // If a sparse-looking dense range cannot be reduced meaningfully, retain
+    // the persistent source ring instead of uploading a nearly identical VBO.
+    if (denseNotes_.size() * 10 >= denseSourceScratch_.size() * 9)
+        return false;
+
+    uploadDenseDrawList();
+    return !denseNotes_.empty();
+}
+
+void GLRenderer::uploadDenseDrawList()
+{
+    if (!initialized_ || !denseVbo_)
+        return;
+
+    glBindBuffer(GL_ARRAY_BUFFER, denseVbo_);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(denseNotes_.size() * sizeof(VisualNote)),
+        denseNotes_.empty() ? nullptr : denseNotes_.data(),
+        GL_STREAM_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void GLRenderer::drawDenseNotes()
+{
+    if (denseNotes_.empty())
+        return;
+
+    glBindVertexArray(denseVao_);
+    glDrawArraysInstanced(
+        GL_TRIANGLE_STRIP,
+        0,
+        4,
+        static_cast<GLsizei>(denseNotes_.size()));
+}
+
 void GLRenderer::allocateRing(std::size_t capacity)
 {
     std::size_t rounded = 1;
@@ -1412,6 +2084,142 @@ void GLRenderer::rebuildVisualCache(
     forceCacheReset_ = false;
 }
 
+void GLRenderer::uploadCarryCache()
+{
+    if (!initialized_ || carryVbo_ == 0)
+        return;
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        carryVbo_);
+
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(
+            std::max<std::size_t>(
+                1,
+                carryNotes_.size()) *
+            sizeof(VisualNote)),
+        carryNotes_.empty()
+            ? nullptr
+            : carryNotes_.data(),
+        GL_DYNAMIC_DRAW);
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        0);
+}
+
+void GLRenderer::rebuildCarryCache(
+    uint32_t viewStart,
+    std::size_t desiredBegin)
+{
+    carryNotes_.clear();
+
+    if (!document_ || desiredBegin == 0) {
+        uploadCarryCache();
+        return;
+    }
+
+    const auto& notes =
+        document_->visualNotes;
+
+    const auto& blockMaxEnd =
+        document_->visualBlockMaxEnd;
+
+    const std::size_t blockSize =
+        MidiDocument::VisualSeekBlockSize;
+
+    const std::size_t lastBlock =
+        (desiredBegin + blockSize - 1) /
+        blockSize;
+
+    // A seek can land in the middle of a very long note. Search only source
+    // blocks whose maximum end tick can still intersect the visible history;
+    // this avoids rescanning every old note while preserving exact source order.
+    for (std::size_t block = 0;
+         block < lastBlock;
+         ++block) {
+        if (block < blockMaxEnd.size() &&
+            blockMaxEnd[block] < viewStart) {
+            continue;
+        }
+
+        const std::size_t begin =
+            block * blockSize;
+
+        const std::size_t end =
+            std::min(
+                desiredBegin,
+                begin + blockSize);
+
+        for (std::size_t i = begin;
+             i < end;
+             ++i) {
+            if (notes[i].endTick >= viewStart)
+                carryNotes_.push_back(notes[i]);
+        }
+    }
+
+    uploadCarryCache();
+}
+
+void GLRenderer::advanceCarryCache(
+    uint32_t viewStart,
+    std::size_t oldBegin,
+    std::size_t desiredBegin)
+{
+    if (!document_) {
+        carryNotes_.clear();
+        uploadCarryCache();
+        return;
+    }
+
+    if (desiredBegin < oldBegin) {
+        rebuildCarryCache(
+            viewStart,
+            desiredBegin);
+        return;
+    }
+
+    bool changed = false;
+
+    const auto oldSize =
+        carryNotes_.size();
+
+    carryNotes_.erase(
+        std::remove_if(
+            carryNotes_.begin(),
+            carryNotes_.end(),
+            [viewStart](const VisualNote& note) {
+                return note.endTick < viewStart;
+            }),
+        carryNotes_.end());
+
+    changed =
+        carryNotes_.size() != oldSize;
+
+    const auto& notes =
+        document_->visualNotes;
+
+    const std::size_t appendEnd =
+        std::min(
+            desiredBegin,
+            notes.size());
+
+    for (std::size_t i = oldBegin;
+         i < appendEnd;
+         ++i) {
+        if (notes[i].endTick >= viewStart) {
+            carryNotes_.push_back(notes[i]);
+            changed = true;
+        }
+    }
+
+    if (changed)
+        uploadCarryCache();
+}
+
 void GLRenderer::syncVisualCache(
     uint32_t viewStart,
     uint32_t viewEnd)
@@ -1420,6 +2228,10 @@ void GLRenderer::syncVisualCache(
         document_->visualNotes.empty()) {
         sourceBegin_ = 0;
         sourceEnd_ = 0;
+        if (!carryNotes_.empty()) {
+            carryNotes_.clear();
+            uploadCarryCache();
+        }
         return;
     }
 
@@ -1456,8 +2268,16 @@ void GLRenderer::syncVisualCache(
         rebuildVisualCache(
             desiredBegin,
             desiredEnd);
+        rebuildCarryCache(
+            viewStart,
+            desiredBegin);
         return;
     }
+
+    advanceCarryCache(
+        viewStart,
+        sourceBegin_,
+        desiredBegin);
 
     const std::size_t required =
         desiredEnd - desiredBegin;
@@ -1615,12 +2435,35 @@ void GLRenderer::renderRoll()
         viewStart,
         viewEnd);
 
+    primeVisualPageCache(
+        viewStart,
+        viewEnd);
+
     syncVisualCache(
         viewStart,
         viewEnd);
 
-    if (sourceEnd_ <= sourceBegin_)
+    if (sourceEnd_ <= sourceBegin_ &&
+        carryNotes_.empty())
         return;
+
+    const uint32_t visibleSpan =
+        std::max<uint32_t>(1, viewEnd - viewStart);
+    const uint32_t searchStart =
+        viewStart > visibleSpan
+            ? viewStart - visibleSpan
+            : 0;
+    const std::size_t desiredBegin =
+        document_->lowerBoundVisualStart(double(searchStart));
+    const std::size_t desiredEnd =
+        document_->upperBoundVisualStart(double(viewEnd));
+
+    const bool denseMode =
+        buildDenseDrawList(
+            viewStart,
+            viewEnd,
+            desiredBegin,
+            desiredEnd);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -1679,49 +2522,63 @@ void GLRenderer::renderRoll()
         paletteDirty_ = false;
     }
 
-    const std::size_t count =
-        sourceEnd_ -
-        sourceBegin_;
+    if (denseMode) {
+        // One compact draw after the resolution-dependent visibility pass.
+        // Source order inside denseNotes_ is unchanged.
+        drawDenseNotes();
+    } else {
+        // Recovery/sparse path: draw the persistent source ring directly. This
+        // remains available whenever a background page is unfinished or dense
+        // culling would not save enough work to justify a transient upload.
+        if (!carryNotes_.empty()) {
+            glBindVertexArray(
+                carryVao_);
 
-    const std::size_t physical =
-        sourceBegin_ &
-        ringMask_;
+            glDrawArraysInstanced(
+                GL_TRIANGLE_STRIP,
+                0,
+                4,
+                static_cast<GLsizei>(
+                    carryNotes_.size()));
+        }
 
-    const std::size_t first =
-        std::min(
-            count,
-            ringCapacity_ -
-            physical);
+        if (sourceEnd_ > sourceBegin_) {
+            const std::size_t count =
+                sourceEnd_ - sourceBegin_;
 
-    const std::size_t second =
-        count - first;
+            const std::size_t physical =
+                sourceBegin_ & ringMask_;
 
-    glBindVertexArray(
-        noteVao_);
+            const std::size_t first =
+                std::min(
+                    count,
+                    ringCapacity_ - physical);
 
-    // Draw in exact source/start order. This is the key MPWGL2 parity rule:
-    // later-starting notes overwrite earlier notes where they overlap.
-    if (first != 0) {
-        setInstanceBase(
-            physical);
+            const std::size_t second =
+                count - first;
 
-        glDrawArraysInstanced(
-            GL_TRIANGLE_STRIP,
-            0,
-            4,
-            static_cast<GLsizei>(
-                first));
-    }
+            glBindVertexArray(noteVao_);
 
-    if (second != 0) {
-        setInstanceBase(0);
+            // Exact source/start order is the MPWGL2 parity rule: later-start
+            // notes overwrite earlier notes wherever they overlap.
+            if (first != 0) {
+                setInstanceBase(physical);
+                glDrawArraysInstanced(
+                    GL_TRIANGLE_STRIP,
+                    0,
+                    4,
+                    static_cast<GLsizei>(first));
+            }
 
-        glDrawArraysInstanced(
-            GL_TRIANGLE_STRIP,
-            0,
-            4,
-            static_cast<GLsizei>(
-                second));
+            if (second != 0) {
+                setInstanceBase(0);
+                glDrawArraysInstanced(
+                    GL_TRIANGLE_STRIP,
+                    0,
+                    4,
+                    static_cast<GLsizei>(second));
+            }
+        }
     }
 
     glBindVertexArray(0);

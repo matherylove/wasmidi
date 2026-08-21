@@ -994,6 +994,235 @@ void buildVisualNotes(
     }
 }
 
+
+uint32_t visualKeyPacked(const VisualNote& note)
+{
+    const uint32_t pitch = (note.packedData >> 8) & 0x7f;
+    const uint32_t globalColor = (note.packedData >> 16) & 0x0f;
+    const uint32_t trackColor = (note.packedData >> 20) & 0x0f;
+    return pitch | (globalColor << 8) | (trackColor << 12);
+}
+
+uint32_t visualKeySignature(uint32_t packed)
+{
+    const uint32_t pitch = packed & 0x7f;
+    const uint32_t globalColor = (packed >> 8) & 0x0f;
+    const uint32_t trackColor = (packed >> 12) & 0x0f;
+    return pitch | (globalColor << 7) | (trackColor << 11);
+}
+
+uint32_t packedFromVisualKeySignature(uint32_t signature)
+{
+    const uint32_t pitch = signature & 0x7f;
+    const uint32_t globalColor = (signature >> 7) & 0x0f;
+    const uint32_t trackColor = (signature >> 11) & 0x0f;
+    return pitch | (globalColor << 8) | (trackColor << 12);
+}
+
+void buildVisualKeyIndex(MidiDocument& output)
+{
+    output.visualKeyStarts.clear();
+    output.visualKeyEnds.clear();
+    output.visualKeyOwners.clear();
+
+    const auto& notes = output.visualNotes;
+    if (notes.empty())
+        return;
+
+    // 7 pitch bits + 4 global color bits + 4 track color bits.
+    constexpr std::size_t SignatureCount = std::size_t(1) << 15;
+    std::vector<uint32_t> counts(SignatureCount, 0);
+    std::vector<uint16_t> touched;
+    touched.reserve(1024);
+
+    std::array<uint32_t, 128> ownerPacked{};
+    std::array<uint8_t, 128> ownerTouched{};
+    std::vector<uint8_t> touchedPitches;
+    touchedPitches.reserve(128);
+
+    output.visualKeyStarts.reserve(
+        std::min<std::size_t>(notes.size(), 1u << 20));
+    output.visualKeyOwners.reserve(
+        std::min<std::size_t>(notes.size(), 1u << 18));
+
+    std::size_t begin = 0;
+    while (begin < notes.size()) {
+        const uint32_t tick = notes[begin].startTick;
+        std::size_t end = begin + 1;
+        while (end < notes.size() && notes[end].startTick == tick)
+            ++end;
+
+        touched.clear();
+        touchedPitches.clear();
+
+        for (std::size_t i = begin; i < end; ++i) {
+            const uint32_t packed = visualKeyPacked(notes[i]);
+            const uint32_t signature = visualKeySignature(packed);
+
+            if (counts[signature] == 0)
+                touched.push_back(static_cast<uint16_t>(signature));
+            ++counts[signature];
+
+            const uint8_t pitch = static_cast<uint8_t>(packed & 0x7f);
+            if (!ownerTouched[pitch]) {
+                ownerTouched[pitch] = 1;
+                touchedPitches.push_back(pitch);
+            }
+            // Source order is stable, so this ends as the newest note color.
+            ownerPacked[pitch] = packed;
+        }
+
+        for (uint16_t signature : touched) {
+            output.visualKeyStarts.push_back({
+                tick,
+                counts[signature],
+                packedFromVisualKeySignature(signature)
+            });
+            counts[signature] = 0;
+        }
+
+        for (uint8_t pitch : touchedPitches) {
+            output.visualKeyOwners.push_back({
+                tick,
+                ownerPacked[pitch]
+            });
+            ownerTouched[pitch] = 0;
+        }
+
+        begin = end;
+    }
+
+    // End ticks are not source ordered. Sort a compact 64-bit key instead of
+    // materializing a 12-byte event per note before aggregation.
+    std::vector<uint64_t> endKeys;
+    endKeys.reserve(notes.size());
+
+    for (const VisualNote& note : notes) {
+        const uint32_t signature =
+            visualKeySignature(visualKeyPacked(note));
+        endKeys.push_back(
+            (uint64_t(note.endTick) << 15) |
+            uint64_t(signature));
+    }
+
+    std::sort(endKeys.begin(), endKeys.end());
+    output.visualKeyEnds.reserve(
+        std::min<std::size_t>(endKeys.size(), 1u << 20));
+
+    std::size_t i = 0;
+    while (i < endKeys.size()) {
+        const uint64_t key = endKeys[i];
+        std::size_t j = i + 1;
+        while (j < endKeys.size() && endKeys[j] == key)
+            ++j;
+
+        output.visualKeyEnds.push_back({
+            static_cast<uint32_t>(key >> 15),
+            static_cast<uint32_t>(j - i),
+            packedFromVisualKeySignature(
+                static_cast<uint32_t>(key & 0x7fffu))
+        });
+
+        i = j;
+    }
+}
+
+void buildDerivedStats(MidiDocument& output)
+{
+    output.derivedPeakNps = 0;
+    output.derivedPeakNpsTime = 0.0f;
+    output.derivedPeakPolyphony = 0;
+    output.derivedNpsTimeline.clear();
+
+    if (output.durationSeconds > 0.0f) {
+        constexpr double TimelineStep = 0.5;
+        const std::size_t bucketCount =
+            static_cast<std::size_t>(
+                std::ceil(double(output.durationSeconds) / TimelineStep)) + 1;
+
+        output.derivedNpsTimeline.assign(bucketCount, 0);
+
+        for (const TickGroup& group : output.tickGroups) {
+            if (group.noteOnCount == 0)
+                continue;
+
+            const double seconds = output.tickToSeconds(group.tick);
+            const std::size_t bucket =
+                std::min(
+                    bucketCount - 1,
+                    static_cast<std::size_t>(
+                        std::max(0.0, std::floor(seconds / TimelineStep))));
+
+            const uint64_t sum =
+                uint64_t(output.derivedNpsTimeline[bucket]) + group.noteOnCount;
+            output.derivedNpsTimeline[bucket] =
+                static_cast<uint32_t>(
+                    std::min<uint64_t>(sum, std::numeric_limits<uint32_t>::max()));
+        }
+    }
+
+    // MPWGL2 samples peak NPS every 0.1 seconds and counts NoteOns in [t-1,t].
+    for (double t = 0.0;
+         t <= double(output.durationSeconds) + 0.000001;
+         t += 0.1) {
+        const double hiTick = output.secondsToTick(t);
+        const double loTick =
+            output.secondsToTick(std::max(0.0, t - 1.0));
+        const std::size_t lo = output.lowerBoundVisualStart(loTick);
+        const std::size_t hi = output.upperBoundVisualStart(hiTick);
+        const uint64_t count = hi >= lo ? uint64_t(hi - lo) : 0u;
+
+        if (count > output.derivedPeakNps) {
+            output.derivedPeakNps = static_cast<uint32_t>(
+                std::min<uint64_t>(count, std::numeric_limits<uint32_t>::max()));
+            output.derivedPeakNpsTime = static_cast<float>(t);
+        }
+    }
+
+    struct PolyEdge {
+        uint32_t tick = 0;
+        int8_t direction = 0;
+    };
+
+    constexpr std::size_t MaxPeakNotes = 400000;
+    const std::size_t visualCount = output.visualNotes.size();
+    const std::size_t stride =
+        visualCount > MaxPeakNotes
+            ? static_cast<std::size_t>(
+                  std::ceil(double(visualCount) / double(MaxPeakNotes)))
+            : 1;
+
+    std::vector<PolyEdge> edges;
+    edges.reserve(
+        (visualCount / std::max<std::size_t>(1, stride) + 1) * 2);
+
+    for (std::size_t i = 0; i < visualCount; i += stride) {
+        const VisualNote& note = output.visualNotes[i];
+        edges.push_back({note.startTick, +1});
+        edges.push_back({note.endTick, -1});
+    }
+
+    std::sort(
+        edges.begin(),
+        edges.end(),
+        [](const PolyEdge& a, const PolyEdge& b) {
+            if (a.tick != b.tick)
+                return a.tick < b.tick;
+            // NoteOns before NoteOffs at the same tick, matching MPWGL2.
+            return a.direction > b.direction;
+        });
+
+    int active = 0;
+    int peak = 0;
+    for (const PolyEdge& edge : edges) {
+        active += edge.direction;
+        peak = std::max(peak, active);
+    }
+
+    output.derivedPeakPolyphony = static_cast<uint32_t>(std::max(0, peak));
+    output.derivedStatsReady = true;
+}
+
 } // namespace
 
 double MidiDocument::tickToSeconds(uint32_t tick) const
@@ -1139,8 +1368,17 @@ std::size_t MidiDocument::upperBoundVisualStart(double tick) const
 bool MidiParser::parse(
     const uint8_t* data,
     std::size_t size,
-    MidiDocument& output)
+    MidiDocument& output,
+    MidiParseProgress progress,
+    void* progressUser)
 {
+    auto report =
+        [&](int percent, const char* stage) {
+            if (progress)
+                progress(progressUser, percent, stage);
+        };
+
+    report(1, "Validating MIDI");
     output = MidiDocument{};
     errorMessage_ = "Unknown error";
 
@@ -1227,6 +1465,8 @@ bool MidiParser::parse(
         p += length;
     }
 
+    report(5, "Indexing tracks");
+
     output.activeChannelMasks.assign(
         tracks.size(),
         0);
@@ -1267,8 +1507,17 @@ bool MidiParser::parse(
             std::max(
                 output.maxTick,
                 scans[track].maxTick);
+
+        const int percent =
+            5 +
+            static_cast<int>(
+                30.0 *
+                double(track + 1) /
+                double(std::max<std::size_t>(1, tracks.size())));
+        report(percent, "Indexing tracks");
     }
 
+    report(38, "Building tempo index");
     buildTempoIndex(output);
 
     std::size_t minimumGlobalGroups = 0;
@@ -1287,6 +1536,8 @@ bool MidiParser::parse(
         output = MidiDocument{};
         return false;
     }
+
+    report(46, "Building global event index");
 
     output.noteCount = totalNotes;
     output.controlEventCount = totalControls;
@@ -1323,6 +1574,7 @@ bool MidiParser::parse(
     }
 
     // Pass 2: write compact events directly into final tick-group positions.
+    report(50, "Decoding MIDI events");
     for (std::size_t track = 0;
          track < tracks.size();
          ++track) {
@@ -1340,17 +1592,36 @@ bool MidiParser::parse(
             output = MidiDocument{};
             return false;
         }
+
+        const int percent =
+            50 +
+            static_cast<int>(
+                25.0 *
+                double(track + 1) /
+                double(std::max<std::size_t>(1, tracks.size())));
+        report(percent, "Decoding MIDI events");
     }
 
+    report(78, "Pairing visual notes");
     buildVisualNotes(
         output,
         eventTracks,
         scans);
 
+    report(87, "Compressing keyboard timeline");
+    buildVisualKeyIndex(output);
+
+    report(90, "Analyzing MIDI density");
+    buildDerivedStats(output);
+
+    report(93, "Finalizing visual index");
+
     // Free the temporary 2-byte/event track side-buffer before returning the
     // document to Qt; steady-state RAM remains compact.
     eventTracks.clear();
     eventTracks.shrink_to_fit();
+
+    report(95, "Sorting SysEx events");
 
     std::stable_sort(
         output.sysEx.begin(),
@@ -1360,6 +1631,7 @@ bool MidiParser::parse(
         });
 
     errorMessage_ = "";
+    report(100, "Parsed");
     return true;
 }
 

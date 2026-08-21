@@ -21,6 +21,8 @@ qt_add_executable(wasmidi
     src/keyboard.hpp
     src/midi/midi_parser.cpp
     src/midi/midi_parser.hpp
+    src/midi/midi_document_codec.cpp
+    src/midi/midi_document_codec.hpp
     src/midi/scheduler.cpp
     src/midi/scheduler.hpp
     src/renderer/gl_renderer.cpp
@@ -49,6 +51,37 @@ target_link_libraries(wasmidi PRIVATE
 )
 
 if(EMSCRIPTEN)
+    # Parse large MIDI files in a dedicated Worker-owned WASM instance. The Qt
+    # module receives only the compact finalized MidiDocument wire image, so the
+    # browser UI/render thread never performs the two full MIDI parse passes.
+    add_executable(midi_parser_core
+        src/midi/midi_parser.cpp
+        src/midi/midi_document_codec.cpp
+        src/midi/midi_worker_core.cpp
+    )
+
+    set_target_properties(midi_parser_core PROPERTIES
+        OUTPUT_NAME "wasmidi-midi-parser"
+        SUFFIX ".js"
+    )
+
+    target_include_directories(midi_parser_core PRIVATE src)
+    target_compile_options(midi_parser_core PRIVATE -O3 -flto)
+    target_link_options(midi_parser_core PRIVATE
+        -O3
+        -flto
+        "-sMODULARIZE=1"
+        "-sEXPORT_NAME=WasmidiMidiParserCore"
+        "-sENVIRONMENT=worker"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sINITIAL_MEMORY=67108864"
+        "-sMAXIMUM_MEMORY=2147483648"
+        "-sSTACK_SIZE=4194304"
+        "-sFILESYSTEM=0"
+        "-sEXPORTED_FUNCTIONS=['_wmp_parse','_wmp_result_ptr','_wmp_result_size','_wmp_error_ptr','_malloc','_free']"
+        "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
+    )
+
     # Qt stays single-threaded. SnappySynthV2 is a completely separate WASM
     # module hosted in its own browser Worker and may therefore use pthreads
     # without moving the QML/renderer runtime off Qt's wasm_singlethread build.
@@ -101,7 +134,7 @@ if(EMSCRIPTEN)
         "-lworkerfs.js"
     )
 
-    add_dependencies(wasmidi snappysynth_core)
+    add_dependencies(wasmidi midi_parser_core snappysynth_core)
 
     # Qt for WebAssembly owns the generated HTML/JS/WASM packaging.
     target_link_options(wasmidi PRIVATE

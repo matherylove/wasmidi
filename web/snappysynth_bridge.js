@@ -26,6 +26,9 @@
         minVoices: 0,
         blockFrames: 512,
         numBuffers: 16,
+        prebufferSeconds: 8.0,
+        midiDuration: 0.0,
+        prebufferFrames: 0,
         requestedSampleRate: 44100, // supplied SnappySynth.cfg default
         channels: 2,
         bitsPerSample: 32,
@@ -200,6 +203,8 @@
                     state.bitsPerSample = Number(data.bitsPerSample) === 16 ? 16 : 32;
                 if (Number.isFinite(data.numBuffers))
                     state.numBuffers = Math.max(1, Math.round(data.numBuffers));
+                if (Number.isFinite(data.prebufferFrames))
+                    state.prebufferFrames = Math.max(0, Math.round(data.prebufferFrames));
 
                 switch (data.type) {
                 case "ready":
@@ -346,6 +351,10 @@
                     state.blockFrames,
                 numBuffers:
                     state.numBuffers,
+                prebufferSeconds:
+                    state.prebufferSeconds,
+                midiDuration:
+                    state.midiDuration,
                 channels:
                     state.channels,
                 bitsPerSample:
@@ -611,6 +620,20 @@
         }
     }
 
+    function syncVisualClock(time) {
+        const value =
+            Math.max(
+                0.0,
+                Number(time) || 0.0);
+
+        if (node) {
+            node.port.postMessage({
+                type: "visualClock",
+                time: value
+            });
+        }
+    }
+
     function schedule(messages, times, safeUntil) {
         if (!worker ||
             !state.soundfontLoaded)
@@ -680,6 +703,29 @@
                 type: "vor",
                 overlapGain:
                     state.overlapGain
+            });
+        }
+    }
+
+    function setPrebuffer(seconds, duration) {
+        const requested = Number(seconds);
+        const songDuration = Number(duration);
+
+        state.prebufferSeconds =
+            Number.isFinite(requested)
+                ? Math.max(0.0, Math.min(3600.0, requested))
+                : state.prebufferSeconds;
+
+        state.midiDuration =
+            Number.isFinite(songDuration)
+                ? Math.max(0.0, songDuration)
+                : state.midiDuration;
+
+        if (worker) {
+            worker.postMessage({
+                type: "prebuffer",
+                seconds: state.prebufferSeconds,
+                duration: state.midiDuration
             });
         }
     }
@@ -828,6 +874,10 @@
                     state.blockFrames,
                 numBuffers:
                     state.numBuffers,
+                prebufferSeconds:
+                    state.prebufferSeconds,
+                midiDuration:
+                    state.midiDuration,
                 channels:
                     state.channels,
                 bitsPerSample:
@@ -864,11 +914,13 @@
         pause,
         stop,
         seek,
+        syncVisualClock,
         schedule,
         scheduleSysEx,
         clearSoundfonts,
         setVolume,
         setOverlapGain,
+        setPrebuffer,
         configure,
         getAudioClock
     };

@@ -11,6 +11,14 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         this.underruns = 0;
         this.starved = false;
 
+        // Qt's horizontal visualizer is the transport master. Audio may run a
+        // small lead (one worst-case 50 ms visual step plus one worklet block)
+        // to stay continuous at normal FPS, but it is never allowed to consume
+        // indefinitely when rendering stalls.
+        this.visualClockEnabled = false;
+        this.visualClockTime = 0.0;
+        this.visualLeadSeconds = 0.055;
+
         this.blockFrames = 512;
         this.numBuffers = 16;
         // Preserve Pass 10's post-synth gain semantics exactly. The shared-ring
@@ -58,8 +66,17 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                     this.playedFrames = 0;
                     this.lastClockReportFrame = 0;
                 }
+                this.visualClockEnabled = true;
+                this.visualClockTime = Math.max(0.0, Number(data.time) || 0.0);
                 this.playing = true;
                 this.requestAudioIfNeeded();
+                return;
+            }
+
+            if (data.type === "visualClock") {
+                this.visualClockEnabled = true;
+                this.visualClockTime =
+                    Math.max(0.0, Number(data.time) || 0.0);
                 return;
             }
 
@@ -72,6 +89,8 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                 this.flushRing();
                 if (Number.isFinite(data.time)) {
                     this.baseSongTime = Number(data.time);
+                    this.visualClockTime = Math.max(0.0, Number(data.time));
+                    this.visualClockEnabled = true;
                     this.playedFrames = 0;
                     this.lastClockReportFrame = 0;
                 }
@@ -115,17 +134,16 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                 this.blockFrames,
                 this.blockFrames * this.numBuffers);
 
-        // The actual ring can be slightly larger than the source NumBuffers
-        // setting only for pathological sub-128-frame browser configurations.
+        // When the Worker exposes a deep rolling pre-render ring, use the full
+        // ring as the high-water mark instead of intentionally draining it back
+        // to the old real-time NumBuffers depth. This keeps expensive synth work
+        // several seconds ahead of the device whenever possible.
         const hardCapacity =
             this.capacityFrames > 0
                 ? this.capacityFrames
                 : configuredHigh;
 
-        this.highWaterFrames =
-            Math.min(
-                hardCapacity,
-                configuredHigh);
+        this.highWaterFrames = hardCapacity;
 
         if (this.highWaterFrames < 128 && hardCapacity >= 128)
             this.highWaterFrames = Math.min(hardCapacity, 256);
@@ -364,9 +382,27 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                     this.ringHeader,
                     this.RING_AVAILABLE));
 
+        let visuallyAllowed = frames;
+        if (this.visualClockEnabled) {
+            const audioTime =
+                this.baseSongTime +
+                this.playedFrames / sampleRate;
+            const visualCeiling =
+                this.visualClockTime +
+                this.visualLeadSeconds;
+            visuallyAllowed =
+                Math.max(
+                    0,
+                    Math.min(
+                        frames,
+                        Math.floor(
+                            (visualCeiling - audioTime) *
+                            sampleRate + 1e-6)));
+        }
+
         const count =
             Math.min(
-                frames,
+                visuallyAllowed,
                 available);
 
         const written =
@@ -377,14 +413,16 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                 count);
 
         const starvedNow =
-            written < frames;
+            written < visuallyAllowed;
 
-        if (starvedNow) {
+        if (written < frames) {
             left.fill(0.0, written);
             if (right !== left)
                 right.fill(0.0, written);
-            ++this.underruns;
         }
+
+        if (starvedNow)
+            ++this.underruns;
 
         // The clock still advances only for PCM actually delivered to the
         // device, exactly as in Pass 10.

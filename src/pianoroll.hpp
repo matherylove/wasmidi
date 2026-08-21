@@ -3,6 +3,7 @@
 #include <QPointer>
 #include <QQuickFramebufferObject>
 #include <QQmlEngine>
+#include <QTimer>
 
 #include <atomic>
 
@@ -24,10 +25,14 @@ public:
 
     Renderer* createRenderer() const override;
 
+protected:
+    void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override;
+
 signals:
     void controllerChanged();
 
 private:
     QPointer<QObject> controller_;
     mutable std::atomic<int> renderFps_{0};
+    QTimer resizeSettleTimer_;
 };

@@ -11,6 +11,10 @@ let audioPort = null;
 let sampleRateHz = 44100;
 let blockFrames = 512;
 let numBuffers = 16;
+let prebufferSeconds = 8.0;
+let midiDuration = 0.0;
+let prebufferFrames = 0;
+const MAX_PREBUFFER_BYTES = 384 * 1024 * 1024;
 let maxVoices = 16384;
 let minVoices = 0;
 let synthChannels = 2;
@@ -87,7 +91,8 @@ function postState(type, extra = {}) {
         bitsPerSample:
             coreReady && Module ? Module._ssw_bits_per_sample() : bitsPerSample,
         numBuffers:
-            coreReady && Module ? Module._ssw_num_buffers() : numBuffers
+            coreReady && Module ? Module._ssw_num_buffers() : numBuffers,
+        prebufferFrames
     }, extra));
 }
 
@@ -164,32 +169,73 @@ function publishAudioRing(force = false) {
     });
 }
 
+function preferredRenderFrames() {
+    // Browser pthread/futex synchronization is substantially more expensive
+    // than the native Win32 event path. Render several source blocks per voice
+    // pass while preserving sample-accurate event offsets inside the larger
+    // call. At the default 512-frame source block this reduces worker barriers
+    // by 8x without changing the AudioWorklet's 128-frame delivery cadence.
+    const target = 4096;
+    if (blockFrames >= target)
+        return blockFrames;
+    return Math.ceil(target / Math.max(1, blockFrames)) * Math.max(1, blockFrames);
+}
+
+function requestedPrebufferFrames() {
+    const transportFrames =
+        Math.max(1, blockFrames) *
+        Math.max(1, numBuffers);
+
+    let seconds = prebufferSeconds;
+    if (midiDuration > 0.0) {
+        seconds =
+            seconds <= 0.0
+                ? midiDuration
+                : Math.min(seconds, midiDuration);
+    }
+
+    let requested =
+        seconds > 0.0
+            ? Math.ceil(seconds * sampleRateHz)
+            : transportFrames;
+
+    requested = Math.max(transportFrames, requested);
+
+    const bytesPerFrame = Math.max(1, synthChannels) * 4;
+    const memoryCapFrames =
+        Math.max(transportFrames, Math.floor(MAX_PREBUFFER_BYTES / bytesPerFrame));
+
+    requested = Math.min(requested, memoryCapFrames);
+
+    const quantum = Math.max(1, preferredRenderFrames());
+    const aligned = Math.ceil(requested / quantum) * quantum;
+    return Math.max(quantum, Math.min(aligned, memoryCapFrames));
+}
+
 function allocateAudioRing() {
     if (!Module)
         return;
 
     freeAudioRing();
 
-    // WebAudio renders 128-frame quanta. Preserve the configured SnappySynth
-    // buffer pool, but guarantee enough transport space for two device quanta
-    // even if the user intentionally chooses tiny source buffer settings.
+    // The shared ring is also the rolling pre-render cache. It is sized from
+    // the user's requested ahead duration (0 = MIDI duration), with the source
+    // NumBuffers transport size as a minimum and a browser-memory safety cap.
     const minimumTransportFrames = 256;
-    const requestedFrames =
-        Math.max(1, blockFrames) *
-        Math.max(1, numBuffers);
-    const minimumBlocks =
-        Math.max(
-            1,
-            Math.ceil(
-                minimumTransportFrames /
-                Math.max(1, blockFrames)));
-    const configuredBlocks =
-        Math.max(1, numBuffers);
-    const ringBlocks =
-        Math.max(configuredBlocks, minimumBlocks);
-
     audioRingCapacityFrames =
-        Math.max(1, blockFrames) * ringBlocks;
+        Math.max(
+            minimumTransportFrames,
+            requestedPrebufferFrames());
+
+    // Keep capacity an exact source-block multiple so wrap points can never
+    // split one sample-accurate synth block.
+    audioRingCapacityFrames =
+        Math.ceil(
+            audioRingCapacityFrames /
+            Math.max(1, blockFrames)) *
+        Math.max(1, blockFrames);
+
+    prebufferFrames = audioRingCapacityFrames;
 
     audioRingHeaderPtr =
         Module._malloc(RING_WORDS * 4);
@@ -426,7 +472,8 @@ function reinitializeCore() {
         softClip,
         loaded: soundfontLoaded,
         layers: Module._ssw_layer_count(),
-        regions: Module._ssw_region_count()
+        regions: Module._ssw_region_count(),
+        prebufferFrames
     });
 
     renderSongTime = 0.0;
@@ -656,15 +703,46 @@ function pump() {
     try {
         let guard = 0;
         let produced = 0;
+        const header = ringHeader();
+        const renderQuantum = Math.max(1, preferredRenderFrames());
 
-        // Preserve SnappySynth's configured render block size. The worklet
-        // requests demand rounded to whole blocks, so every render maps to one
-        // original AudioConfig.buffer_size block.
-        while (pendingNeedFrames > 0 &&
-               guard++ < 128) {
-            if (!renderOneBlock(blockFrames))
+        // Proactively pre-render until the rolling cache is full or the main
+        // MIDI scheduler's safe horizon is reached. Yield periodically so seek,
+        // config and catch-up messages can interrupt long background renders.
+        while (header && guard++ < 16) {
+            const available =
+                Math.max(0, Atomics.load(header, RING_AVAILABLE));
+            const freeFrames = audioRingCapacityFrames - available;
+
+            if (freeFrames < Math.max(1, blockFrames))
                 break;
-            produced += blockFrames;
+
+            const writeFrame =
+                Math.max(0, Atomics.load(header, RING_WRITE));
+            const contiguous =
+                Math.max(0, audioRingCapacityFrames - writeFrame);
+
+            let safeFrames =
+                Math.floor(
+                    Math.max(0.0, safeUntil - renderSongTime) *
+                    sampleRateHz +
+                    1e-6);
+
+            safeFrames =
+                Math.floor(safeFrames / Math.max(1, blockFrames)) *
+                Math.max(1, blockFrames);
+
+            let frames =
+                Math.min(renderQuantum, freeFrames, contiguous, safeFrames);
+
+            frames =
+                Math.floor(frames / Math.max(1, blockFrames)) *
+                Math.max(1, blockFrames);
+
+            if (frames <= 0 || !renderOneBlock(frames))
+                break;
+
+            produced += frames;
         }
 
         if (produced > 0) {
@@ -673,6 +751,22 @@ function pump() {
                 type: "filled",
                 frames: produced
             });
+        }
+
+        const available =
+            header
+                ? Math.max(0, Atomics.load(header, RING_AVAILABLE))
+                : 0;
+        const room = audioRingCapacityFrames - available;
+        const safeFramesRemaining =
+            Math.floor(
+                Math.max(0.0, safeUntil - renderSongTime) *
+                sampleRateHz +
+                1e-6);
+
+        if (room >= Math.max(1, blockFrames) &&
+            safeFramesRemaining >= Math.max(1, blockFrames)) {
+            setTimeout(pump, 0);
         }
     } catch (error) {
         setError(error);
@@ -907,6 +1001,32 @@ onmessage = async event => {
             return;
         }
 
+        if (data.type === "prebuffer") {
+            prebufferSeconds =
+                Math.max(
+                    0.0,
+                    Math.min(
+                        3600.0,
+                        Number(data.seconds) || 0.0));
+
+            midiDuration =
+                Math.max(
+                    0.0,
+                    Number(data.duration) || 0.0);
+
+            if (Module && coreReady) {
+                allocateAudioRing();
+                resetAudioRing();
+                publishAudioRing(true);
+            }
+
+            postState("configured", {
+                prebufferFrames
+            });
+            pump();
+            return;
+        }
+
         if (data.type === "configure") {
             sampleRateHz =
                 Math.max(
@@ -945,6 +1065,18 @@ onmessage = async event => {
                         128,
                         Number(data.numBuffers) |
                         0));
+
+            prebufferSeconds =
+                Math.max(
+                    0.0,
+                    Math.min(
+                        3600.0,
+                        Number(data.prebufferSeconds) || prebufferSeconds));
+
+            midiDuration =
+                Math.max(
+                    0.0,
+                    Number(data.midiDuration) || midiDuration);
 
             synthChannels =
                 Number(data.channels) === 1
@@ -1012,7 +1144,8 @@ onmessage = async event => {
                 stealScoreCache,
                 fastNoteOff,
                 validateState,
-                softClip
+                softClip,
+                prebufferFrames
             });
             return;
         }
@@ -1089,7 +1222,8 @@ SnappySynthCore({
         stealScoreCache,
         fastNoteOff,
         validateState,
-        softClip
+        softClip,
+        prebufferFrames
     });
 
     pump();

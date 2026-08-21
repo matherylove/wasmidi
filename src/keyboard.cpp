@@ -245,20 +245,28 @@ public:
         if (!controller)
             return;
 
-        mask_ =
+        const auto nextMask =
             controller->activePitchMask();
 
-        colorIndices_ =
-            controller->
-                activePitchColorIndices();
+        const auto nextColorIndices =
+            controller->activePitchColorIndices();
 
-        colors_ =
+        const auto nextColors =
             controller->channelColors();
 
-        hue_ =
-            controller->dominantHue();
+        if (nextMask != mask_ ||
+            nextColorIndices != colorIndices_ ||
+            nextColors != colors_) {
+            mask_ = nextMask;
+            colorIndices_ = nextColorIndices;
+            colors_ = nextColors;
+            dirty_ = true;
+        }
 
-        dirty_ = true;
+        // Background hue is a shader uniform; changing it does not require a
+        // 128-instance VBO rebuild. This keeps keyboard rendering effectively
+        // pre-cached between actual key/color state changes.
+        hue_ = controller->dominantHue();
     }
 
     void render() override
@@ -547,6 +555,34 @@ Keyboard::Keyboard(QQuickItem* parent)
 {
     setMirrorVertically(false);
     setTextureFollowsItemSize(true);
+
+    resizeSettleTimer_.setSingleShot(true);
+    resizeSettleTimer_.setInterval(140);
+
+    connect(
+        &resizeSettleTimer_,
+        &QTimer::timeout,
+        this,
+        [this]() {
+            setTextureFollowsItemSize(true);
+            update();
+        });
+}
+
+void Keyboard::geometryChange(
+    const QRectF& newGeometry,
+    const QRectF& oldGeometry)
+{
+    QQuickFramebufferObject::geometryChange(
+        newGeometry,
+        oldGeometry);
+
+    if (newGeometry.size() == oldGeometry.size())
+        return;
+
+    setTextureFollowsItemSize(false);
+    resizeSettleTimer_.start();
+    update();
 }
 
 void Keyboard::setController(QObject* controller)
