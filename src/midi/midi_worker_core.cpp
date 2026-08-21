@@ -23,25 +23,48 @@ EM_JS(void, wmp_post_progress, (int percent, const char* stage), {
     const stageText = stage ? UTF8ToString(stage) : "Parsing MIDI";
     const absolutePercent = 15 + Math.floor(
         Math.max(0, Math.min(100, percent | 0)) * 0.79);
-    self.__wasmidiMidiParserStage = stageText;
-    self.__wasmidiMidiParserPercent = absolutePercent;
-    postMessage({
-        type: "progress",
-        percent: absolutePercent,
-        stage: stageText
-    });
+
+    // The production parser runs in a browser Worker, while CI executes the
+    // exact generated module in Node. Never assume the Worker-only `self`
+    // global exists just to report optional progress.
+    const root = typeof globalThis !== "undefined"
+        ? globalThis
+        : (typeof self !== "undefined" ? self : null);
+
+    if (root) {
+        root.__wasmidiMidiParserStage = stageText;
+        root.__wasmidiMidiParserPercent = absolutePercent;
+    }
+
+    if (typeof postMessage === "function") {
+        postMessage({
+            type: "progress",
+            percent: absolutePercent,
+            stage: stageText
+        });
+    }
 });
 
 EM_JS(void, wmp_post_absolute_progress, (int percent, const char* stage), {
     const stageText = stage ? UTF8ToString(stage) : "Loading MIDI";
     const absolutePercent = Math.max(0, Math.min(100, percent | 0));
-    self.__wasmidiMidiParserStage = stageText;
-    self.__wasmidiMidiParserPercent = absolutePercent;
-    postMessage({
-        type: "progress",
-        percent: absolutePercent,
-        stage: stageText
-    });
+
+    const root = typeof globalThis !== "undefined"
+        ? globalThis
+        : (typeof self !== "undefined" ? self : null);
+
+    if (root) {
+        root.__wasmidiMidiParserStage = stageText;
+        root.__wasmidiMidiParserPercent = absolutePercent;
+    }
+
+    if (typeof postMessage === "function") {
+        postMessage({
+            type: "progress",
+            percent: absolutePercent,
+            stage: stageText
+        });
+    }
 });
 #endif
 

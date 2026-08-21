@@ -6,6 +6,19 @@
 const fs = require("fs");
 const path = require("path");
 
+// Emscripten is intentionally built for both `worker` and `node`. The parser's
+// EM_JS progress callbacks are optional in Node, but providing the tiny Worker
+// surface here makes the smoke test exercise the same callback path that Pages
+// uses instead of failing merely because Node has no `self`/`postMessage`.
+const parserProgressMessages = [];
+if (typeof globalThis.self === "undefined")
+    globalThis.self = globalThis;
+if (typeof globalThis.postMessage !== "function") {
+    globalThis.postMessage = message => {
+        parserProgressMessages.push(message);
+    };
+}
+
 async function main() {
     const jsPath = path.resolve(
         process.argv[2] ||
@@ -79,6 +92,12 @@ async function main() {
         const resultSize = Number(Module._wmp_result_size()) >>> 0;
         if (!resultPtr || resultSize === 0)
             throw new Error("Parser produced an empty serialized document.");
+
+        if (!parserProgressMessages.some(message =>
+                message && message.type === "progress")) {
+            throw new Error(
+                "Parser smoke test completed without exercising progress callbacks.");
+        }
     } finally {
         Module._free(ptr);
     }
