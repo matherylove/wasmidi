@@ -123,20 +123,45 @@ jobs:
           cp web/snappysynth-audio-worklet.js site/
 
           # Load the isolation helper and bridge before Qt's generated bootstrap.
+          # Fingerprint executable assets with the commit SHA so a successful
+          # Pages deploy cannot reuse an older Qt/COI bootstrap from HTTP cache.
           python3 - <<'PY'
+          import os
+          import re
           from pathlib import Path
+
+          version = os.environ.get("GITHUB_SHA", "dev")[:16]
           p = Path("site/index.html")
           html = p.read_text(encoding="utf-8")
-          scripts = """
-          <script src="coi-serviceworker.js"></script>
-          <script src="snappysynth_bridge.js"></script>
+          scripts = f"""
+          <script src="coi-serviceworker.js?v={version}"></script>
+          <script src="snappysynth_bridge.js?v={version}"></script>
           """
           if "snappysynth_bridge.js" not in html:
               if "</head>" in html:
                   html = html.replace("</head>", scripts + "\n</head>", 1)
               else:
                   html = scripts + "\n" + html
+          else:
+              html = re.sub(
+                  r'coi-serviceworker\.js(?:\?[^"\']*)?',
+                  f'coi-serviceworker.js?v={version}',
+                  html)
+              html = re.sub(
+                  r'snappysynth_bridge\.js(?:\?[^"\']*)?',
+                  f'snappysynth_bridge.js?v={version}',
+                  html)
+
+          # Qt's generated script tag is otherwise a stable wasmidi.js URL.
+          html = re.sub(
+              r'wasmidi\.js(?:\?[^"\']*)?',
+              f'wasmidi.js?v={version}',
+              html)
+
           p.write_text(html, encoding="utf-8")
+          Path("site/build-id.txt").write_text(
+              os.environ.get("GITHUB_SHA", "dev") + "\n",
+              encoding="utf-8")
           PY
 
           touch site/.nojekyll
@@ -157,6 +182,10 @@ jobs:
           test -s site/snappysynth-audio-worklet.js
           test -s site/snappysynth_bridge.js
           test -s site/coi-serviceworker.js
+          test -s site/build-id.txt
+          grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.9"' site/midi-parser-worker.js
+          grep -q 'wasmidi.js?v=' site/index.html
+          grep -q 'coi-serviceworker.js?v=' site/index.html
 
           echo "SnappySynthV2 deployment validation:"
           grep -q 'coi-serviceworker.js' site/index.html
