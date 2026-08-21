@@ -61,8 +61,6 @@ GLuint linkProgram(const char* vertexSource,
 constexpr std::size_t InitialRingCapacity =
     std::size_t(1) << 18;
 
-constexpr std::size_t TotalMidiStates =
-    16u * 128u;
 
 float wrapHue(float value)
 {
@@ -94,8 +92,6 @@ GLRenderer::GLRenderer()
             defaults[i][3]
         };
     }
-
-    openNotes_.reserve(TotalMidiStates);
     neuralLines_.reserve(95u * 24u);
     neuralPoints_.reserve(95u);
 
@@ -113,25 +109,48 @@ bool GLRenderer::createPrograms()
 precision highp float;
 precision highp int;
 
-layout(location=0) in int aStartTick;
-layout(location=1) in int aEndTick;
+layout(location=0) in uint aStartTick;
+layout(location=1) in uint aEndTick;
 layout(location=2) in uint aPackedData;
 
 uniform float uViewStart;
 uniform float uViewEnd;
 uniform float uCurrentTick;
+uniform float uViewportWidth;
+uniform int uPerTrack;
 uniform vec3 uPalette[16];
 
 flat out vec3 vColor;
 flat out float vActive;
 
+float snapTickX(float tick)
+{
+    float rangeTicks =
+        max(1.0, uViewEnd - uViewStart);
+
+    float normalized =
+        (tick - uViewStart) /
+        rangeTicks;
+
+    // MPWGL2 converts ticks to integer texture columns with Math.round().
+    // Snap to the current FBO's CSS-pixel columns to keep bar placement
+    // visually identical while retaining vector/instanced rendering.
+    float columns =
+        max(1.0, uViewportWidth - 1.0);
+
+    float column =
+        floor(
+            normalized * columns +
+            0.5);
+
+    return
+        column / columns *
+        2.0 -
+        1.0;
+}
+
 void main()
 {
-    int endTick =
-        aEndTick > 0
-            ? aEndTick
-            : int(uViewEnd);
-
     uint vertexId =
         uint(gl_VertexID);
 
@@ -142,25 +161,13 @@ void main()
         float(
             (vertexId >> 1u) & 1u);
 
-    float rangeTicks =
-        max(
-            1.0,
-            uViewEnd -
-            uViewStart);
-
     float startX =
-        (float(aStartTick) -
-         uViewStart) /
-        rangeTicks *
-        2.0 -
-        1.0;
+        snapTickX(
+            float(aStartTick));
 
     float endX =
-        (float(endTick) -
-         uViewStart) /
-        rangeTicks *
-        2.0 -
-        1.0;
+        snapTickX(
+            float(aEndTick));
 
     float x =
         mix(
@@ -172,21 +179,43 @@ void main()
         (aPackedData >> 8u) &
         0xffu;
 
-    uint colorIndex =
+    uint globalColor =
         (aPackedData >> 16u) &
         0x0fu;
 
-    float yBottom =
+    uint trackColor =
+        (aPackedData >> 20u) &
+        0x0fu;
+
+    uint colorIndex =
+        uPerTrack != 0
+            ? trackColor
+            : globalColor;
+
+    // Match MPWGL2:
+    // rowCenter = round((pitch/127) * (height-1))
+    // rowH      = max(1, floor(height/128))
+    // The shader uses the equivalent normalized row center/height.
+    float rowHeight =
+        2.0 / 128.0;
+
+    float centerY =
         -1.0 +
         float(pitch) /
-        128.0 *
+        127.0 *
         2.0;
 
+    float yBottom =
+        clamp(
+            centerY -
+            rowHeight * 0.5,
+            -1.0,
+            1.0 -
+            rowHeight);
+
     float yTop =
-        -1.0 +
-        float(pitch + 1u) /
-        128.0 *
-        2.0;
+        yBottom +
+        rowHeight;
 
     float y =
         mix(
@@ -202,7 +231,7 @@ void main()
         (uCurrentTick >=
              float(aStartTick) &&
          uCurrentTick <=
-             float(endTick))
+             float(aEndTick))
             ? 1.0
             : 0.0;
 
@@ -571,6 +600,16 @@ void main()
             noteProgram_,
             "uCurrentTick");
 
+    viewportWidthUniform_ =
+        glGetUniformLocation(
+            noteProgram_,
+            "uViewportWidth");
+
+    perTrackUniform_ =
+        glGetUniformLocation(
+            noteProgram_,
+            "uPerTrack");
+
     paletteUniform_ =
         glGetUniformLocation(
             noteProgram_,
@@ -618,128 +657,60 @@ bool GLRenderer::initialize()
 
     glGenVertexArrays(
         1,
-        &completedVao_);
+        &noteVao_);
 
     glGenBuffers(
         1,
-        &completedVbo_);
+        &noteVbo_);
 
-    // The completed-note ring is the main horizontal visualizer. Pass 8.2
-    // accidentally created this VAO/VBO but never enabled/configured its
-    // instanced attributes, so DrawArraysInstanced read constant zero values
-    // for StartTick/EndTick/PackedData and completed notes disappeared.
     glBindVertexArray(
-        completedVao_);
+        noteVao_);
 
     glBindBuffer(
         GL_ARRAY_BUFFER,
-        completedVbo_);
+        noteVbo_);
 
     glEnableVertexAttribArray(0);
 
     glVertexAttribIPointer(
-        0,
-        1,
-        GL_INT,
-        sizeof(RenderNote),
-        reinterpret_cast<void*>(
-            offsetof(
-                RenderNote,
-                startTick)));
-
-    glVertexAttribDivisor(
-        0,
-        1);
-
-    glEnableVertexAttribArray(1);
-
-    glVertexAttribIPointer(
-        1,
-        1,
-        GL_INT,
-        sizeof(RenderNote),
-        reinterpret_cast<void*>(
-            offsetof(
-                RenderNote,
-                endTick)));
-
-    glVertexAttribDivisor(
-        1,
-        1);
-
-    glEnableVertexAttribArray(2);
-
-    glVertexAttribIPointer(
-        2,
-        1,
+        0, 1,
         GL_UNSIGNED_INT,
-        sizeof(RenderNote),
+        sizeof(VisualNote),
         reinterpret_cast<void*>(
             offsetof(
-                RenderNote,
-                packedData)));
-
-    glVertexAttribDivisor(
-        2,
-        1);
-
-    glBindVertexArray(0);
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        0);
-
-    glGenVertexArrays(
-        1,
-        &openVao_);
-
-    glGenBuffers(
-        1,
-        &openVbo_);
-
-    glBindVertexArray(openVao_);
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        openVbo_);
-
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        static_cast<GLsizeiptr>(
-            TotalMidiStates *
-            sizeof(RenderNote)),
-        nullptr,
-        GL_DYNAMIC_DRAW);
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribIPointer(
-        0, 1, GL_INT,
-        sizeof(RenderNote),
-        reinterpret_cast<void*>(
-            offsetof(
-                RenderNote,
+                VisualNote,
                 startTick)));
+
     glVertexAttribDivisor(0, 1);
 
     glEnableVertexAttribArray(1);
+
     glVertexAttribIPointer(
-        1, 1, GL_INT,
-        sizeof(RenderNote),
+        1, 1,
+        GL_UNSIGNED_INT,
+        sizeof(VisualNote),
         reinterpret_cast<void*>(
             offsetof(
-                RenderNote,
+                VisualNote,
                 endTick)));
+
     glVertexAttribDivisor(1, 1);
 
     glEnableVertexAttribArray(2);
+
     glVertexAttribIPointer(
-        2, 1, GL_UNSIGNED_INT,
-        sizeof(RenderNote),
+        2, 1,
+        GL_UNSIGNED_INT,
+        sizeof(VisualNote),
         reinterpret_cast<void*>(
             offsetof(
-                RenderNote,
+                VisualNote,
                 packedData)));
+
     glVertexAttribDivisor(2, 1);
 
     glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 
     glGenVertexArrays(
         1,
@@ -761,11 +732,9 @@ bool GLRenderer::initialize()
         neuralLineVbo_);
 
     glEnableVertexAttribArray(0);
+
     glVertexAttribPointer(
-        0,
-        2,
-        GL_FLOAT,
-        GL_FALSE,
+        0, 2, GL_FLOAT, GL_FALSE,
         sizeof(NeuralLineVertex),
         reinterpret_cast<void*>(
             offsetof(
@@ -773,11 +742,9 @@ bool GLRenderer::initialize()
                 x)));
 
     glEnableVertexAttribArray(1);
+
     glVertexAttribPointer(
-        1,
-        1,
-        GL_FLOAT,
-        GL_FALSE,
+        1, 1, GL_FLOAT, GL_FALSE,
         sizeof(NeuralLineVertex),
         reinterpret_cast<void*>(
             offsetof(
@@ -802,11 +769,9 @@ bool GLRenderer::initialize()
         neuralPointVbo_);
 
     glEnableVertexAttribArray(0);
+
     glVertexAttribPointer(
-        0,
-        2,
-        GL_FLOAT,
-        GL_FALSE,
+        0, 2, GL_FLOAT, GL_FALSE,
         sizeof(NeuralPointVertex),
         reinterpret_cast<void*>(
             offsetof(
@@ -814,11 +779,9 @@ bool GLRenderer::initialize()
                 x)));
 
     glEnableVertexAttribArray(1);
+
     glVertexAttribPointer(
-        1,
-        1,
-        GL_FLOAT,
-        GL_FALSE,
+        1, 1, GL_FLOAT, GL_FALSE,
         sizeof(NeuralPointVertex),
         reinterpret_cast<void*>(
             offsetof(
@@ -829,7 +792,7 @@ bool GLRenderer::initialize()
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
     allocateRing(
-        InitialRingCapacity);
+        std::size_t(1) << 18);
 
     initialized_ = true;
     return true;
@@ -838,8 +801,7 @@ bool GLRenderer::initialize()
 void GLRenderer::destroy()
 {
     const GLuint buffers[] = {
-        completedVbo_,
-        openVbo_,
+        noteVbo_,
         neuralLineVbo_,
         neuralPointVbo_
     };
@@ -850,8 +812,7 @@ void GLRenderer::destroy()
     }
 
     const GLuint vaos[] = {
-        completedVao_,
-        openVao_,
+        noteVao_,
         backgroundVao_,
         neuralLineVao_,
         neuralPointVao_
@@ -873,13 +834,11 @@ void GLRenderer::destroy()
             glDeleteProgram(program);
     }
 
-    completedVbo_ = 0;
-    openVbo_ = 0;
+    noteVbo_ = 0;
     neuralLineVbo_ = 0;
     neuralPointVbo_ = 0;
 
-    completedVao_ = 0;
-    openVao_ = 0;
+    noteVao_ = 0;
     backgroundVao_ = 0;
     neuralLineVao_ = 0;
     neuralPointVao_ = 0;
@@ -889,47 +848,34 @@ void GLRenderer::destroy()
     neuralProgram_ = 0;
 
     ring_.clear();
-    openNotes_.clear();
-
     ringCapacity_ = 0;
     ringMask_ = 0;
+    sourceBegin_ = 0;
+    sourceEnd_ = 0;
 
     initialized_ = false;
 }
 
-void GLRenderer::resize(
-    int width,
-    int height)
+void GLRenderer::resize(int width, int height)
 {
-    width_ =
-        std::max(
-            1,
-            width);
-
-    height_ =
-        std::max(
-            1,
-            height);
+    width_ = std::max(1, width);
+    height_ = std::max(1, height);
 }
 
-void GLRenderer::setDocument(
-    const MidiDocument* document)
+void GLRenderer::setDocument(const MidiDocument* document)
 {
     document_ = document;
-    resetSweep();
+    sourceBegin_ = 0;
+    sourceEnd_ = 0;
+    forceCacheReset_ = true;
 }
 
-void GLRenderer::setCurrentTime(
-    float seconds)
+void GLRenderer::setCurrentTime(float seconds)
 {
-    currentTime_ =
-        std::max(
-            0.0f,
-            seconds);
+    currentTime_ = std::max(0.0f, seconds);
 }
 
-void GLRenderer::setNoteSpeed(
-    float secondsPerWindow)
+void GLRenderer::setNoteSpeed(float secondsPerWindow)
 {
     const float value =
         std::clamp(
@@ -937,19 +883,14 @@ void GLRenderer::setNoteSpeed(
             0.1f,
             60.0f);
 
-    if (std::abs(
-            noteSpeed_ -
-            value) <
-        0.00001f) {
+    if (std::abs(noteSpeed_ - value) < 0.00001f)
         return;
-    }
 
     noteSpeed_ = value;
-    forceSweepReset_ = true;
+    forceCacheReset_ = true;
 }
 
-void GLRenderer::setPostBuffer(
-    float seconds)
+void GLRenderer::setPostBuffer(float seconds)
 {
     const float value =
         std::clamp(
@@ -957,25 +898,16 @@ void GLRenderer::setPostBuffer(
             0.0f,
             10.0f);
 
-    if (std::abs(
-            postBuffer_ -
-            value) <
-        0.00001f) {
+    if (std::abs(postBuffer_ - value) < 0.00001f)
         return;
-    }
 
     postBuffer_ = value;
-    forceSweepReset_ = true;
+    forceCacheReset_ = true;
 }
 
-void GLRenderer::setPerTrackColors(
-    bool enabled)
+void GLRenderer::setPerTrackColors(bool enabled)
 {
-    if (perTrackColors_ == enabled)
-        return;
-
     perTrackColors_ = enabled;
-    forceSweepReset_ = true;
 }
 
 void GLRenderer::setChannelColor(
@@ -984,38 +916,24 @@ void GLRenderer::setChannelColor(
     uint8_t g,
     uint8_t b)
 {
-    if (channel >=
-        channelColors_.size()) {
+    if (channel >= channelColors_.size())
         return;
-    }
 
-    const std::array<uint8_t, 4>
-        value =
-            {r,g,b,255};
+    const std::array<uint8_t,4> value =
+        {r,g,b,255};
 
-    if (channelColors_[channel] ==
-        value) {
+    if (channelColors_[channel] == value)
         return;
-    }
 
-    channelColors_[channel] =
-        value;
-
+    channelColors_[channel] = value;
     paletteDirty_ = true;
 }
 
-void GLRenderer::setNeuralVisual(
-    float hue,
-    float activity)
+void GLRenderer::setNeuralVisual(float hue, float activity)
 {
-    neuralTargetHue_ =
-        wrapHue(hue);
-
+    neuralTargetHue_ = wrapHue(hue);
     neuralActivity_ =
-        std::clamp(
-            activity,
-            0.0f,
-            1.0f);
+        std::clamp(activity, 0.0f, 1.0f);
 }
 
 void GLRenderer::initializeNeuralNodes()
@@ -1066,7 +984,6 @@ void GLRenderer::initializeNeuralNodes()
             .004f;
     }
 }
-
 void GLRenderer::updateNeuralNodes()
 {
     const auto now =
@@ -1239,7 +1156,6 @@ void GLRenderer::updateNeuralNodes()
         }
     }
 }
-
 void GLRenderer::renderBackground()
 {
     updateNeuralNodes();
@@ -1366,60 +1282,26 @@ void GLRenderer::renderBackground()
 
     glDisable(GL_BLEND);
 }
-
-void GLRenderer::allocateRing(
-    std::size_t capacity)
+void GLRenderer::allocateRing(std::size_t capacity)
 {
     std::size_t rounded = 1;
 
     while (rounded < capacity)
         rounded <<= 1;
 
-    const std::size_t oldCapacity =
-        ringCapacity_;
-
-    const std::size_t oldMask =
-        ringMask_;
-
-    std::vector<RenderNote>
-        oldRing;
-
-    oldRing.swap(ring_);
-
     ringCapacity_ = rounded;
-    ringMask_ =
-        ringCapacity_ - 1;
-
-    ring_.resize(
-        ringCapacity_);
-
-    if (!oldRing.empty() &&
-        oldCapacity != 0) {
-        for (int64_t id = tail_;
-             id < head_;
-             ++id) {
-            ring_[
-                static_cast<
-                    std::size_t>(
-                        id) &
-                ringMask_] =
-            oldRing[
-                static_cast<
-                    std::size_t>(
-                        id) &
-                oldMask];
-        }
-    }
+    ringMask_ = ringCapacity_ - 1;
+    ring_.resize(ringCapacity_);
 
     glBindBuffer(
         GL_ARRAY_BUFFER,
-        completedVbo_);
+        noteVbo_);
 
     glBufferData(
         GL_ARRAY_BUFFER,
         static_cast<GLsizeiptr>(
             ringCapacity_ *
-            sizeof(RenderNote)),
+            sizeof(VisualNote)),
         nullptr,
         GL_DYNAMIC_DRAW);
 
@@ -1427,307 +1309,82 @@ void GLRenderer::allocateRing(
         GL_ARRAY_BUFFER,
         0);
 
-    if (head_ > tail_)
-        uploadCompletedRange(
-            tail_,
-            head_);
+    // Re-upload from the immutable source; no ring-to-ring copy required.
+    if (document_ &&
+        sourceEnd_ > sourceBegin_) {
+        uploadSourceRange(
+            sourceBegin_,
+            sourceEnd_);
+    }
 }
 
-void GLRenderer::ensureRingSpace()
+void GLRenderer::ensureRingCapacity(std::size_t required)
 {
-    if (ringCapacity_ == 0) {
-        allocateRing(
-            InitialRingCapacity);
-        return;
-    }
-
-    if (head_ - tail_ <
-        static_cast<int64_t>(
-            ringCapacity_ - 1)) {
-        return;
-    }
-
-    allocateRing(
-        ringCapacity_ * 2);
-}
-
-void GLRenderer::reserveForSweep(
-    uint32_t fromTick,
-    uint32_t toTick)
-{
-    if (!document_ ||
-        fromTick > toTick) {
-        return;
-    }
-
-    const std::size_t begin =
-        document_->
-            lowerBoundGroup(
-                fromTick);
-
-    const std::size_t end =
-        document_->
-            upperBoundGroup(
-                toTick);
-
-    uint64_t possibleNotes = 0;
-
-    for (std::size_t i = begin;
-         i < end;
-         ++i) {
-        possibleNotes +=
-            document_->
-                tickGroups[i]
-                .noteOnCount;
-    }
-
-    const uint64_t required =
-        uint64_t(
-            std::max<int64_t>(
-                0,
-                head_ -
-                tail_)) +
-        possibleNotes +
-        1u;
-
     if (required <= ringCapacity_)
         return;
 
     std::size_t target =
         std::max<std::size_t>(
             ringCapacity_,
-            InitialRingCapacity);
+            std::size_t(1) << 18);
 
-    while (uint64_t(target) <
-           required) {
+    while (target < required)
         target <<= 1;
-    }
 
     allocateRing(target);
 }
 
-void GLRenderer::resetSweep()
+void GLRenderer::uploadSourceRange(
+    std::size_t begin,
+    std::size_t end)
 {
-    head_ = 0;
-    tail_ = 0;
-
-    activeCount_.fill(0);
-    activeColor_.fill(0);
-    activeStartTick_.fill(0);
-    activePackedData_.fill(0);
-
-    openNotes_.clear();
-
-    lastSweepEnd_ = -1;
-    lastViewSpan_ = 0;
-
-    forceSweepReset_ = true;
-    openDirty_ = true;
-}
-
-uint8_t GLRenderer::eventColor(
-    const CompactEvent& event) const
-{
-    return document_
-        ? document_->
-            colorIndex(
-                event,
-                perTrackColors_)
-        : 0;
-}
-
-void GLRenderer::appendCompleted(
-    int32_t startTick,
-    int32_t endTick,
-    uint32_t packedData)
-{
-    ensureRingSpace();
-
-    const std::size_t physical =
-        static_cast<
-            std::size_t>(
-                head_) &
-        ringMask_;
-
-    ring_[physical] = {
-        startTick,
-        endTick,
-        packedData
-    };
-
-    ++head_;
-}
-
-void GLRenderer::beginActiveNote(
-    std::size_t stateIndex,
-    uint32_t tick,
-    uint8_t pitch,
-    uint8_t velocity,
-    uint8_t color)
-{
-    activeStartTick_[stateIndex] =
-        static_cast<int32_t>(
-            std::min<uint32_t>(
-                tick,
-                uint32_t(
-                    std::numeric_limits<
-                        int32_t>::max())));
-
-    activePackedData_[stateIndex] =
-        uint32_t(velocity) |
-        (uint32_t(pitch) << 8) |
-        (uint32_t(
-            color & 0x0f) << 16);
-
-    activeColor_[stateIndex] =
-        color;
-
-    openDirty_ = true;
-}
-
-void GLRenderer::finishActiveNote(
-    std::size_t stateIndex,
-    uint32_t tick)
-{
-    appendCompleted(
-        activeStartTick_[
-            stateIndex],
-        static_cast<int32_t>(
-            std::min<uint32_t>(
-                tick,
-                uint32_t(
-                    std::numeric_limits<
-                        int32_t>::max()))),
-        activePackedData_[
-            stateIndex]);
-
-    openDirty_ = true;
-}
-
-void GLRenderer::processEvent(
-    const CompactEvent& event,
-    uint32_t tick)
-{
-    const uint8_t command =
-        event.status & 0xf0;
-
-    if (command != 0x90 &&
-        command != 0x80) {
-        return;
-    }
-
-    const uint8_t channel =
-        event.status & 0x0f;
-
-    const uint8_t pitch =
-        event.data1 & 0x7f;
-
-    const std::size_t stateIndex =
-        std::size_t(channel) *
-        128u +
-        std::size_t(pitch);
-
-    const uint8_t color =
-        eventColor(event);
-
-    uint32_t& count =
-        activeCount_[stateIndex];
-
-    if (command == 0x90 &&
-        event.data2 != 0) {
-        if (count != 0 &&
-            activeColor_[
-                stateIndex] !=
-                color) {
-            finishActiveNote(
-                stateIndex,
-                tick);
-
-            count = 0;
-        }
-
-        if (count == 0) {
-            beginActiveNote(
-                stateIndex,
-                tick,
-                pitch,
-                event.data2,
-                color);
-        }
-
-        ++count;
-        return;
-    }
-
-    if (count == 0)
-        return;
-
-    if (activeColor_[
-            stateIndex] !=
-        color) {
-        return;
-    }
-
-    --count;
-
-    if (count == 0)
-        finishActiveNote(
-            stateIndex,
-            tick);
-}
-
-void GLRenderer::uploadCompletedRange(
-    int64_t begin,
-    int64_t end)
-{
-    if (end <= begin ||
+    if (!document_ ||
+        begin >= end ||
         ringCapacity_ == 0) {
         return;
     }
 
+    const auto& notes =
+        document_->visualNotes;
+
+    if (end > notes.size())
+        end = notes.size();
+
     glBindBuffer(
         GL_ARRAY_BUFFER,
-        completedVbo_);
+        noteVbo_);
 
-    int64_t cursor = begin;
+    std::size_t cursor = begin;
 
     while (cursor < end) {
         const std::size_t physical =
-            static_cast<
-                std::size_t>(
-                    cursor) &
-            ringMask_;
-
-        const std::size_t available =
-            ringCapacity_ -
-            physical;
+            cursor & ringMask_;
 
         const std::size_t count =
-            static_cast<
-                std::size_t>(
-                    std::min<
-                        int64_t>(
-                            end -
-                            cursor,
-                            static_cast<
-                                int64_t>(
-                                    available)));
+            std::min(
+                end - cursor,
+                ringCapacity_ - physical);
+
+        // Copy only the newly entering contiguous source segment into the CPU
+        // mirror and issue one matching contiguous WebGL transfer.
+        for (std::size_t i = 0;
+             i < count;
+             ++i) {
+            ring_[physical + i] =
+                notes[cursor + i];
+        }
 
         glBufferSubData(
             GL_ARRAY_BUFFER,
             static_cast<GLintptr>(
                 physical *
-                sizeof(RenderNote)),
+                sizeof(VisualNote)),
             static_cast<GLsizeiptr>(
                 count *
-                sizeof(RenderNote)),
-            ring_.data() +
-                physical);
+                sizeof(VisualNote)),
+            ring_.data() + physical);
 
-        cursor +=
-            static_cast<
-                int64_t>(
-                    count);
+        cursor += count;
     }
 
     glBindBuffer(
@@ -1735,165 +1392,144 @@ void GLRenderer::uploadCompletedRange(
         0);
 }
 
-void GLRenderer::rebuildOpenNotes()
+void GLRenderer::rebuildVisualCache(
+    std::size_t begin,
+    std::size_t end)
 {
-    if (!openDirty_)
-        return;
+    sourceBegin_ = begin;
+    sourceEnd_ = end;
 
-    openNotes_.clear();
+    ensureRingCapacity(
+        std::max<std::size_t>(
+            1,
+            sourceEnd_ -
+            sourceBegin_));
 
-    for (std::size_t state = 0;
-         state < TotalMidiStates;
-         ++state) {
-        if (activeCount_[state] == 0)
-            continue;
+    uploadSourceRange(
+        sourceBegin_,
+        sourceEnd_);
 
-        openNotes_.push_back({
-            activeStartTick_[state],
-            0,
-            activePackedData_[state]
-        });
-    }
-
-    openDirty_ = false;
+    forceCacheReset_ = false;
 }
 
-void GLRenderer::uploadOpenNotes()
-{
-    rebuildOpenNotes();
-
-    if (openNotes_.empty())
-        return;
-
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        openVbo_);
-
-    glBufferSubData(
-        GL_ARRAY_BUFFER,
-        0,
-        static_cast<GLsizeiptr>(
-            openNotes_.size() *
-            sizeof(RenderNote)),
-        openNotes_.data());
-
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        0);
-}
-
-void GLRenderer::sweepRange(
-    uint32_t fromTick,
-    uint32_t toTick)
+void GLRenderer::syncVisualCache(
+    uint32_t viewStart,
+    uint32_t viewEnd)
 {
     if (!document_ ||
-        document_->tickGroups.empty() ||
-        fromTick > toTick) {
+        document_->visualNotes.empty()) {
+        sourceBegin_ = 0;
+        sourceEnd_ = 0;
         return;
     }
 
-    reserveForSweep(
-        fromTick,
-        toTick);
+    const uint32_t span =
+        std::max<uint32_t>(
+            1,
+            viewEnd - viewStart);
 
-    const std::size_t firstGroup =
+    // This reproduces MPWGL2's _writeStrip search range for a full roll:
+    // lowerBound(stripStart - windowTicks - postTicks). With viewStart equal
+    // to stripStart and span=(window+post), this is viewStart-span.
+    const uint32_t searchStart =
+        viewStart > span
+            ? viewStart - span
+            : 0;
+
+    const std::size_t desiredBegin =
         document_->
-            lowerBoundGroup(
-                fromTick);
+            lowerBoundVisualStart(
+                double(searchStart));
 
-    const std::size_t lastGroup =
+    const std::size_t desiredEnd =
         document_->
-            upperBoundGroup(
-                toTick);
+            upperBoundVisualStart(
+                double(viewEnd));
 
-    const int64_t appendBegin =
-        head_;
+    const bool forwardCompatible =
+        !forceCacheReset_ &&
+        desiredBegin >= sourceBegin_ &&
+        desiredEnd >= sourceEnd_ &&
+        desiredBegin <= sourceEnd_;
 
-    for (std::size_t groupIndex =
-             firstGroup;
-         groupIndex < lastGroup;
-         ++groupIndex) {
-        const TickGroup& group =
-            document_->
-                tickGroups[
-                    groupIndex];
-
-        const std::size_t begin =
-            group.eventOffset;
-
-        const std::size_t end =
-            begin +
-            group.eventCount;
-
-        for (std::size_t eventIndex =
-                 begin;
-             eventIndex < end;
-             ++eventIndex) {
-            processEvent(
-                document_->
-                    events[
-                        eventIndex],
-                group.tick);
-        }
+    if (!forwardCompatible) {
+        rebuildVisualCache(
+            desiredBegin,
+            desiredEnd);
+        return;
     }
 
-    // Completed notes were appended in monotonically increasing NoteOff tick
-    // order, so the whole update is one/two contiguous WebGL transfers.
-    uploadCompletedRange(
-        appendBegin,
-        head_);
+    const std::size_t required =
+        desiredEnd - desiredBegin;
 
-    if (openDirty_)
-        uploadOpenNotes();
+    if (required > ringCapacity_) {
+        sourceBegin_ = desiredBegin;
+        sourceEnd_ = desiredEnd;
+        ensureRingCapacity(required);
+        // allocateRing() already re-uploaded the new source range.
+        forceCacheReset_ = false;
+        return;
+    }
+
+    if (desiredEnd > sourceEnd_) {
+        uploadSourceRange(
+            sourceEnd_,
+            desiredEnd);
+    }
+
+    sourceBegin_ = desiredBegin;
+    sourceEnd_ = desiredEnd;
 }
 
-void GLRenderer::advanceTail(
-    uint32_t viewStart)
+void GLRenderer::setInstanceBase(
+    std::size_t physicalIndex)
 {
-    if (ringCapacity_ == 0)
-        return;
+    const std::size_t base =
+        physicalIndex *
+        sizeof(VisualNote);
 
-    const int64_t safeTail =
-        head_ -
-        static_cast<
-            int64_t>(
-                ringCapacity_);
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        noteVbo_);
 
-    if (tail_ < safeTail)
-        tail_ = safeTail;
+    glVertexAttribIPointer(
+        0, 1,
+        GL_UNSIGNED_INT,
+        sizeof(VisualNote),
+        reinterpret_cast<void*>(
+            base +
+            offsetof(
+                VisualNote,
+                startTick)));
 
-    // Completed notes are appended at NoteOff time, therefore EndTick is
-    // monotonic. Tail culling is O(number actually discarded), with no scan
-    // across millions of retained instances.
-    while (tail_ < head_) {
-        const RenderNote& note =
-            ring_[
-                static_cast<
-                    std::size_t>(
-                        tail_) &
-                ringMask_];
+    glVertexAttribIPointer(
+        1, 1,
+        GL_UNSIGNED_INT,
+        sizeof(VisualNote),
+        reinterpret_cast<void*>(
+            base +
+            offsetof(
+                VisualNote,
+                endTick)));
 
-        if (note.endTick <
-            static_cast<int32_t>(
-                viewStart)) {
-            ++tail_;
-        } else {
-            break;
-        }
-    }
+    glVertexAttribIPointer(
+        2, 1,
+        GL_UNSIGNED_INT,
+        sizeof(VisualNote),
+        reinterpret_cast<void*>(
+            base +
+            offsetof(
+                VisualNote,
+                packedData)));
 }
 
 void GLRenderer::calculateView(
     uint32_t& currentTick,
     uint32_t& viewStart,
-    uint32_t& viewEnd,
-    uint32_t& sweepEnd) const
+    uint32_t& viewEnd) const
 {
     if (!document_) {
-        currentTick =
-            viewStart =
-            viewEnd =
-            sweepEnd = 0;
+        currentTick = viewStart = viewEnd = 0;
         return;
     }
 
@@ -1909,8 +1545,7 @@ void GLRenderer::calculateView(
 
     const double rightSeconds =
         std::min<double>(
-            document_->
-                durationSeconds,
+            document_->durationSeconds,
             double(currentTime_) +
             double(noteSpeed_));
 
@@ -1925,8 +1560,7 @@ void GLRenderer::calculateView(
                 double(
                     std::max<uint32_t>(
                         currentTick + 1,
-                        document_->
-                            maxTick))));
+                        document_->maxTick))));
 
     const double historySeconds =
         postBuffer_ > 0.0f
@@ -1953,55 +1587,7 @@ void GLRenderer::calculateView(
         std::max(
             viewStart + 1,
             rightTick);
-
-    // Unlike desktop SharpMIDI, WebGL has no persistent mapped VBO. Sweeping
-    // hidden lookahead notes only increases CPU/GPU work. The visible right
-    // edge is sufficient because the next frame appends only the new delta.
-    sweepEnd = viewEnd;
 }
-
-void GLRenderer::setCompletedInstanceBase(
-    std::size_t physicalIndex)
-{
-    const std::size_t base =
-        physicalIndex *
-        sizeof(RenderNote);
-
-    glBindBuffer(
-        GL_ARRAY_BUFFER,
-        completedVbo_);
-
-    glVertexAttribIPointer(
-        0, 1,
-        GL_INT,
-        sizeof(RenderNote),
-        reinterpret_cast<void*>(
-            base +
-            offsetof(
-                RenderNote,
-                startTick)));
-
-    glVertexAttribIPointer(
-        1, 1,
-        GL_INT,
-        sizeof(RenderNote),
-        reinterpret_cast<void*>(
-            base +
-            offsetof(
-                RenderNote,
-                endTick)));
-
-    glVertexAttribIPointer(
-        2, 1,
-        GL_UNSIGNED_INT,
-        sizeof(RenderNote),
-        reinterpret_cast<void*>(
-            base +
-            offsetof(
-                RenderNote,
-                packedData)));
-}
-
 void GLRenderer::renderRoll()
 {
     if (!initialized_ &&
@@ -2011,106 +1597,31 @@ void GLRenderer::renderRoll()
 
     glViewport(
         0, 0,
-        width_,
-        height_);
+        width_, height_);
 
     renderBackground();
 
     if (!document_ ||
-        document_->noteCount == 0 ||
-        document_->tickGroups.empty()) {
+        document_->visualNotes.empty()) {
         return;
     }
 
     uint32_t currentTick = 0;
     uint32_t viewStart = 0;
     uint32_t viewEnd = 0;
-    uint32_t sweepEnd = 0;
 
     calculateView(
         currentTick,
         viewStart,
-        viewEnd,
-        sweepEnd);
+        viewEnd);
 
-    const uint32_t viewSpan =
-        std::max<uint32_t>(
-            1,
-            viewEnd -
-            viewStart);
+    syncVisualCache(
+        viewStart,
+        viewEnd);
 
-    const bool incremental =
-        !forceSweepReset_ &&
-        lastSweepEnd_ >= 0 &&
-        sweepEnd >=
-            static_cast<uint32_t>(
-                lastSweepEnd_) &&
-        sweepEnd -
-            static_cast<uint32_t>(
-                lastSweepEnd_) <
-            viewSpan;
+    if (sourceEnd_ <= sourceBegin_)
+        return;
 
-    if (!incremental) {
-        head_ = 0;
-        tail_ = 0;
-
-        activeCount_.fill(0);
-        activeColor_.fill(0);
-        activeStartTick_.fill(0);
-        activePackedData_.fill(0);
-
-        openNotes_.clear();
-        openDirty_ = true;
-
-        const uint32_t lookbehind =
-            std::min(
-                viewStart,
-                std::max<uint32_t>(
-                    viewSpan,
-                    uint32_t(
-                        std::max<uint16_t>(
-                            1,
-                            document_->
-                                ticksPerBeat)) *
-                    16u));
-
-        const uint32_t sweepStart =
-            viewStart -
-            lookbehind;
-
-        reserveForSweep(
-            sweepStart,
-            sweepEnd);
-
-        sweepRange(
-            sweepStart,
-            sweepEnd);
-    } else if (
-        sweepEnd >
-        static_cast<uint32_t>(
-            lastSweepEnd_)) {
-        sweepRange(
-            static_cast<uint32_t>(
-                lastSweepEnd_) +
-            1u,
-            sweepEnd);
-    }
-
-    lastSweepEnd_ =
-        static_cast<int64_t>(
-            sweepEnd);
-
-    lastViewSpan_ = viewSpan;
-    forceSweepReset_ = false;
-
-    advanceTail(viewStart);
-
-    if (openDirty_)
-        uploadOpenNotes();
-
-    // Keep the note pipeline independent of a depth attachment. Qt/WASM's
-    // QQuickFramebufferObject composition is reliable with a color-only FBO;
-    // depth is an optional future optimization, not a rendering requirement.
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -2132,24 +1643,30 @@ void GLRenderer::renderRoll()
         static_cast<float>(
             currentTick));
 
+    glUniform1f(
+        viewportWidthUniform_,
+        static_cast<float>(
+            std::max(1, width_)));
+
+    glUniform1i(
+        perTrackUniform_,
+        perTrackColors_ ? 1 : 0);
+
     if (paletteDirty_) {
         GLfloat palette[16 * 3];
 
         for (int i = 0;
              i < 16;
              ++i) {
-            palette[
-                i * 3 + 0] =
+            palette[i * 3 + 0] =
                 channelColors_[i][0] /
                 255.0f;
 
-            palette[
-                i * 3 + 1] =
+            palette[i * 3 + 1] =
                 channelColors_[i][1] /
                 255.0f;
 
-            palette[
-                i * 3 + 2] =
+            palette[i * 3 + 2] =
                 channelColors_[i][2] /
                 255.0f;
         }
@@ -2162,73 +1679,49 @@ void GLRenderer::renderRoll()
         paletteDirty_ = false;
     }
 
-    const int64_t completed64 =
-        std::max<int64_t>(
-            0,
-            head_ -
-            tail_);
+    const std::size_t count =
+        sourceEnd_ -
+        sourceBegin_;
 
-    if (completed64 > 0 &&
-        ringCapacity_ != 0) {
-        const std::size_t completed =
-            static_cast<std::size_t>(
-                std::min<int64_t>(
-                    completed64,
-                    static_cast<int64_t>(
-                        ringCapacity_)));
+    const std::size_t physical =
+        sourceBegin_ &
+        ringMask_;
 
-        const std::size_t start =
-            static_cast<std::size_t>(
-                tail_) &
-            ringMask_;
+    const std::size_t first =
+        std::min(
+            count,
+            ringCapacity_ -
+            physical);
 
-        const std::size_t first =
-            std::min(
-                completed,
-                ringCapacity_ -
-                start);
+    const std::size_t second =
+        count - first;
 
-        const std::size_t second =
-            completed - first;
+    glBindVertexArray(
+        noteVao_);
 
-        glBindVertexArray(
-            completedVao_);
-
-        if (first != 0) {
-            setCompletedInstanceBase(
-                start);
-
-            glDrawArraysInstanced(
-                GL_TRIANGLE_STRIP,
-                0,
-                4,
-                static_cast<GLsizei>(
-                    first));
-        }
-
-        if (second != 0) {
-            setCompletedInstanceBase(
-                0);
-
-            glDrawArraysInstanced(
-                GL_TRIANGLE_STRIP,
-                0,
-                4,
-                static_cast<GLsizei>(
-                    second));
-        }
-    }
-
-    if (!openNotes_.empty()) {
-        glBindVertexArray(
-            openVao_);
+    // Draw in exact source/start order. This is the key MPWGL2 parity rule:
+    // later-starting notes overwrite earlier notes where they overlap.
+    if (first != 0) {
+        setInstanceBase(
+            physical);
 
         glDrawArraysInstanced(
             GL_TRIANGLE_STRIP,
             0,
             4,
             static_cast<GLsizei>(
-                openNotes_.size()));
+                first));
+    }
+
+    if (second != 0) {
+        setInstanceBase(0);
+
+        glDrawArraysInstanced(
+            GL_TRIANGLE_STRIP,
+            0,
+            4,
+            static_cast<GLsizei>(
+                second));
     }
 
     glBindVertexArray(0);

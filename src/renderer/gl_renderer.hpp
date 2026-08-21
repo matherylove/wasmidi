@@ -34,14 +34,6 @@ public:
     void renderRoll();
 
 private:
-    struct RenderNote {
-        int32_t startTick = 0;
-        int32_t endTick = 0;
-        uint32_t packedData = 0;
-    };
-    static_assert(sizeof(RenderNote) == 12,
-                  "RenderNote must remain 12 bytes");
-
     struct NeuralNode {
         float x = 0.0f;
         float y = 0.0f;
@@ -73,35 +65,15 @@ private:
     void renderBackground();
 
     void allocateRing(std::size_t capacity);
-    void ensureRingSpace();
-    void reserveForSweep(uint32_t fromTick, uint32_t toTick);
-    void resetSweep();
+    void ensureRingCapacity(std::size_t required);
+    void uploadSourceRange(std::size_t begin, std::size_t end);
+    void rebuildVisualCache(std::size_t begin, std::size_t end);
+    void syncVisualCache(uint32_t viewStart, uint32_t viewEnd);
+    void setInstanceBase(std::size_t physicalIndex);
 
-    void sweepRange(uint32_t fromTick, uint32_t toTick);
-    void processEvent(const CompactEvent& event, uint32_t tick);
-    void beginActiveNote(std::size_t stateIndex,
-                         uint32_t tick,
-                         uint8_t pitch,
-                         uint8_t velocity,
-                         uint8_t color);
-    void finishActiveNote(std::size_t stateIndex, uint32_t tick);
-    void appendCompleted(int32_t startTick,
-                         int32_t endTick,
-                         uint32_t packedData);
-
-    void uploadCompletedRange(int64_t begin, int64_t end);
-    void rebuildOpenNotes();
-    void uploadOpenNotes();
-
-    void setCompletedInstanceBase(std::size_t physicalIndex);
-
-    void advanceTail(uint32_t viewStart);
     void calculateView(uint32_t& currentTick,
                        uint32_t& viewStart,
-                       uint32_t& viewEnd,
-                       uint32_t& sweepEnd) const;
-
-    uint8_t eventColor(const CompactEvent& event) const;
+                       uint32_t& viewEnd) const;
 
     int width_ = 1;
     int height_ = 1;
@@ -119,18 +91,17 @@ private:
 
     bool initialized_ = false;
     bool paletteDirty_ = true;
-    bool forceSweepReset_ = true;
-    bool openDirty_ = true;
+    bool forceCacheReset_ = true;
 
     GLuint noteProgram_ = 0;
-    GLuint completedVao_ = 0;
-    GLuint completedVbo_ = 0;
-    GLuint openVao_ = 0;
-    GLuint openVbo_ = 0;
+    GLuint noteVao_ = 0;
+    GLuint noteVbo_ = 0;
 
     GLint viewStartUniform_ = -1;
     GLint viewEndUniform_ = -1;
     GLint currentTickUniform_ = -1;
+    GLint viewportWidthUniform_ = -1;
+    GLint perTrackUniform_ = -1;
     GLint paletteUniform_ = -1;
 
     GLuint backgroundProgram_ = 0;
@@ -150,22 +121,15 @@ private:
     std::array<std::array<uint8_t, 4>, 16>
         channelColors_{};
 
-    std::vector<RenderNote> ring_;
+    // CPU mirror of only the cached start-ordered visual range.
+    std::vector<VisualNote> ring_;
     std::size_t ringCapacity_ = 0;
     std::size_t ringMask_ = 0;
 
-    int64_t head_ = 0;
-    int64_t tail_ = 0;
-
-    // The visual merge state is bounded to MIDI's 16*128 channel/pitch states.
-    // Open notes live here, not in the completed-note VBO, so NoteOff never
-    // requires a random glBufferSubData update.
-    std::array<uint32_t, 16 * 128> activeCount_{};
-    std::array<uint8_t, 16 * 128> activeColor_{};
-    std::array<int32_t, 16 * 128> activeStartTick_{};
-    std::array<uint32_t, 16 * 128> activePackedData_{};
-
-    std::vector<RenderNote> openNotes_;
+    // Absolute source indices into MidiDocument::visualNotes. Physical VBO
+    // location is sourceIndex & ringMask_. This preserves source/draw order.
+    std::size_t sourceBegin_ = 0;
+    std::size_t sourceEnd_ = 0;
 
     std::array<NeuralNode, 95> neuralNodes_{};
     std::vector<NeuralLineVertex> neuralLines_;
@@ -173,9 +137,6 @@ private:
 
     std::chrono::steady_clock::time_point neuralClock_ =
         std::chrono::steady_clock::now();
-
-    int64_t lastSweepEnd_ = -1;
-    uint32_t lastViewSpan_ = 0;
 };
 
 } // namespace wasmidi

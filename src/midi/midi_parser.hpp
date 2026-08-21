@@ -17,6 +17,24 @@ struct CompactEvent {
 };
 static_assert(sizeof(CompactEvent) == 4, "CompactEvent must stay packed to 4 bytes");
 
+// Exact MPWGL2 visual note representation.
+//
+// Notes are stored in NoteOn/start order (stable across equal start ticks).
+// This is important: MPWGL2 paints its start-sorted note buffer sequentially,
+// so later-starting notes overwrite earlier notes where they overlap.
+//
+// packedData:
+//   bits  0..7  velocity
+//   bits  8..15 pitch
+//   bits 16..19 global/channel color slot
+//   bits 20..23 per-track color slot
+struct VisualNote {
+    uint32_t startTick = 0;
+    uint32_t endTick = 0;
+    uint32_t packedData = 0;
+};
+static_assert(sizeof(VisualNote) == 12, "VisualNote must stay 12 bytes");
+
 // Sparse timing index. There is one entry only for ticks that contain
 // channel events, rather than allocating maxTick+1 entries.
 struct TickGroup {
@@ -53,9 +71,14 @@ struct MidiDocument {
     uint8_t maxPitch = 0;
     bool hasPitch = false;
 
-    // Single authoritative event stream, already ordered by tick.
+    // Single authoritative playback/control stream, already ordered by tick.
     std::vector<CompactEvent> events;
     std::vector<TickGroup> tickGroups;
+
+    // Dedicated immutable visual stream. Unlike the previous runtime
+    // channel+pitch merger, every NoteOn remains an independent note exactly
+    // as in MPWGL2. It is already sorted by startTick, so rendering never sorts.
+    std::vector<VisualNote> visualNotes;
 
     std::vector<TempoChange> tempoMap;
     // Seconds corresponding to tempoMap[i].tick. Tiny compared with MIDI data
@@ -73,10 +96,22 @@ struct MidiDocument {
     // First group with tick > value.
     std::size_t upperBoundGroup(uint32_t tick) const;
 
+    // Binary search in the start-ordered visual stream. Double tick values are
+    // intentional: secondsToTick() is fractional between real MIDI ticks and
+    // this preserves MPWGL2's exact [time-window] boundary semantics.
+    std::size_t lowerBoundVisualStart(double tick) const;
+    std::size_t upperBoundVisualStart(double tick) const;
+
     uint8_t colorIndex(const CompactEvent& event, bool perTrack) const {
         return perTrack
             ? static_cast<uint8_t>((event.color >> 4) & 0x0f)
             : static_cast<uint8_t>(event.color & 0x0f);
+    }
+
+    uint8_t visualColorIndex(const VisualNote& note, bool perTrack) const {
+        return perTrack
+            ? static_cast<uint8_t>((note.packedData >> 20) & 0x0f)
+            : static_cast<uint8_t>((note.packedData >> 16) & 0x0f);
     }
 };
 

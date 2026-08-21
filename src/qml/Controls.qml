@@ -10,14 +10,6 @@ Item {
     signal colorRequested(int channel)
 
     property var postValues: [-1, 0.0, 0.1, 0.5, 1.0, 2.0]
-    property int chartTick: 0
-
-    Timer {
-        interval: 33
-        running: root.visible && root.mainWindow.hasMidi
-        repeat: true
-        onTriggered: root.chartTick++
-    }
 
     component SectionLabel: Text {
         color: "#6f6685"
@@ -111,13 +103,37 @@ Item {
         color: "#0d0b1d"
         border.color: "#241b3b"
         border.width: 1
+
         Column {
             anchors.fill: parent
             anchors.leftMargin: 7
+            anchors.rightMargin: 5
             anchors.topMargin: 4
             spacing: 0
-            Text { text: parent.parent.label; color: "#5d5470"; font.pixelSize: 7; font.bold: true; font.letterSpacing: 0.7 }
-            Text { text: parent.parent.value; color: "#c4b5fd"; font.pixelSize: 14; font.bold: true }
+
+            Text {
+                width: parent.width
+                text: parent.parent.label
+                color: "#5d5470"
+                font.pixelSize: 7
+                font.bold: true
+                font.letterSpacing: 0.7
+                wrapMode: Text.NoWrap
+            }
+
+            Text {
+                width: parent.width
+                height: 18
+                text: parent.parent.value
+                color: "#c4b5fd"
+                font.pixelSize: 14
+                minimumPixelSize: 7
+                fontSizeMode: Text.HorizontalFit
+                font.bold: true
+                wrapMode: Text.NoWrap
+                horizontalAlignment: Text.AlignLeft
+                verticalAlignment: Text.AlignVCenter
+            }
         }
     }
 
@@ -148,23 +164,26 @@ Item {
         Component.onCompleted: resetHistory()
         onRevisionChanged: resetHistory()
 
-        property int sharedTick: root.chartTick
+        // MPWGL2 uses _HIST_RATE = 1000/30. Keep the same 30 Hz sample
+        // cadence while repainting on the display cadence below.
+        Timer {
+            interval: 33
+            running: chartBox.visible && root.mainWindow.hasMidi
+            repeat: true
+            onTriggered: {
+                if (chartBox.samples.length !== chartBox.historyLength)
+                    chartBox.resetHistory()
+                chartBox.samples[chartBox.sampleIndex] = Number(chartBox.value)
+                chartBox.sampleIndex = (chartBox.sampleIndex + 1) % chartBox.historyLength
+            }
+        }
 
-        onSharedTickChanged: {
-            if (!chartBox.visible || !root.mainWindow.hasMidi)
-                return
-
-            if (chartBox.samples.length !== chartBox.historyLength)
-                chartBox.resetHistory()
-
-            chartBox.samples[chartBox.sampleIndex] =
-                Number(chartBox.value)
-
-            chartBox.sampleIndex =
-                (chartBox.sampleIndex + 1) %
-                chartBox.historyLength
-
-            spark.requestPaint()
+        // The legacy _glLoop draws the charts every requestAnimationFrame.
+        Timer {
+            interval: 16
+            running: chartBox.visible
+            repeat: true
+            onTriggered: spark.requestPaint()
         }
 
         Canvas {
@@ -233,10 +252,15 @@ Item {
             anchors.top: parent.top
             anchors.rightMargin: 7
             anchors.topMargin: 4
+            width: Math.max(38, parent.width * 0.48)
             text: Math.round(chartBox.value).toLocaleString()
             color: chartBox.title === "Skipped vel" ? "#fb7185" : chartBox.accent
             font.pixelSize: 9
+            minimumPixelSize: 6
+            fontSizeMode: Text.HorizontalFit
             font.bold: true
+            wrapMode: Text.NoWrap
+            horizontalAlignment: Text.AlignRight
         }
     }
 
@@ -249,10 +273,11 @@ Item {
         border.color: "#211a35"
         border.width: 1
 
-        property int sharedTick: root.chartTick
-        onSharedTickChanged: {
-            if (timelineBox.visible)
-                timeline.requestPaint()
+        Timer {
+            interval: 16
+            running: timelineBox.visible
+            repeat: true
+            onTriggered: timeline.requestPaint()
         }
 
         Canvas {
@@ -331,10 +356,15 @@ Item {
             anchors.top: parent.top
             anchors.rightMargin: 7
             anchors.topMargin: 4
+            width: Math.max(38, parent.width * 0.48)
             text: root.mainWindow.nps.toLocaleString()
             color: "#818cf8"
             font.pixelSize: 9
+            minimumPixelSize: 6
+            fontSizeMode: Text.HorizontalFit
             font.bold: true
+            wrapMode: Text.NoWrap
+            horizontalAlignment: Text.AlignRight
         }
     }
 

@@ -593,125 +593,119 @@ void MainWindow::rebuildDerivedStats()
             npsTimeline_.push_back(value);
     }
 
-    // Exact one-second peak-NPS using a sliding TickGroup window.
-    std::size_t left = 0;
-    uint64_t rollingNotes = 0;
+    // MPWGL2 peak NPS samples every 0.1 s and counts starts in [t-1,t].
+    // Use the exact same cadence/bounds over the immutable visual note stream.
+    for (double t = 0.0;
+         t <= double(duration_) + 0.000001;
+         t += 0.1) {
+        const double hiTick =
+            document_.secondsToTick(t);
 
-    for (std::size_t right = 0;
-         right < document_.tickGroups.size();
-         ++right) {
-        const auto& group =
-            document_.tickGroups[right];
+        const double loTick =
+            document_.secondsToTick(
+                std::max(
+                    0.0,
+                    t - 1.0));
 
-        rollingNotes +=
-            group.noteOnCount;
+        const std::size_t lo =
+            document_.lowerBoundVisualStart(
+                loTick);
 
-        const double rightSeconds =
-            document_.tickToSeconds(
-                group.tick);
+        const std::size_t hi =
+            document_.upperBoundVisualStart(
+                hiTick);
 
-        while (left <= right) {
-            const double leftSeconds =
-                document_.tickToSeconds(
-                    document_.tickGroups[left].tick);
+        const uint64_t count =
+            hi >= lo
+                ? uint64_t(hi - lo)
+                : 0u;
 
-            if (leftSeconds >=
-                rightSeconds - 1.0) {
-                break;
-            }
-
-            rollingNotes -=
-                document_.tickGroups[left]
-                    .noteOnCount;
-
-            ++left;
-        }
-
-        if (rollingNotes >
+        if (count >
             static_cast<uint64_t>(
                 peakNps_)) {
             peakNps_ =
                 static_cast<int>(
                     std::min<uint64_t>(
-                        rollingNotes,
+                        count,
                         uint64_t(
                             std::numeric_limits<int>::max())));
 
             peakNpsTime_ =
-                static_cast<float>(
-                    rightSeconds);
+                static_cast<float>(t);
         }
     }
 
-    // Exact peak polyphony from the compact event stream. No 2x Edge vector,
-    // no global note sort and no sampling.
-    std::array<uint32_t, 16 * 128>
-        activeStates{};
+    // MPWGL2 samples very large files for peak-poly calculation.
+    // Preserve that behavior, but use the independent VisualNote pairs so
+    // repeated/overlapping same-key notes are not merged.
+    struct PolyEdge {
+        uint32_t tick = 0;
+        int8_t direction = 0;
+    };
 
-    int64_t active = 0;
-    int64_t peak = 0;
+    constexpr std::size_t MaxPeakNotes =
+        400000;
 
-    for (const auto& group :
-         document_.tickGroups) {
-        const std::size_t begin =
-            group.eventOffset;
+    const std::size_t visualCount =
+        document_.visualNotes.size();
 
-        const std::size_t end =
-            begin + group.eventCount;
+    const std::size_t stride =
+        visualCount > MaxPeakNotes
+            ? static_cast<std::size_t>(
+                std::ceil(
+                    double(visualCount) /
+                    double(MaxPeakNotes)))
+            : 1;
 
-        // Match the old dirs[b]-dirs[a] edge ordering: all NoteOns at this
-        // exact tick contribute before any NoteOff at the same tick.
-        for (std::size_t i = begin;
-             i < end;
-             ++i) {
-            const auto& event =
-                document_.events[i];
+    std::vector<PolyEdge> edges;
 
-            if ((event.status & 0xf0) != 0x90 ||
-                event.data2 == 0) {
-                continue;
-            }
+    edges.reserve(
+        (visualCount /
+         std::max<std::size_t>(
+             1,
+             stride) + 1) *
+        2);
 
-            const std::size_t state =
-                std::size_t(
-                    event.status & 0x0f) *
-                128u +
-                std::size_t(
-                    event.data1 & 0x7f);
+    for (std::size_t i = 0;
+         i < visualCount;
+         i += stride) {
+        const auto& note =
+            document_.visualNotes[i];
 
-            ++activeStates[state];
-            ++active;
-            peak = std::max(peak, active);
-        }
+        edges.push_back({
+            note.startTick,
+            +1
+        });
 
-        for (std::size_t i = begin;
-             i < end;
-             ++i) {
-            const auto& event =
-                document_.events[i];
-
-            if ((event.status & 0xf0) != 0x80)
-                continue;
-
-            const std::size_t state =
-                std::size_t(
-                    event.status & 0x0f) *
-                128u +
-                std::size_t(
-                    event.data1 & 0x7f);
-
-            if (activeStates[state] != 0) {
-                --activeStates[state];
-                --active;
-            }
-        }
+        edges.push_back({
+            note.endTick,
+            -1
+        });
     }
 
-    peakPolyphony_ =
-        static_cast<int>(
-            std::min<int64_t>(
-                peak,
-                std::numeric_limits<int>::max()));
+    std::sort(
+        edges.begin(),
+        edges.end(),
+        [](const PolyEdge& a,
+           const PolyEdge& b) {
+            if (a.tick != b.tick)
+                return a.tick < b.tick;
+
+            // Same as MPWGL2: NoteOns before NoteOffs at equal time.
+            return a.direction >
+                   b.direction;
+        });
+
+    int active = 0;
+
+    for (const auto& edge : edges) {
+        active += edge.direction;
+
+        peakPolyphony_ =
+            std::max(
+                peakPolyphony_,
+                active);
+    }
 
     emit bpmChanged();
     emit peakNpsChanged();
@@ -1325,15 +1319,26 @@ void MainWindow::updateLiveStats()
                     document_.secondsToTick(
                         time))));
 
-    const uint32_t npsStartTick =
-        static_cast<uint32_t>(
+    // MPWGL2 live NPS is exactly:
+    // (upperBound(startArr,t) - lowerBound(startArr,t-0.25)) * 4.
+    // visualNotes is the same stable start-ordered note stream, so perform the
+    // identical binary searches in fractional tick space.
+    const double currentVisualTick =
+        document_.secondsToTick(time);
+
+    const double npsStartVisualTick =
+        document_.secondsToTick(
             std::max(
                 0.0,
-                std::floor(
-                    document_.secondsToTick(
-                        std::max(
-                            0.0,
-                            time - 0.25)))));
+                time - 0.25));
+
+    const std::size_t exactNpsLo =
+        document_.lowerBoundVisualStart(
+            npsStartVisualTick);
+
+    const std::size_t exactNpsHi =
+        document_.upperBoundVisualStart(
+            currentVisualTick);
 
     const uint32_t ccStartTick =
         static_cast<uint32_t>(
@@ -1349,10 +1354,6 @@ void MainWindow::updateLiveStats()
         document_.upperBoundGroup(
             currentTick);
 
-    const std::size_t targetNpsLo =
-        document_.lowerBoundGroup(
-            npsStartTick);
-
     const std::size_t targetCcLo =
         document_.lowerBoundGroup(
             ccStartTick);
@@ -1366,14 +1367,6 @@ void MainWindow::updateLiveStats()
         liveNpsCount_ = 0;
         liveCcCount_ = 0;
 
-        for (std::size_t i = targetNpsLo;
-             i < targetHi;
-             ++i) {
-            liveNpsCount_ +=
-                document_.tickGroups[i]
-                    .noteOnCount;
-        }
-
         for (std::size_t i = targetCcLo;
              i < targetHi;
              ++i) {
@@ -1383,7 +1376,7 @@ void MainWindow::updateLiveStats()
         }
 
         liveHi_ = targetHi;
-        liveNpsLo_ = targetNpsLo;
+        liveNpsLo_ = 0;
         liveCcLo_ = targetCcLo;
         liveWindowsValid_ = true;
     } else {
@@ -1391,25 +1384,11 @@ void MainWindow::updateLiveStats()
             const auto& group =
                 document_.tickGroups[liveHi_];
 
-            liveNpsCount_ +=
-                group.noteOnCount;
-
             liveCcCount_ +=
                 group.controlCount;
 
             ++liveHi_;
         }
-
-        while (liveNpsLo_ < targetNpsLo &&
-               liveNpsLo_ < liveHi_) {
-            liveNpsCount_ -=
-                document_.tickGroups[
-                    liveNpsLo_]
-                    .noteOnCount;
-
-            ++liveNpsLo_;
-        }
-
         while (liveCcLo_ < targetCcLo &&
                liveCcLo_ < liveHi_) {
             liveCcCount_ -=
@@ -1427,10 +1406,17 @@ void MainWindow::updateLiveStats()
     syncVisualState(
         currentTick);
 
+    const uint64_t exactNpsCount =
+        exactNpsHi >= exactNpsLo
+            ? uint64_t(
+                exactNpsHi -
+                exactNpsLo)
+            : 0u;
+
     const int newNps =
         static_cast<int>(
             std::min<uint64_t>(
-                liveNpsCount_ * 4u,
+                exactNpsCount * 4u,
                 uint64_t(
                     std::numeric_limits<int>::max())));
 

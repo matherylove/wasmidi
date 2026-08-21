@@ -494,6 +494,7 @@ bool parseTrackEvents(
     const std::array<uint8_t, 16>& globalColors,
     const std::vector<std::array<uint8_t, 16>>& trackColors,
     std::vector<uint32_t>& writeCursors,
+    std::vector<uint16_t>& eventTracks,
     MidiDocument& output)
 {
     const uint8_t* p = track.data;
@@ -614,9 +615,354 @@ bool parseTrackEvents(
                 globalColor |
                 (trackColor << 4))
         };
+
+        eventTracks[position] =
+            static_cast<uint16_t>(
+                trackIndex);
     }
 
     return ok;
+}
+
+constexpr uint32_t VisualNoIndex = 0xffffffffu;
+constexpr uint32_t VisualHashSize = 65536u;
+constexpr uint32_t VisualHashMask = VisualHashSize - 1u;
+
+struct VisualPendingKey {
+    uint32_t key = 0;
+    uint32_t head = VisualNoIndex;
+    uint32_t tail = VisualNoIndex;
+    uint32_t nextHash = VisualNoIndex;
+};
+
+uint32_t visualKeyHash(uint32_t key)
+{
+    // Multiplicative hash; the fixed table keeps load-time allocation stable.
+    return (key * 2654435761u) & VisualHashMask;
+}
+
+uint32_t findOrCreateVisualPendingKey(
+    uint32_t key,
+    std::array<uint32_t, VisualHashSize>& buckets,
+    std::vector<VisualPendingKey>& keys)
+{
+    const uint32_t bucket =
+        visualKeyHash(key);
+
+    uint32_t index =
+        buckets[bucket];
+
+    while (index != VisualNoIndex) {
+        if (keys[index].key == key)
+            return index;
+
+        index =
+            keys[index].nextHash;
+    }
+
+    const uint32_t newIndex =
+        static_cast<uint32_t>(
+            keys.size());
+
+    VisualPendingKey pending;
+    pending.key = key;
+    pending.nextHash =
+        buckets[bucket];
+
+    keys.push_back(pending);
+    buckets[bucket] = newIndex;
+
+    return newIndex;
+}
+
+uint32_t minimumEndTick(
+    const MidiDocument& output,
+    uint32_t startTick)
+{
+    const double minEndSeconds =
+        output.tickToSeconds(startTick) +
+        0.015;
+
+    const double endTick =
+        std::ceil(
+            output.secondsToTick(
+                minEndSeconds));
+
+    return static_cast<uint32_t>(
+        std::clamp<double>(
+            endTick,
+            double(startTick + 1u),
+            double(
+                std::numeric_limits<uint32_t>::max())));
+}
+
+void buildVisualNotes(
+    MidiDocument& output,
+    const std::vector<uint16_t>& eventTracks,
+    const std::vector<TrackScan>& scans)
+{
+    output.visualNotes.clear();
+    output.visualNotes.reserve(
+        static_cast<std::size_t>(
+            output.noteCount));
+
+    std::array<uint32_t, VisualHashSize>
+        buckets;
+
+    buckets.fill(
+        VisualNoIndex);
+
+    std::vector<VisualPendingKey>
+        pendingKeys;
+
+    pendingKeys.reserve(
+        std::min<std::size_t>(
+            static_cast<std::size_t>(
+                output.noteCount),
+            65536u));
+
+    // MPWGL2 per-track colors are assigned by first appearance in the final
+    // start-sorted note stream, not merely by track/channel mask order.
+    std::array<uint32_t, VisualHashSize>
+        colorBuckets;
+
+    colorBuckets.fill(
+        VisualNoIndex);
+
+    struct ColorKey {
+        uint32_t key = 0;
+        uint32_t nextHash = VisualNoIndex;
+        uint8_t color = 0;
+    };
+
+    std::vector<ColorKey> colorKeys;
+    colorKeys.reserve(256);
+
+    uint32_t nextPerTrackColor = 0;
+
+    auto getPerTrackColor =
+        [&](uint16_t track,
+            uint8_t channel,
+            bool create) -> uint8_t {
+            const uint32_t key =
+                uint32_t(track) * 16u +
+                uint32_t(channel & 15u);
+
+            const uint32_t bucket =
+                visualKeyHash(key);
+
+            uint32_t index =
+                colorBuckets[bucket];
+
+            while (index != VisualNoIndex) {
+                if (colorKeys[index].key == key)
+                    return colorKeys[index].color;
+
+                index =
+                    colorKeys[index].nextHash;
+            }
+
+            if (!create)
+                return channel & 15u;
+
+            const uint32_t newIndex =
+                static_cast<uint32_t>(
+                    colorKeys.size());
+
+            ColorKey entry;
+            entry.key = key;
+            entry.color =
+                static_cast<uint8_t>(
+                    nextPerTrackColor++ &
+                    15u);
+
+            entry.nextHash =
+                colorBuckets[bucket];
+
+            colorKeys.push_back(entry);
+            colorBuckets[bucket] =
+                newIndex;
+
+            return entry.color;
+        };
+
+    for (const TickGroup& group :
+         output.tickGroups) {
+        const std::size_t begin =
+            group.eventOffset;
+
+        const std::size_t end =
+            begin + group.eventCount;
+
+        for (std::size_t eventIndex =
+                 begin;
+             eventIndex < end;
+             ++eventIndex) {
+            CompactEvent& event =
+                output.events[eventIndex];
+
+            const uint8_t command =
+                event.status & 0xf0;
+
+            if (command != 0x90 &&
+                command != 0x80) {
+                continue;
+            }
+
+            const uint8_t channel =
+                event.status & 0x0f;
+
+            const uint8_t pitch =
+                event.data1 & 0x7f;
+
+            const uint16_t track =
+                eventTracks[eventIndex];
+
+            const bool noteOn =
+                command == 0x90 &&
+                event.data2 != 0;
+
+            const uint8_t perTrackColor =
+                getPerTrackColor(
+                    track,
+                    channel,
+                    noteOn);
+
+            // Keep the compact runtime stream's per-track color nibble in sync
+            // with MPWGL2's first-note-appearance color ordering.
+            event.color =
+                static_cast<uint8_t>(
+                    (event.color & 0x0f) |
+                    ((perTrackColor & 0x0f) << 4));
+
+            const uint32_t key =
+                (uint32_t(track) << 11) |
+                (uint32_t(channel) << 7) |
+                uint32_t(pitch);
+
+            const uint32_t pendingIndex =
+                findOrCreateVisualPendingKey(
+                    key,
+                    buckets,
+                    pendingKeys);
+
+            VisualPendingKey& queue =
+                pendingKeys[pendingIndex];
+
+            if (noteOn) {
+                const uint32_t noteIndex =
+                    static_cast<uint32_t>(
+                        output.visualNotes.size());
+
+                // endTick is temporarily the FIFO next pointer. It is replaced
+                // with the actual NoteOff tick when the note closes.
+                output.visualNotes.push_back({
+                    group.tick,
+                    VisualNoIndex,
+                    uint32_t(event.data2) |
+                    (uint32_t(pitch) << 8) |
+                    (uint32_t(
+                        event.color &
+                        0x0f) << 16) |
+                    (uint32_t(
+                        perTrackColor &
+                        0x0f) << 20)
+                });
+
+                if (queue.tail !=
+                    VisualNoIndex) {
+                    output.visualNotes[
+                        queue.tail]
+                        .endTick =
+                            noteIndex;
+                } else {
+                    queue.head =
+                        noteIndex;
+                }
+
+                queue.tail =
+                    noteIndex;
+
+                continue;
+            }
+
+            if (queue.head ==
+                VisualNoIndex) {
+                continue;
+            }
+
+            const uint32_t noteIndex =
+                queue.head;
+
+            const uint32_t next =
+                output.visualNotes[
+                    noteIndex]
+                    .endTick;
+
+            queue.head = next;
+
+            if (next ==
+                VisualNoIndex) {
+                queue.tail =
+                    VisualNoIndex;
+            }
+
+            VisualNote& note =
+                output.visualNotes[
+                    noteIndex];
+
+            note.endTick =
+                group.tick >
+                    note.startTick
+                ? group.tick
+                : minimumEndTick(
+                    output,
+                    note.startTick);
+        }
+    }
+
+    // MPWGL2 closes orphan NoteOns at that track's EndOfTrack, not at the
+    // global file end. Flush every remaining FIFO with the same rule.
+    for (const VisualPendingKey& queueInfo :
+         pendingKeys) {
+        uint32_t noteIndex =
+            queueInfo.head;
+
+        const uint16_t track =
+            static_cast<uint16_t>(
+                queueInfo.key >> 11);
+
+        const uint32_t trackEnd =
+            track < scans.size()
+                ? scans[track].maxTick
+                : output.maxTick;
+
+        while (noteIndex !=
+               VisualNoIndex) {
+            VisualNote& note =
+                output.visualNotes[
+                    noteIndex];
+
+            const uint32_t next =
+                note.endTick;
+
+            note.endTick =
+                trackEnd >
+                    note.startTick
+                ? trackEnd
+                : minimumEndTick(
+                    output,
+                    note.startTick);
+
+            noteIndex = next;
+        }
+    }
+
+    // The source event stream is globally tick ordered and events at equal
+    // ticks were written track-by-track. Therefore visualNotes is already in
+    // the same stable start order produced by MPWGL2's final sort.
+    output.noteCount =
+        output.visualNotes.size();
 }
 
 } // namespace
@@ -733,6 +1079,32 @@ std::size_t MidiDocument::upperBoundGroup(uint32_t tick) const
                 return value < group.tick;
             }) -
         tickGroups.begin());
+}
+
+std::size_t MidiDocument::lowerBoundVisualStart(double tick) const
+{
+    return static_cast<std::size_t>(
+        std::lower_bound(
+            visualNotes.begin(),
+            visualNotes.end(),
+            tick,
+            [](const VisualNote& note, double value) {
+                return double(note.startTick) < value;
+            }) -
+        visualNotes.begin());
+}
+
+std::size_t MidiDocument::upperBoundVisualStart(double tick) const
+{
+    return static_cast<std::size_t>(
+        std::upper_bound(
+            visualNotes.begin(),
+            visualNotes.end(),
+            tick,
+            [](double value, const VisualNote& note) {
+                return value < double(note.startTick);
+            }) -
+        visualNotes.begin());
 }
 
 bool MidiParser::parse(
@@ -896,6 +1268,12 @@ bool MidiParser::parse(
     output.events.resize(
         static_cast<std::size_t>(totalEvents));
 
+    // Temporary only during load. Track identity is required to reproduce
+    // MPWGL2's exact (track,channel,pitch) FIFO pairing. It is discarded once
+    // immutable visualNotes have been built.
+    std::vector<uint16_t> eventTracks(
+        static_cast<std::size_t>(totalEvents));
+
     std::array<uint8_t, 16> globalColors{};
     std::vector<std::array<uint8_t, 16>>
         trackColors;
@@ -926,6 +1304,7 @@ bool MidiParser::parse(
                 globalColors,
                 trackColors,
                 writeCursors,
+                eventTracks,
                 output)) {
             errorMessage_ =
                 "Malformed MIDI event data";
@@ -933,6 +1312,16 @@ bool MidiParser::parse(
             return false;
         }
     }
+
+    buildVisualNotes(
+        output,
+        eventTracks,
+        scans);
+
+    // Free the temporary 2-byte/event track side-buffer before returning the
+    // document to Qt; steady-state RAM remains compact.
+    eventTracks.clear();
+    eventTracks.shrink_to_fit();
 
     std::stable_sort(
         output.sysEx.begin(),

@@ -55,7 +55,16 @@ Item {
                         anchors.topMargin: 3
                         spacing: 0
                         Text { text: modelData[0].toUpperCase(); color: "#554d66"; font.pixelSize: 6; font.bold: true; font.letterSpacing: 0.4 }
-                        Text { text: modelData[1]; color: "#bdb0d5"; font.pixelSize: 9; font.bold: true; elide: Text.ElideRight; width: parent.width - 5 }
+                        Text {
+                            text: modelData[1]
+                            color: "#bdb0d5"
+                            font.pixelSize: 9
+                            minimumPixelSize: 6
+                            fontSizeMode: Text.HorizontalFit
+                            font.bold: true
+                            wrapMode: Text.NoWrap
+                            width: parent.width - 8
+                        }
                     }
                 }
             }
