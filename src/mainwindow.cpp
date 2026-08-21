@@ -208,9 +208,132 @@ EM_JS(int, wasmidi_snappy_copy_string, (int which, char* dst, int capacity), {
 });
 
 EM_JS(void, wasmidi_snappy_open_soundfont, (), {
-    const b = globalThis.WasmidiSnappyBridge;
-    if (b && b.openSoundfont)
-        b.openSoundfont();
+    /*
+     * The native file picker MUST be opened synchronously from this call,
+     * because this call is reached directly from the QML button's user gesture.
+     *
+     * Do not depend on WasmidiSnappyBridge being loaded yet: the previous
+     * implementation simply did nothing when the bridge script had not
+     * initialized, which made "Load SF2" appear dead.
+     */
+    let input =
+        document.getElementById(
+            'wasmidi-snappysynth-sf2-input');
+
+    if (!input) {
+        input =
+            document.createElement(
+                'input');
+
+        input.id =
+            'wasmidi-snappysynth-sf2-input';
+
+        input.type = 'file';
+
+        input.accept =
+            '.sf2,audio/x-soundfont,application/octet-stream';
+
+        input.style.position = 'fixed';
+        input.style.left = '-10000px';
+        input.style.top = '-10000px';
+        input.style.width = '1px';
+        input.style.height = '1px';
+        input.style.opacity = '0';
+
+        document.body.appendChild(input);
+
+        input.onchange = async () => {
+            const file =
+                input.files &&
+                input.files.length
+                    ? input.files[0]
+                    : null;
+
+            // Allow selecting the same SF2 again later.
+            input.value = null;
+
+            if (!file)
+                return;
+
+            try {
+                let bridge =
+                    globalThis.WasmidiSnappyBridge;
+
+                // Recovery path if the deployment loaded Qt before the bridge
+                // script for any reason. The picker has already been opened
+                // under the original user gesture, so loading the bridge here
+                // cannot cause the browser to block the dialog.
+                if (!bridge) {
+                    await new Promise(
+                        (resolve, reject) => {
+                            const existing =
+                                document.querySelector(
+                                    'script[data-wasmidi-snappy-bridge]');
+
+                            if (existing) {
+                                if (globalThis.WasmidiSnappyBridge) {
+                                    resolve();
+                                    return;
+                                }
+
+                                existing.addEventListener(
+                                    'load',
+                                    resolve,
+                                    { once: true });
+
+                                existing.addEventListener(
+                                    'error',
+                                    reject,
+                                    { once: true });
+
+                                return;
+                            }
+
+                            const script =
+                                document.createElement(
+                                    'script');
+
+                            script.src =
+                                './snappysynth_bridge.js';
+
+                            script.async = false;
+
+                            script.dataset.wasmidiSnappyBridge =
+                                '1';
+
+                            script.onload = resolve;
+                            script.onerror = reject;
+
+                            document.head.appendChild(
+                                script);
+                        });
+
+                    bridge =
+                        globalThis.WasmidiSnappyBridge;
+                }
+
+                if (!bridge)
+                    throw new Error(
+                        'SnappySynthV2 bridge is not available.');
+
+                if (bridge.loadSoundfontFile) {
+                    await bridge.loadSoundfontFile(file);
+                } else if (bridge.openSoundfontWithFile) {
+                    await bridge.openSoundfontWithFile(file);
+                } else {
+                    throw new Error(
+                        'SnappySynthV2 bridge does not expose an SF2 loader.');
+                }
+            } catch (error) {
+                console.error(
+                    '[WASMIDI] Could not load selected SF2:',
+                    error);
+            }
+        };
+    }
+
+    // Keep click() synchronous with the QML user gesture.
+    input.click();
 });
 
 EM_JS(void, wasmidi_snappy_play, (double time, int reset), {

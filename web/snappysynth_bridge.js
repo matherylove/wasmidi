@@ -243,6 +243,41 @@
         }
     }
 
+    async function loadSoundfontFile(file) {
+        if (!file)
+            return false;
+
+        state.soundfontLoaded = false;
+        state.soundfontName =
+            copyFileName(file);
+
+        updateStatus(
+            "Loading SF2…");
+
+        try {
+            await ensureBackend();
+
+            worker.postMessage({
+                type: "loadSoundfont",
+                file
+            });
+
+            return true;
+        } catch (error) {
+            updateStatus(
+                error &&
+                error.message
+                    ? error.message
+                    : "Could not start SnappySynthV2");
+
+            console.error(
+                "[WASMIDI] SnappySynthV2 SF2 load failed:",
+                error);
+
+            return false;
+        }
+    }
+
     function getInput() {
         if (input)
             return input;
@@ -271,32 +306,12 @@
                     ? input.files[0]
                     : null;
 
-            input.value = "";
+            input.value = null;
 
             if (!file)
                 return;
 
-            state.soundfontLoaded = false;
-            state.soundfontName =
-                copyFileName(file);
-
-            updateStatus(
-                "Loading SF2…");
-
-            try {
-                await ensureBackend();
-
-                worker.postMessage({
-                    type: "loadSoundfont",
-                    file
-                });
-            } catch (error) {
-                updateStatus(
-                    error &&
-                    error.message
-                        ? error.message
-                        : "Could not start SnappySynthV2");
-            }
+            await loadSoundfontFile(file);
         };
 
         return input;
@@ -549,6 +564,7 @@
     globalThis.WasmidiSnappyBridge = {
         state,
         ensureBackend,
+        loadSoundfontFile,
         openSoundfont,
         play,
         pause,
