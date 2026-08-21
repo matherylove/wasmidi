@@ -70,6 +70,12 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 2
 
+      - name: Validate generated MIDI parser runtime
+        run: |
+          node --check build/wasmidi-midi-parser.js
+          node --check web/midi-parser-worker.js
+          node tools/midi_parser_bootstrap_smoke.cjs build/wasmidi-midi-parser.js
+
       - name: Prepare Pages artifact
         shell: bash
         run: |
@@ -83,19 +89,18 @@ jobs:
           test -s build/snappysynth-core.wasm
           test -s build/snappysynth-core.worker.js
           test -s build/wasmidi-midi-parser.js
-          test -s build/wasmidi-midi-parser.wasm
 
           cp build/wasmidi.html site/index.html
           cp build/wasmidi.js site/
           cp build/wasmidi.wasm site/
 
           if [[ -f build/qtloader.js ]]; then cp build/qtloader.js site/; fi
+          if [[ -f build/qtlogo.svg ]]; then cp build/qtlogo.svg site/; fi
           if [[ -f build/wasmidi.data ]]; then cp build/wasmidi.data site/; fi
           if [[ -f build/wasmidi.worker.js ]]; then cp build/wasmidi.worker.js site/; fi
 
           # Large MIDI parsing runs in its own non-pthread Worker WASM module.
           cp build/wasmidi-midi-parser.js site/
-          cp build/wasmidi-midi-parser.wasm site/
           cp web/midi-parser-worker.js site/
           cp web/visual-cache-worker.js site/
 
@@ -136,7 +141,6 @@ jobs:
           test -s site/wasmidi.js
           test -s site/wasmidi.wasm
           test -s site/wasmidi-midi-parser.js
-          test -s site/wasmidi-midi-parser.wasm
           test -s site/midi-parser-worker.js
           test -s site/visual-cache-worker.js
           test -s site/snappysynth-core.js
