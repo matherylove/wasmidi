@@ -110,3 +110,11 @@ The repository workflow has been extended to build/deploy the standalone MIDI
 parser WASM/JS and both hand-written browser Workers. A full Qt 6.8/Emscripten
 link still requires the repository CI/toolchain; the local execution environment
 used for this pass does not contain Qt or `emcc`.
+
+## Pass 12.2 — parser startup hardening
+
+The dedicated MIDI parser no longer deploys separate generated `.js` and
+`.wasm` files. It is a single-file modularized Emscripten module with a
+cache-versioned Worker bootstrap, inert entry point, persistent runtime, and
+parser-only exception/assertion diagnostics. GitHub Actions now loads the exact
+generated module and parses a minimal MIDI before Pages deployment.

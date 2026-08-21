@@ -54,3 +54,22 @@ is configured for that authoritative build.
 The connected GitHub integration in this session can read the repository but
 returned HTTP 403 `Resource not accessible by integration` for branch/blob write
 operations, so this pass could not be pushed to a CI branch from the session.
+
+## Pass 12.2 parser bootstrap validation
+
+The background MIDI parser is packaged as one modularized JavaScript file with
+its WebAssembly payload embedded. This prevents a newly deployed glue file from
+being paired with a stale cached `.wasm` file. The browser worker and its core
+URL are versioned (`12.2`) to invalidate older worker/bootstrap cache entries.
+
+The Pages workflow now executes the *generated* parser module under Node before
+uploading the Pages artifact. The smoke test checks every required export and
+parses a valid format-0 MIDI containing an EndOfTrack event. A parser module
+that aborts during startup or cannot call `_wmp_parse()` therefore fails CI and
+cannot reach deployment.
+
+The parser target also keeps an inert real `main()`, uses `NO_EXIT_RUNTIME=1`,
+and catches C++ allocation/standard exceptions around the complete parse and
+serialization operation. Parser-only Emscripten assertions remain enabled so a
+future fatal runtime error reports its actual reason and stage instead of only
+`Aborted()`.

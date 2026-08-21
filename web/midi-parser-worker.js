@@ -2,50 +2,120 @@
 
 "use strict";
 
-importScripts("./wasmidi-midi-parser.js");
+// Bump this whenever the generated parser ABI/bootstrap changes. The parser is
+// SINGLE_FILE, so this one cache-busted URL contains both glue and WASM bytes.
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.2";
+
+self.__wasmidiMidiParserStage = "Loading parser core";
+self.__wasmidiMidiParserPercent = 14;
+
+importScripts(
+    "./wasmidi-midi-parser.js?v=" +
+    encodeURIComponent(WASMIDI_MIDI_PARSER_BOOTSTRAP));
 
 let modulePromise = null;
+let lastAbortReason = "";
+let lastRuntimeError = "";
+
+function currentStage() {
+    return String(
+        self.__wasmidiMidiParserStage ||
+        "Initializing parser core");
+}
+
+function conciseError(value) {
+    if (!value)
+        return "";
+    if (value instanceof Error)
+        return value.message || String(value);
+    return String(value);
+}
+
+function enrichedCoreError(error) {
+    const primary = conciseError(error);
+    const detail =
+        lastAbortReason ||
+        lastRuntimeError ||
+        primary ||
+        "unknown parser runtime error";
+
+    // Do not return the old opaque `Aborted()` dialog. Always identify which
+    // stage failed and preserve Emscripten's assertion/fetch/trap diagnostic.
+    return new Error(
+        "Background MIDI parser failed while " +
+        currentStage() +
+        ": " + detail);
+}
 
 function getModule() {
     if (!modulePromise) {
-        modulePromise = WasmidiMidiParserCore({
-            // This target exposes a C API and is not an application. Do not let
-            // Emscripten run an executable main()/exit sequence in this Worker.
-            // The CMake target is also linked with --no-entry; keeping this here
-            // makes the worker robust against stale/generated glue during deploys.
-            noInitialRun: true,
-            locateFile(path) {
-                return new URL(path, self.location.href).href;
-            },
-            onAbort(reason) {
-                console.error(
-                    "[WASMIDI MIDI parser] core aborted:",
-                    reason || "unknown reason");
-            }
-        }).then(Module => {
+        lastAbortReason = "";
+        lastRuntimeError = "";
+        self.__wasmidiMidiParserStage = "Initializing parser core";
+        self.__wasmidiMidiParserPercent = 15;
+
+        modulePromise = Promise.resolve().then(() =>
+            WasmidiMidiParserCore({
+                // The generated module now also has a real inert main() and is
+                // linked NO_EXIT_RUNTIME=1, making either startup convention
+                // safe. Keep these explicit for current Emscripten glue.
+                noInitialRun: true,
+                noExitRuntime: true,
+                onAbort(reason) {
+                    lastAbortReason =
+                        conciseError(reason) ||
+                        "Emscripten aborted without a reason";
+                    console.error(
+                        "[WASMIDI MIDI parser] abort during " +
+                        currentStage() + ":",
+                        lastAbortReason);
+                },
+                print(text) {
+                    if (text)
+                        console.log("[WASMIDI MIDI parser]", text);
+                },
+                printErr(text) {
+                    if (!text)
+                        return;
+                    lastRuntimeError = String(text);
+                    console.error(
+                        "[WASMIDI MIDI parser runtime]",
+                        text);
+                }
+            })
+        ).then(Module => {
             if (!Module ||
                 typeof Module._wmp_parse !== "function" ||
+                typeof Module._wmp_result_ptr !== "function" ||
+                typeof Module._wmp_result_size !== "function" ||
+                typeof Module._wmp_error_ptr !== "function" ||
                 typeof Module._malloc !== "function" ||
+                typeof Module._free !== "function" ||
                 !Module.HEAPU8) {
                 throw new Error(
-                    "MIDI parser WASM initialized without its exported API.");
+                    "parser WASM initialized without its complete exported API");
             }
+
+            self.__wasmidiMidiParserStage = "Parser core ready";
+            self.__wasmidiMidiParserPercent = 15;
             return Module;
         }).catch(error => {
-            // Permit a later load attempt after a transient deployment/cache
-            // failure instead of permanently retaining a rejected Promise.
             modulePromise = null;
-            throw error;
+            throw enrichedCoreError(error);
         });
     }
     return modulePromise;
 }
 
 function progress(percent, stage) {
+    const bounded = Math.max(0, Math.min(100, percent | 0));
+    const text = String(stage || "Loading MIDI");
+    self.__wasmidiMidiParserStage = text;
+    self.__wasmidiMidiParserPercent = bounded;
     postMessage({
         type: "progress",
-        percent: Math.max(0, Math.min(100, percent | 0)),
-        stage: String(stage || "Loading MIDI")
+        percent: bounded,
+        stage: text
     });
 }
 
@@ -77,8 +147,6 @@ async function readFileWithProgress(file) {
                 1 + Math.floor(13 * offset / Math.max(1, total)),
                 "Reading MIDI file");
 
-            // Keep the Worker message queue responsive even when File.stream()
-            // supplies many chunks back-to-back from memory cache.
             if ((offset & ((4 * 1024 * 1024) - 1)) === 0)
                 await new Promise(resolve => setTimeout(resolve, 0));
         }
@@ -103,12 +171,14 @@ self.onmessage = async event => {
         return;
 
     let inputPtr = 0;
+    let Module = null;
 
     try {
         const file = message.file;
         const input = await readFileWithProgress(file);
-        const Module = await getModule();
+        Module = await getModule();
 
+        self.__wasmidiMidiParserStage = "Allocating MIDI input";
         inputPtr = Module._malloc(Math.max(1, input.length));
         if (!inputPtr)
             throw new Error("Could not allocate parser WASM memory.");
@@ -116,6 +186,7 @@ self.onmessage = async event => {
         if (input.length)
             Module.HEAPU8.set(input, inputPtr);
 
+        self.__wasmidiMidiParserStage = "Parsing MIDI";
         const ok = Module._wmp_parse(inputPtr, input.length);
         if (!ok) {
             const errorPtr = Module._wmp_error_ptr();
@@ -147,16 +218,20 @@ self.onmessage = async event => {
             data: result.buffer
         }, [result.buffer]);
     } catch (error) {
+        const failure =
+            (lastAbortReason || lastRuntimeError)
+                ? enrichedCoreError(error)
+                : error;
+
         postMessage({
             type: "error",
-            message: error && error.message
-                ? error.message
-                : String(error || "Could not parse MIDI")
+            message: failure && failure.message
+                ? failure.message
+                : String(failure || "Could not parse MIDI")
         });
     } finally {
-        if (inputPtr) {
+        if (inputPtr && Module) {
             try {
-                const Module = await getModule();
                 Module._free(inputPtr);
             } catch (_) {}
         }

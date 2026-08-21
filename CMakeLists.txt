@@ -66,19 +66,39 @@ if(EMSCRIPTEN)
     )
 
     target_include_directories(midi_parser_core PRIVATE src)
-    target_compile_options(midi_parser_core PRIVATE -O3 -flto)
+    target_compile_options(midi_parser_core PRIVATE
+        -O3
+        -flto
+        -fexceptions
+    )
     target_link_options(midi_parser_core PRIVATE
         -O3
         -flto
-        "--no-entry"
+        -fexceptions
         "-sMODULARIZE=1"
         "-sEXPORT_NAME=WasmidiMidiParserCore"
-        "-sENVIRONMENT=worker"
+        # Keep a conventional Emscripten application lifecycle, but never tear
+        # the runtime down. The Worker normally passes noInitialRun=true; if a
+        # browser/generated-glue variant still executes main(), the inert main
+        # simply returns and NO_EXIT_RUNTIME keeps the exported parser alive.
+        "-sNO_EXIT_RUNTIME=1"
+        # Package the parser's WASM payload into its JS glue. This removes the
+        # possibility of a cached/new .js file being paired with a stale .wasm
+        # file after a Pages deployment.
+        "-sSINGLE_FILE=1"
+        # Node support is build/CI-only. The same generated module runs as a
+        # classic browser Worker in production and is executed in Node during
+        # CI so a startup abort cannot reach Pages unnoticed again.
+        "-sENVIRONMENT=worker,node"
         "-sALLOW_MEMORY_GROWTH=1"
         "-sINITIAL_MEMORY=67108864"
         "-sMAXIMUM_MEMORY=2147483648"
         "-sSTACK_SIZE=4194304"
         "-sFILESYSTEM=0"
+        # Parser-only assertions keep fatal startup/runtime diagnostics useful;
+        # they do not affect the real-time renderer or SnappySynth hot paths.
+        "-sASSERTIONS=1"
+        "-sINCOMING_MODULE_JS_API=['noInitialRun','noExitRuntime','onAbort','print','printErr']"
         "-sEXPORTED_FUNCTIONS=['_wmp_parse','_wmp_result_ptr','_wmp_result_size','_wmp_error_ptr','_malloc','_free']"
         "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
     )
