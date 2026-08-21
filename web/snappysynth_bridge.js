@@ -27,6 +27,9 @@
     let node = null;
     let worker = null;
     let backendPromise = null;
+    let workerReadyPromise = null;
+    let workerReadyResolve = null;
+    let workerReadyReject = null;
     let input = null;
 
     function updateStatus(text) {
@@ -98,6 +101,13 @@
                 new Worker(
                     "./snappysynth-worker.js");
 
+            workerReadyPromise =
+                new Promise(
+                    (resolve, reject) => {
+                        workerReadyResolve = resolve;
+                        workerReadyReject = reject;
+                    });
+
             const channel =
                 new MessageChannel();
 
@@ -136,6 +146,13 @@
                 switch (data.type) {
                 case "ready":
                     state.ready = true;
+
+                    if (workerReadyResolve) {
+                        workerReadyResolve(true);
+                        workerReadyResolve = null;
+                        workerReadyReject = null;
+                    }
+
                     updateStatus(
                         "SnappySynthV2 ready — load an SF2");
                     break;
@@ -186,21 +203,47 @@
                             : "SnappySynthV2 ready — load an SF2");
                     break;
 
-                case "error":
-                    updateStatus(
+                case "error": {
+                    const message =
                         String(
                             data.message ||
-                            "SnappySynthV2 error"));
+                            "SnappySynthV2 error");
+
+                    if (!state.ready &&
+                        workerReadyReject) {
+                        workerReadyReject(
+                            new Error(message));
+
+                        workerReadyResolve = null;
+                        workerReadyReject = null;
+                    }
+
+                    updateStatus(message);
+
                     console.error(
                         "[WASMIDI SnappySynthV2]",
-                        data.message);
+                        message);
                     break;
+                }
                 }
             };
 
             worker.onerror = error => {
-                updateStatus(
-                    "SnappySynthV2 worker error");
+                const message =
+                    error && error.message
+                        ? String(error.message)
+                        : "SnappySynthV2 worker error";
+
+                if (!state.ready &&
+                    workerReadyReject) {
+                    workerReadyReject(
+                        new Error(message));
+
+                    workerReadyResolve = null;
+                    workerReadyReject = null;
+                }
+
+                updateStatus(message);
 
                 console.error(
                     "[WASMIDI SnappySynthV2 worker]",
@@ -231,7 +274,11 @@
             });
 
             updateStatus(
-                "Starting SnappySynthV2…");
+                "Starting SnappySynthV2 core…");
+
+            // Do not let loadSoundfontFile() post a File until the modularized
+            // Emscripten core has instantiated and the worker has sent ready.
+            await workerReadyPromise;
 
             return true;
         })();
@@ -240,6 +287,9 @@
             return await backendPromise;
         } catch (error) {
             backendPromise = null;
+            workerReadyPromise = null;
+            workerReadyResolve = null;
+            workerReadyReject = null;
             throw error;
         }
     }

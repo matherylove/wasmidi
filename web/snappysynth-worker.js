@@ -633,9 +633,32 @@ onmessage = async event => {
     }
 };
 
+const coreScriptUrl =
+    new URL(
+        "./snappysynth-core.js",
+        self.location.href).href;
+
+console.info(
+    "[SnappySynthV2 worker] core script:",
+    coreScriptUrl);
+
 SnappySynthCore({
+    /*
+     * This module is MODULARIZE + pthreads and is itself instantiated from
+     * snappysynth-worker.js. In that nested-worker scenario Emscripten cannot
+     * reliably infer the URL of the main generated JS file.
+     *
+     * Without this value the generated snappysynth-core.worker.js receives
+     * urlOrBlob=undefined and executes URL.createObjectURL(undefined), which
+     * is exactly the Chrome "Overload resolution failed" seen in the console.
+     */
+    mainScriptUrlOrBlob:
+        coreScriptUrl,
+
     locateFile(path) {
-        return "./" + path;
+        return new URL(
+            path,
+            self.location.href).href;
     },
     print(text) {
         if (text)

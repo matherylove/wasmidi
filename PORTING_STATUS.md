@@ -1,42 +1,43 @@
-# WASMIDI Pass 9.3 — GitHub Pages SnappySynthV2 deployment fix
+# WASMIDI Pass 9.4 — SnappySynthV2 pthread startup + ready race fix
 
-Apply on top of Pass 9.x.
+Apply on top of Pass 9.3.
 
-## Root cause
+## Browser error fixed
 
-The active `.github/workflows/build-wasm.yml` in the repository was still the
-old Qt-only deployment. It published:
-- wasmidi.html / wasmidi.js / wasmidi.wasm
-but did NOT publish the SnappySynthV2 runtime payload.
+Chrome showed:
 
-Selecting an SF2 therefore worked, but the browser could not reliably start the
-SnappySynth worker/core, so the UI remained at "No SoundFont loaded".
+    snappysynth-core.worker.js:
+    TypeError: Failed to execute 'createObjectURL' on 'URL':
+    Overload resolution failed.
 
-## This overlay restores the complete deployment
+Emscripten's generated pthread worker was receiving `urlOrBlob=undefined`.
+This happens because `snappysynth-core.js` is MODULARIZE+pthreads and is loaded
+with importScripts() from another browser Worker. In that context the generated
+runtime cannot reliably infer the URL of its own main JS file.
 
-GitHub Pages now publishes and verifies:
-- snappysynth-core.js
-- snappysynth-core.wasm
-- snappysynth-core.worker.js
-- snappysynth-worker.js
-- snappysynth-audio-worklet.js
-- snappysynth_bridge.js
-- coi-serviceworker.js
+The worker now instantiates SnappySynthCore with:
 
-`index.html` is patched during Actions to load:
-1. coi-serviceworker.js
-2. snappysynth_bridge.js
+    mainScriptUrlOrBlob:
+        new URL("./snappysynth-core.js", self.location.href).href
 
-## Why COI remains required
+and `locateFile()` also returns absolute URLs derived from the outer worker URL.
 
-The supplied SnappySynthV2 voice engine internally creates worker threads via
-its Win32 compatibility layer (`_beginthreadex` -> pthread). Therefore its
-Emscripten core correctly remains a pthread build. GitHub Pages does not emit
-COOP/COEP headers itself, so the same-origin service worker injects them.
+## Second race fixed
 
-On the first deployment/navigation the page may reload once while the service
-worker takes control. After that `crossOriginIsolated` should be true and SF2
-loading can proceed.
+The console also showed:
 
-GitHub Actions now fails before deployment if any required SnappySynthV2 file
-is missing.
+    SnappySynthV2 core is still starting.
+
+`ensureBackend()` previously returned after creating the Worker, not after the
+SnappySynth WASM module was ready. A fast SF2 selection therefore posted
+`loadSoundfont` while `Module === null`.
+
+The bridge now owns a `workerReadyPromise`:
+- resolves only on worker message `type: "ready"`
+- rejects on startup `type: "error"` or Worker.onerror
+- `ensureBackend()` awaits it
+- `loadSoundfontFile()` cannot send the SF2 before core initialization finishes
+
+Files:
+- web/snappysynth-worker.js
+- web/snappysynth_bridge.js
