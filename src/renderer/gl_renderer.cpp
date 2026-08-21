@@ -636,6 +636,70 @@ bool GLRenderer::initialize()
         1,
         &completedVbo_);
 
+    // The completed-note ring is the main horizontal visualizer. Pass 8.2
+    // accidentally created this VAO/VBO but never enabled/configured its
+    // instanced attributes, so DrawArraysInstanced read constant zero values
+    // for StartTick/EndTick/PackedData and completed notes disappeared.
+    glBindVertexArray(
+        completedVao_);
+
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        completedVbo_);
+
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribIPointer(
+        0,
+        1,
+        GL_INT,
+        sizeof(RenderNote),
+        reinterpret_cast<void*>(
+            offsetof(
+                RenderNote,
+                startTick)));
+
+    glVertexAttribDivisor(
+        0,
+        1);
+
+    glEnableVertexAttribArray(1);
+
+    glVertexAttribIPointer(
+        1,
+        1,
+        GL_INT,
+        sizeof(RenderNote),
+        reinterpret_cast<void*>(
+            offsetof(
+                RenderNote,
+                endTick)));
+
+    glVertexAttribDivisor(
+        1,
+        1);
+
+    glEnableVertexAttribArray(2);
+
+    glVertexAttribIPointer(
+        2,
+        1,
+        GL_UNSIGNED_INT,
+        sizeof(RenderNote),
+        reinterpret_cast<void*>(
+            offsetof(
+                RenderNote,
+                packedData)));
+
+    glVertexAttribDivisor(
+        2,
+        1);
+
+    glBindVertexArray(0);
+    glBindBuffer(
+        GL_ARRAY_BUFFER,
+        0);
+
     glGenVertexArrays(
         1,
         &openVao_);
