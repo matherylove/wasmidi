@@ -100,6 +100,7 @@ typedef struct {
 } VoiceStats;
 
 VoiceStats GetVoiceStats(void);
+int voice_get_worker_count(void);
 void voice_init(AudioConfig* config);
 void voice_init_with_count(long voice_count, AudioConfig* config);
 void voice_request_stop(void);

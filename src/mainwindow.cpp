@@ -288,6 +288,31 @@ EM_JS(int, wasmidi_snappy_active_voices, (), {
     return b && b.state ? (Number(b.state.activeVoices) | 0) : 0;
 });
 
+EM_JS(int, wasmidi_snappy_free_voices, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.freeVoices) | 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_steals, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.steals) | 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_layers, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.layers) | 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_regions, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.regions) | 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_worker_count, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.workerCount) | 0) : 0;
+});
+
 EM_JS(int, wasmidi_snappy_underruns, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? (Number(b.state.underruns) | 0) : 0;
@@ -313,6 +338,22 @@ EM_JS(int, wasmidi_snappy_copy_string, (int which, char* dst, int capacity), {
 });
 
 
+
+EM_JS(void, wasmidi_snappy_clear_soundfonts, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.clearSoundfonts)
+        b.clearSoundfonts();
+});
+
+EM_JS(void, wasmidi_snappy_schedule_sysex,
+      (const uint8_t* data, int length, double time), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (!b || !b.scheduleSysEx || !data || length <= 0)
+        return;
+    const bytes = new Uint8Array(length);
+    bytes.set(HEAPU8.subarray(data, data + length));
+    b.scheduleSysEx(bytes, Number(time) || 0.0);
+});
 
 EM_JS(void, wasmidi_snappy_play, (double time, int reset), {
     const b = globalThis.WasmidiSnappyBridge;
@@ -344,10 +385,42 @@ EM_JS(void, wasmidi_snappy_set_volume, (int percent), {
         b.setVolume(percent);
 });
 
-EM_JS(void, wasmidi_snappy_configure, (int maxVoices, int blockFrames), {
+EM_JS(void, wasmidi_snappy_configure,
+      (int maxVoices,
+       int minVoices,
+       int blockFrames,
+       int numBuffers,
+       int requestedSampleRate,
+       int channels,
+       int bitsPerSample,
+       int realtimePriority,
+       int workers,
+       int noteSharding,
+       int stealScoreCache,
+       int fastNoteOff,
+       int validateState,
+       int softClip), {
     const b = globalThis.WasmidiSnappyBridge;
-    if (b && b.configure)
-        b.configure(maxVoices, blockFrames);
+
+    if (!b || !b.configure)
+        return;
+
+    b.configure({
+        maxVoices,
+        minVoices,
+        blockFrames,
+        numBuffers,
+        requestedSampleRate,
+        channels,
+        bitsPerSample,
+        realtimePriority: !!realtimePriority,
+        workers,
+        noteSharding,
+        stealScoreCache: !!stealScoreCache,
+        fastNoteOff: !!fastNoteOff,
+        validateState: !!validateState,
+        softClip: !!softClip
+    });
 });
 
 EM_JS(void, wasmidi_snappy_set_overlap_gain, (int enabled), {
@@ -558,6 +631,23 @@ void MainWindow::openSoundfontPicker()
     synthStatus_ = QStringLiteral("SnappySynthV2 SF2 picker is available in the WebAssembly build.");
     emit synthStateChanged();
 #endif
+}
+
+
+void MainWindow::clearSoundfonts()
+{
+#ifdef __EMSCRIPTEN__
+    if (isPlaying_)
+        stop();
+    wasmidi_snappy_clear_soundfonts();
+#endif
+    soundfontLoaded_ = false;
+    soundfontName_.clear();
+    synthLayers_ = 0;
+    synthRegions_ = 0;
+    synthPlaybackPrimed_ = false;
+    synthWasSoundfontLoaded_ = false;
+    emit synthStateChanged();
 }
 
 
@@ -1169,46 +1259,253 @@ void MainWindow::setVolume(int value)
 }
 
 
+void MainWindow::applySynthConfig()
+{
+    synthPlaybackPrimed_ = false;
+
+#ifdef __EMSCRIPTEN__
+    wasmidi_snappy_configure(
+        synthMaxVoices_,
+        synthMinVoices_,
+        synthBufferFrames_,
+        synthNumBuffers_,
+        synthRequestedSampleRate_,
+        synthChannels_,
+        synthBitsPerSample_,
+        synthRealtimePriority_ ? 1 : 0,
+        synthWorkers_,
+        synthNoteSharding_,
+        synthStealScoreCache_ ? 1 : 0,
+        synthFastNoteOff_ ? 1 : 0,
+        synthValidateState_ ? 1 : 0,
+        synthSoftClip_ ? 1 : 0);
+#endif
+}
+
 void MainWindow::setSynthMaxVoices(int value)
 {
-    const int clamped = std::clamp(value, 128, 262144);
+    // SnappySynth_SetMinimumVoices() treats the minimum as a floor for the
+    // effective voice cap. Keep the UI state internally consistent with that
+    // source behavior instead of showing Max < Min while the core silently
+    // raises Max during initialization.
+    const int clamped =
+        std::clamp(
+            value,
+            std::max(1, synthMinVoices_),
+            5000000);
+
     if (synthMaxVoices_ == clamped)
         return;
+
     synthMaxVoices_ = clamped;
-    synthPlaybackPrimed_ = false;
     emit synthConfigChanged();
-#ifdef __EMSCRIPTEN__
-    wasmidi_snappy_configure(synthMaxVoices_, synthBufferFrames_);
-#endif
+    applySynthConfig();
+}
+
+void MainWindow::setSynthMinVoices(int value)
+{
+    const int clamped =
+        std::clamp(
+            value,
+            0,
+            5000000);
+
+    bool changed = false;
+
+    if (synthMinVoices_ != clamped) {
+        synthMinVoices_ = clamped;
+        changed = true;
+    }
+
+    if (synthMaxVoices_ < synthMinVoices_) {
+        synthMaxVoices_ = synthMinVoices_;
+        changed = true;
+    }
+
+    if (!changed)
+        return;
+
+    emit synthConfigChanged();
+    applySynthConfig();
 }
 
 void MainWindow::setSynthBufferFrames(int value)
 {
-    int clamped = std::clamp(value, 128, 2048);
-    // Keep the worker/render block on a power of two, which is the efficient
-    // path for both the source voice engine and the AudioWorklet queue.
-    int pow2 = 128;
-    while (pow2 < clamped && pow2 < 2048)
-        pow2 <<= 1;
-    clamped = pow2;
+    // The original SnappySynth configuration accepts any positive BufferSize
+    // (examples include 48, 96, 256, 480, 512, 1024). Do not force powers of 2.
+    const int clamped =
+        std::clamp(
+            value,
+            1,
+            65536);
+
     if (synthBufferFrames_ == clamped)
         return;
+
     synthBufferFrames_ = clamped;
-    synthPlaybackPrimed_ = false;
     emit synthConfigChanged();
-#ifdef __EMSCRIPTEN__
-    wasmidi_snappy_configure(synthMaxVoices_, synthBufferFrames_);
-#endif
+    applySynthConfig();
+}
+
+void MainWindow::setSynthNumBuffers(int value)
+{
+    const int clamped =
+        std::clamp(
+            value,
+            1,
+            128);
+
+    if (synthNumBuffers_ == clamped)
+        return;
+
+    synthNumBuffers_ = clamped;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthRequestedSampleRate(int value)
+{
+    const int clamped =
+        value <= 0
+            ? 0
+            : std::clamp(
+                value,
+                8000,
+                384000);
+
+    if (synthRequestedSampleRate_ == clamped)
+        return;
+
+    // AudioContext sample rate is chosen at context construction. Keep this
+    // configurable before the backend starts; afterward the actual device rate
+    // remains authoritative so pitch cannot drift.
+    if (synthReady_)
+        return;
+
+    synthRequestedSampleRate_ = clamped;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthChannels(int value)
+{
+    const int clamped =
+        value == 1 ? 1 : 2;
+
+    if (synthChannels_ == clamped)
+        return;
+
+    synthChannels_ = clamped;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthBitsPerSample(int value)
+{
+    const int clamped =
+        value == 16 ? 16 : 32;
+
+    if (synthBitsPerSample_ == clamped)
+        return;
+
+    synthBitsPerSample_ = clamped;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthRealtimePriority(bool enabled)
+{
+    if (synthRealtimePriority_ == enabled)
+        return;
+
+    synthRealtimePriority_ = enabled;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthWorkers(int value)
+{
+    const int clamped =
+        std::clamp(
+            value,
+            0,
+            256);
+
+    if (synthWorkers_ == clamped)
+        return;
+
+    synthWorkers_ = clamped;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthNoteSharding(int value)
+{
+    const int clamped =
+        std::clamp(
+            value,
+            0,
+            2);
+
+    if (synthNoteSharding_ == clamped)
+        return;
+
+    synthNoteSharding_ = clamped;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthStealScoreCache(bool enabled)
+{
+    if (synthStealScoreCache_ == enabled)
+        return;
+
+    synthStealScoreCache_ = enabled;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthFastNoteOff(bool enabled)
+{
+    if (synthFastNoteOff_ == enabled)
+        return;
+
+    synthFastNoteOff_ = enabled;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthValidateState(bool enabled)
+{
+    if (synthValidateState_ == enabled)
+        return;
+
+    synthValidateState_ = enabled;
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthSoftClip(bool enabled)
+{
+    if (synthSoftClip_ == enabled)
+        return;
+
+    synthSoftClip_ = enabled;
+    emit synthConfigChanged();
+    applySynthConfig();
 }
 
 void MainWindow::setSynthOverlapGain(bool enabled)
 {
     if (synthOverlapGain_ == enabled)
         return;
+
     synthOverlapGain_ = enabled;
     emit synthConfigChanged();
+
 #ifdef __EMSCRIPTEN__
-    wasmidi_snappy_set_overlap_gain(enabled ? 1 : 0);
+    wasmidi_snappy_set_overlap_gain(
+        enabled ? 1 : 0);
 #endif
 }
 
@@ -1695,6 +1992,12 @@ void MainWindow::resetSynthSchedule(float seconds)
         std::max(0.0, std::floor(document_.secondsToTick(time))));
 
     synthGroupCursor_ = document_.lowerBoundGroup(tick);
+    synthSysExCursor_ = static_cast<std::size_t>(
+        std::lower_bound(
+            document_.sysEx.begin(), document_.sysEx.end(), tick,
+            [](const wasmidi::SysExEvent& event, uint32_t value) {
+                return event.tick < value;
+            }) - document_.sysEx.begin());
     synthScheduledUntil_ = time;
     synthMessages_.clear();
     synthTimes_.clear();
@@ -1702,6 +2005,17 @@ void MainWindow::resetSynthSchedule(float seconds)
 #ifdef __EMSCRIPTEN__
     if (!soundfontLoaded_)
         return;
+
+    // Restore SnappySynthV2's GM/GS/XG SysEx state exactly as the original
+    // driver does. SysEx count is normally tiny, so replaying the historical
+    // state at seek is cheap and preserves drum-part/channel remaps/tuning.
+    for (std::size_t si = 0; si < synthSysExCursor_; ++si) {
+        const auto& sx = document_.sysEx[si];
+        if (!sx.data.empty()) {
+            wasmidi_snappy_schedule_sysex(
+                sx.data.data(), static_cast<int>(sx.data.size()), time);
+        }
+    }
 
     // Restore the last controller/program/bend state at a seek. Groups with no
     // control data are skipped, so this scans the sparse control history rather
@@ -1870,6 +2184,17 @@ void MainWindow::scheduleSynthAhead()
         }
     }
 
+    // Forward all original SysEx through the SnappySynthV2 SysEx dispatcher.
+    while (synthSysExCursor_ < document_.sysEx.size() &&
+           document_.sysEx[synthSysExCursor_].tick <= targetTick) {
+        const auto& sx = document_.sysEx[synthSysExCursor_++];
+        if (!sx.data.empty()) {
+            wasmidi_snappy_schedule_sysex(
+                sx.data.data(), static_cast<int>(sx.data.size()),
+                document_.tickToSeconds(sx.tick));
+        }
+    }
+
     // Only advance safeUntil after every event through the target horizon has
     // been transferred; this prevents the audio worker from rendering past a
     // partially delivered ultra-dense tick.
@@ -1905,6 +2230,11 @@ void MainWindow::pollSynthState()
     const bool loaded = wasmidi_snappy_soundfont_loaded() != 0;
     const int sampleRate = wasmidi_snappy_sample_rate();
     const int active = wasmidi_snappy_active_voices();
+    const int freeVoices = wasmidi_snappy_free_voices();
+    const int steals = wasmidi_snappy_steals();
+    const int layers = wasmidi_snappy_layers();
+    const int regions = wasmidi_snappy_regions();
+    const int workerCount = wasmidi_snappy_worker_count();
     const int underruns = wasmidi_snappy_underruns();
 
     char nameBuffer[512] = {};
@@ -1917,12 +2247,20 @@ void MainWindow::pollSynthState()
     const bool changed =
         ready != synthReady_ || loaded != soundfontLoaded_ ||
         sampleRate != synthSampleRate_ || active != synthActiveVoices_ ||
+        freeVoices != synthFreeVoices_ || steals != synthSteals_ ||
+        layers != synthLayers_ || regions != synthRegions_ ||
+        workerCount != synthWorkerCount_ ||
         underruns != synthUnderruns_ || name != soundfontName_ || status != synthStatus_;
 
     synthReady_ = ready;
     soundfontLoaded_ = loaded;
     synthSampleRate_ = sampleRate;
     synthActiveVoices_ = active;
+    synthFreeVoices_ = freeVoices;
+    synthSteals_ = steals;
+    synthLayers_ = layers;
+    synthRegions_ = regions;
+    synthWorkerCount_ = workerCount;
     synthUnderruns_ = underruns;
     soundfontName_ = name;
     synthStatus_ = status.isEmpty() ? QStringLiteral("SnappySynthV2 idle") : status;

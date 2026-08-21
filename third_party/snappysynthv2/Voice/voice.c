@@ -64,11 +64,9 @@ extern sfz_instrument* instrument;
 // ==============================
 #define MIDI_CHANNEL_COUNT     16
 #define MIDI_KEY_COUNT         128
-#ifdef SNAPPYSYNTH_WASM
-#define VOICE_WORKER_COUNT     2      // fixed Emscripten pthread pool
-#else
+// Preserve SnappySynthV2's original policy: 0 => auto-detect all logical cores.
+// The Emscripten pthread pool is sized from navigator.hardwareConcurrency.
 #define VOICE_WORKER_COUNT     0      // 0 => auto (all cores)
-#endif
 #define VOICE_MAX_SAFE         9223372036854775000
 #define CH_EVENT_QUEUE_SIZE    16384  // Even larger for extreme loads
 #define CH_EVENT_QUEUE_MASK    (CH_EVENT_QUEUE_SIZE - 1)
@@ -6206,3 +6204,6 @@ ss_game_mix_float(out_buffer, num_frames, channels, g_audio.sample_rate);
                                                                                                                                                                                                                                                                 g_voice_stats.steals = steals;
                                                                                                                                                                                                                                                                 return g_voice_stats;
                                                                                                                                                                                                                                                                 }
+int voice_get_worker_count(void) {
+    return g_worker_count;
+}

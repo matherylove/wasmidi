@@ -17,6 +17,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 
 #ifndef MAX_PATH
 #define MAX_PATH 260
@@ -333,9 +336,8 @@ static inline DWORD GetTickCount(void) {
 
 static inline void GetSystemInfo(SYSTEM_INFO *si) {
 #ifdef __EMSCRIPTEN__
-    // The synth WASM is hosted in one dedicated JS Worker and uses a fixed
-    // two-thread Emscripten pthread pool. Never auto-spawn navigator core count.
-    si->dwNumberOfProcessors = 2;
+    int n = emscripten_num_logical_cores();
+    si->dwNumberOfProcessors = (DWORD)(n > 0 ? n : 1);
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     si->dwNumberOfProcessors = (DWORD)(n > 0 ? n : 1);

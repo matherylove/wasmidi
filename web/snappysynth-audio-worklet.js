@@ -16,8 +16,10 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         this.starved = false;
 
         this.blockFrames = 512;
-        this.lowWaterFrames = 4096;
-        this.highWaterFrames = 8192;
+        this.numBuffers = 16;
+        this.outputGain = 1.0;
+        this.lowWaterFrames = this.blockFrames * Math.max(2, Math.floor(this.numBuffers / 2));
+        this.highWaterFrames = this.blockFrames * this.numBuffers;
 
         this.port.onmessage = event => {
             const data = event.data || {};
@@ -57,11 +59,45 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                 return;
             }
 
+            if (data.type === "volume") {
+                this.outputGain = Math.max(0.0, Math.min(1.0, Number(data.value) || 0.0));
+                return;
+            }
+
             if (data.type === "config") {
-                const block = Math.max(128, Number(data.blockFrames) | 0);
+                const block =
+                    Math.max(
+                        1,
+                        Number(data.blockFrames) |
+                        0);
+
+                const buffers =
+                    Math.max(
+                        1,
+                        Math.min(
+                            128,
+                            Number(data.numBuffers) |
+                            0 || this.numBuffers));
+
                 this.blockFrames = block;
-                this.lowWaterFrames = Math.max(2048, block * 4);
-                this.highWaterFrames = Math.max(4096, block * 10);
+                this.numBuffers = buffers;
+
+                // Browser equivalent of SnappySynth's configured output-buffer
+                // pool: keep approximately NumBuffers synth blocks queued.
+                this.highWaterFrames =
+                    Math.max(
+                        block,
+                        block * buffers);
+
+                this.lowWaterFrames =
+                    Math.max(
+                        block,
+                        block *
+                        Math.max(
+                            1,
+                            Math.floor(
+                                buffers / 2)));
+
                 this.requestAudioIfNeeded();
             }
         };
@@ -180,8 +216,8 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
             let source = this.queueOffsetFrames * 2;
 
             for (let i = 0; i < count; ++i) {
-                left[written + i] = chunk.pcm[source++];
-                right[written + i] = chunk.pcm[source++];
+                left[written + i] = chunk.pcm[source++] * this.outputGain;
+                right[written + i] = chunk.pcm[source++] * this.outputGain;
             }
 
             written += count;

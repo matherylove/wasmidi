@@ -55,9 +55,26 @@ class MainWindow : public QObject {
     Q_PROPERTY(QString synthStatus READ synthStatus NOTIFY synthStateChanged)
     Q_PROPERTY(int synthSampleRate READ synthSampleRate NOTIFY synthStateChanged)
     Q_PROPERTY(int synthActiveVoices READ synthActiveVoices NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthFreeVoices READ synthFreeVoices NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthSteals READ synthSteals NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthLayers READ synthLayers NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthRegions READ synthRegions NOTIFY synthStateChanged)
     Q_PROPERTY(int synthUnderruns READ synthUnderruns NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMaxVoices READ synthMaxVoices WRITE setSynthMaxVoices NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthMinVoices READ synthMinVoices WRITE setSynthMinVoices NOTIFY synthConfigChanged)
     Q_PROPERTY(int synthBufferFrames READ synthBufferFrames WRITE setSynthBufferFrames NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthNumBuffers READ synthNumBuffers WRITE setSynthNumBuffers NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthRequestedSampleRate READ synthRequestedSampleRate WRITE setSynthRequestedSampleRate NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthChannels READ synthChannels WRITE setSynthChannels NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthBitsPerSample READ synthBitsPerSample WRITE setSynthBitsPerSample NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthRealtimePriority READ synthRealtimePriority WRITE setSynthRealtimePriority NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthWorkers READ synthWorkers WRITE setSynthWorkers NOTIFY synthConfigChanged)
+    Q_PROPERTY(int synthWorkerCount READ synthWorkerCount NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthNoteSharding READ synthNoteSharding WRITE setSynthNoteSharding NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthStealScoreCache READ synthStealScoreCache WRITE setSynthStealScoreCache NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthFastNoteOff READ synthFastNoteOff WRITE setSynthFastNoteOff NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthValidateState READ synthValidateState WRITE setSynthValidateState NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthSoftClip READ synthSoftClip WRITE setSynthSoftClip NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthOverlapGain READ synthOverlapGain WRITE setSynthOverlapGain NOTIFY synthConfigChanged)
 
     Q_PROPERTY(QVariantList channelColorList READ channelColorList NOTIFY channelColorsChanged)
@@ -103,9 +120,26 @@ public:
     QString synthStatus() const { return synthStatus_; }
     int synthSampleRate() const { return synthSampleRate_; }
     int synthActiveVoices() const { return synthActiveVoices_; }
+    int synthFreeVoices() const { return synthFreeVoices_; }
+    int synthSteals() const { return synthSteals_; }
+    int synthLayers() const { return synthLayers_; }
+    int synthRegions() const { return synthRegions_; }
     int synthUnderruns() const { return synthUnderruns_; }
     int synthMaxVoices() const { return synthMaxVoices_; }
+    int synthMinVoices() const { return synthMinVoices_; }
     int synthBufferFrames() const { return synthBufferFrames_; }
+    int synthNumBuffers() const { return synthNumBuffers_; }
+    int synthRequestedSampleRate() const { return synthRequestedSampleRate_; }
+    int synthChannels() const { return synthChannels_; }
+    int synthBitsPerSample() const { return synthBitsPerSample_; }
+    bool synthRealtimePriority() const { return synthRealtimePriority_; }
+    int synthWorkers() const { return synthWorkers_; }
+    int synthWorkerCount() const { return synthWorkerCount_; }
+    int synthNoteSharding() const { return synthNoteSharding_; }
+    bool synthStealScoreCache() const { return synthStealScoreCache_; }
+    bool synthFastNoteOff() const { return synthFastNoteOff_; }
+    bool synthValidateState() const { return synthValidateState_; }
+    bool synthSoftClip() const { return synthSoftClip_; }
     bool synthOverlapGain() const { return synthOverlapGain_; }
 
     QVariantList channelColorList() const;
@@ -129,6 +163,7 @@ public:
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
     Q_INVOKABLE void openMidiPicker();
     Q_INVOKABLE void openSoundfontPicker();
+    Q_INVOKABLE void clearSoundfonts();
     Q_INVOKABLE void clearFile();
     Q_INVOKABLE void play();
     Q_INVOKABLE void pause();
@@ -142,7 +177,19 @@ public:
     void setPerTrackColors(bool enable);
     void setVolume(int value);
     void setSynthMaxVoices(int value);
+    void setSynthMinVoices(int value);
     void setSynthBufferFrames(int value);
+    void setSynthNumBuffers(int value);
+    void setSynthRequestedSampleRate(int value);
+    void setSynthChannels(int value);
+    void setSynthBitsPerSample(int value);
+    void setSynthRealtimePriority(bool enabled);
+    void setSynthWorkers(int value);
+    void setSynthNoteSharding(int value);
+    void setSynthStealScoreCache(bool enabled);
+    void setSynthFastNoteOff(bool enabled);
+    void setSynthValidateState(bool enabled);
+    void setSynthSoftClip(bool enabled);
     void setSynthOverlapGain(bool enabled);
 
 signals:
@@ -197,6 +244,7 @@ private:
     void removeVisualNote(uint8_t pitch, uint8_t color);
 
     void pollSynthState();
+    void applySynthConfig();
     void resetSynthSchedule(float seconds);
     void scheduleSynthAhead();
     uint32_t packSynthMessage(const wasmidi::CompactEvent& event) const;
@@ -220,7 +268,7 @@ private:
     float postBuffer_ = 0.0f;
     bool postBufferAuto_ = true;
     bool perTrackColors_ = false;
-    int volume_ = 80;
+    int volume_ = 100;
     int midiFormat_ = 0;
     int ppq_ = 480;
     int tempoChangeCount_ = 0;
@@ -278,13 +326,33 @@ private:
     QString synthStatus_ = QStringLiteral("SnappySynthV2 idle");
     int synthSampleRate_ = 0;
     int synthActiveVoices_ = 0;
+    int synthFreeVoices_ = 0;
+    int synthSteals_ = 0;
+    int synthLayers_ = 0;
+    int synthRegions_ = 0;
     int synthUnderruns_ = 0;
+
+    // SnappySynth.cfg-equivalent values plus voice.c runtime tuning.
     int synthMaxVoices_ = 16384;
+    int synthMinVoices_ = 0;
     int synthBufferFrames_ = 512;
+    int synthNumBuffers_ = 16;
+    int synthRequestedSampleRate_ = 44100; // supplied SnappySynth.cfg default
+    int synthChannels_ = 2;
+    int synthBitsPerSample_ = 32;
+    bool synthRealtimePriority_ = true;
+    int synthWorkers_ = 0;             // 0 = original auto policy
+    int synthWorkerCount_ = 0;         // actual source-selected workers
+    int synthNoteSharding_ = 0;        // 0 auto, 1 channel, 2 hash
+    bool synthStealScoreCache_ = true;
+    bool synthFastNoteOff_ = true;
+    bool synthValidateState_ = false;
+    bool synthSoftClip_ = true;
     bool synthOverlapGain_ = false;
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;
     std::size_t synthGroupCursor_ = 0;
+    std::size_t synthSysExCursor_ = 0;
     double synthScheduledUntil_ = 0.0;
 
     std::vector<uint32_t> synthMessages_;

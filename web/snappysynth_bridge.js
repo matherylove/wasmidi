@@ -11,16 +11,39 @@
         status: "SnappySynthV2 idle",
         sampleRate: 0,
         activeVoices: 0,
+        freeVoices: 0,
+        steals: 0,
         underruns: 0,
+        layers: 0,
         regions: 0,
         playing: false,
         starved: false,
         audioClock: 0.0,
         audioClockPerf: 0.0,
+
+        // SnappySynth.cfg / source-exposed settings.
         maxVoices: 16384,
+        minVoices: 0,
         blockFrames: 512,
+        numBuffers: 16,
+        requestedSampleRate: 44100, // supplied SnappySynth.cfg default
+        channels: 2,
+        bitsPerSample: 32,
+        realtimePriority: true,
+
+        // voice.c runtime tuning envs.
+        workers: 0,            // 0 = auto
+        workerCount: 0,        // actual source-selected worker count
+        noteSharding: 0,       // 0 auto, 1 channel, 2 hash
+        stealScoreCache: true,
+        fastNoteOff: true,
+        validateState: false,
+
+        // Voice renderer runtime switches.
+        softClip: true,
         overlapGain: false,
-        volume: 0.80
+
+        volume: 1.00
     };
 
     let context = null;
@@ -72,10 +95,20 @@
                     "The Pages COI service worker has not taken control yet; reload the page and select the SF2 again.");
             }
 
+            const audioOptions = {
+                latencyHint: "interactive"
+            };
+
+            // AudioContext supports a requested sample rate in modern browsers.
+            // The actual device/context rate is still authoritative and is sent
+            // to the synth core after construction so pitch never drifts.
+            if (state.requestedSampleRate > 0)
+                audioOptions.sampleRate =
+                    state.requestedSampleRate;
+
             context =
-                new AudioContext({
-                    latencyHint: "interactive"
-                });
+                new AudioContext(
+                    audioOptions);
 
             state.sampleRate =
                 Math.round(
@@ -124,7 +157,14 @@
             node.port.postMessage({
                 type: "config",
                 blockFrames:
-                    state.blockFrames
+                    state.blockFrames,
+                numBuffers:
+                    state.numBuffers
+            });
+
+            node.port.postMessage({
+                type: "volume",
+                value: state.volume
             });
 
             worker.onmessage = event => {
@@ -142,6 +182,24 @@
                             0,
                             Math.round(
                                 data.activeVoices));
+
+                if (Number.isFinite(data.freeVoices))
+                    state.freeVoices = Math.max(0, Math.round(data.freeVoices));
+                if (Number.isFinite(data.steals))
+                    state.steals = Math.max(0, Math.round(data.steals));
+                if (Number.isFinite(data.layers))
+                    state.layers = Math.max(0, Math.round(data.layers));
+                if (Number.isFinite(data.regions))
+                    state.regions = Math.max(0, Math.round(data.regions));
+
+                if (Number.isFinite(data.workerCount))
+                    state.workerCount = Math.max(0, Math.round(data.workerCount));
+                if (Number.isFinite(data.channels))
+                    state.channels = Number(data.channels) === 1 ? 1 : 2;
+                if (Number.isFinite(data.bitsPerSample))
+                    state.bitsPerSample = Number(data.bitsPerSample) === 16 ? 16 : 32;
+                if (Number.isFinite(data.numBuffers))
+                    state.numBuffers = Math.max(1, Math.round(data.numBuffers));
 
                 switch (data.type) {
                 case "ready":
@@ -197,6 +255,31 @@
                     break;
 
                 case "configured":
+                    if (typeof data.loaded === "boolean")
+                        state.soundfontLoaded = data.loaded;
+
+                    if (Number.isFinite(data.maxVoices))
+                        state.maxVoices = Math.max(1, Math.round(data.maxVoices));
+                    if (Number.isFinite(data.minVoices))
+                        state.minVoices = Math.max(0, Math.round(data.minVoices));
+                    if (Number.isFinite(data.blockFrames))
+                        state.blockFrames = Math.max(1, Math.round(data.blockFrames));
+                    if (Number.isFinite(data.requestedWorkers))
+                        state.workers = Math.max(0, Math.round(data.requestedWorkers));
+                    if (Number.isFinite(data.noteSharding))
+                        state.noteSharding = Math.max(0, Math.min(2, Math.round(data.noteSharding)));
+                    if (typeof data.stealScoreCache === "boolean")
+                        state.stealScoreCache = data.stealScoreCache;
+                    if (typeof data.fastNoteOff === "boolean")
+                        state.fastNoteOff = data.fastNoteOff;
+                    if (typeof data.validateState === "boolean")
+                        state.validateState = data.validateState;
+                    if (typeof data.softClip === "boolean")
+                        state.softClip = data.softClip;
+                    if (typeof data.realtimePriority === "number" ||
+                        typeof data.realtimePriority === "boolean")
+                        state.realtimePriority = !!data.realtimePriority;
+
                     updateStatus(
                         state.soundfontLoaded
                             ? "SF2 ready"
@@ -257,14 +340,30 @@
                     state.sampleRate,
                 maxVoices:
                     state.maxVoices,
+                minVoices:
+                    state.minVoices,
                 blockFrames:
-                    state.blockFrames
-            });
-
-            worker.postMessage({
-                type: "volume",
-                value:
-                    state.volume
+                    state.blockFrames,
+                numBuffers:
+                    state.numBuffers,
+                channels:
+                    state.channels,
+                bitsPerSample:
+                    state.bitsPerSample,
+                realtimePriority:
+                    state.realtimePriority,
+                workers:
+                    state.workers,
+                noteSharding:
+                    state.noteSharding,
+                stealScoreCache:
+                    state.stealScoreCache,
+                fastNoteOff:
+                    state.fastNoteOff,
+                validateState:
+                    state.validateState,
+                softClip:
+                    state.softClip
             });
 
             worker.postMessage({
@@ -298,12 +397,11 @@
         if (!file)
             return false;
 
-        state.soundfontLoaded = false;
-        state.soundfontName =
-            copyFileName(file);
+        const addingLayer = state.soundfontLoaded;
+        state.soundfontName = copyFileName(file);
 
         updateStatus(
-            "Loading SF2…");
+            addingLayer ? "Adding SoundFont layer…" : "Loading SF2…");
 
         try {
             await ensureBackend();
@@ -531,6 +629,29 @@
         ]);
     }
 
+    function scheduleSysEx(bytes, time) {
+        if (!worker || !state.soundfontLoaded || !(bytes instanceof Uint8Array))
+            return;
+        worker.postMessage({
+            type: "sysex",
+            bytes,
+            time: Math.max(0.0, Number(time) || 0.0)
+        }, [bytes.buffer]);
+    }
+
+    function clearSoundfonts() {
+        state.soundfontLoaded = false;
+        state.soundfontName = "";
+        state.layers = 0;
+        state.regions = 0;
+        updateStatus("SnappySynthV2 ready — load an SF2");
+        if (worker) worker.postMessage({ type: "clearSoundfonts" });
+        if (node) {
+            node.port.postMessage({ type: "pause" });
+            node.port.postMessage({ type: "flush", time: 0.0 });
+        }
+    }
+
     function setVolume(percent) {
         state.volume =
             Math.max(
@@ -540,11 +661,12 @@
                     Number(percent) /
                     100.0));
 
-        if (worker) {
-            worker.postMessage({
+        // UI volume is an output gain after SnappySynth. This does not overwrite
+        // the synth's MIDI Universal Master Volume / GS state.
+        if (node) {
+            node.port.postMessage({
                 type: "volume",
-                value:
-                    state.volume
+                value: state.volume
             });
         }
     }
@@ -562,16 +684,112 @@
         }
     }
 
-    function configure(maxVoices, frames) {
-        state.maxVoices =
-            Math.max(
-                128,
-                Number(maxVoices) | 0);
+    function configure(options, legacyFrames) {
+        // Backward compatibility with Pass 9/10 callers.
+        if (typeof options !== "object" || options === null) {
+            options = {
+                maxVoices: options,
+                blockFrames: legacyFrames
+            };
+        }
 
-        state.blockFrames =
-            Math.max(
-                128,
-                Number(frames) | 0);
+        if (Number.isFinite(Number(options.maxVoices))) {
+            state.maxVoices =
+                Math.max(
+                    1,
+                    Math.min(
+                        5000000,
+                        Number(options.maxVoices) |
+                        0));
+        }
+
+        if (Number.isFinite(Number(options.minVoices))) {
+            state.minVoices =
+                Math.max(
+                    0,
+                    Math.min(
+                        5000000,
+                        Number(options.minVoices) |
+                        0));
+        }
+
+        if (Number.isFinite(Number(options.blockFrames))) {
+            state.blockFrames =
+                Math.max(
+                    1,
+                    Math.min(
+                        65536,
+                        Number(options.blockFrames) |
+                        0));
+        }
+
+        if (Number.isFinite(Number(options.numBuffers))) {
+            state.numBuffers =
+                Math.max(
+                    1,
+                    Math.min(
+                        128,
+                        Number(options.numBuffers) |
+                        0));
+        }
+
+        if (Number.isFinite(Number(options.requestedSampleRate))) {
+            state.requestedSampleRate =
+                Math.max(
+                    0,
+                    Math.min(
+                        384000,
+                        Number(options.requestedSampleRate) |
+                        0));
+        }
+
+        if (Number.isFinite(Number(options.channels)))
+            state.channels =
+                Number(options.channels) === 1 ? 1 : 2;
+
+        if (Number.isFinite(Number(options.bitsPerSample)))
+            state.bitsPerSample =
+                Number(options.bitsPerSample) === 16 ? 16 : 32;
+
+        if (typeof options.realtimePriority === "boolean")
+            state.realtimePriority =
+                options.realtimePriority;
+
+        if (Number.isFinite(Number(options.workers))) {
+            state.workers =
+                Math.max(
+                    0,
+                    Math.min(
+                        256,
+                        Number(options.workers) |
+                        0));
+        }
+
+        if (Number.isFinite(Number(options.noteSharding))) {
+            state.noteSharding =
+                Math.max(
+                    0,
+                    Math.min(
+                        2,
+                        Number(options.noteSharding) |
+                        0));
+        }
+
+        if (typeof options.stealScoreCache === "boolean")
+            state.stealScoreCache =
+                options.stealScoreCache;
+
+        if (typeof options.fastNoteOff === "boolean")
+            state.fastNoteOff =
+                options.fastNoteOff;
+
+        if (typeof options.validateState === "boolean")
+            state.validateState =
+                options.validateState;
+
+        if (typeof options.softClip === "boolean")
+            state.softClip =
+                options.softClip;
 
         if (node) {
             node.port.postMessage({
@@ -587,14 +805,15 @@
             node.port.postMessage({
                 type: "config",
                 blockFrames:
-                    state.blockFrames
+                    state.blockFrames,
+                numBuffers:
+                    state.numBuffers
             });
         }
 
         if (worker) {
-            // Reinitializing the voice engine invalidates the loaded instrument
-            // for a moment. Expose that transition so Qt does not try to prime
-            // playback against the old core generation.
+            // Core reinitialization preserves the merged instrument and reapplies
+            // presampling at the active AudioContext sample rate.
             state.soundfontLoaded = false;
 
             worker.postMessage({
@@ -603,13 +822,37 @@
                     state.sampleRate,
                 maxVoices:
                     state.maxVoices,
+                minVoices:
+                    state.minVoices,
                 blockFrames:
-                    state.blockFrames
+                    state.blockFrames,
+                numBuffers:
+                    state.numBuffers,
+                channels:
+                    state.channels,
+                bitsPerSample:
+                    state.bitsPerSample,
+                realtimePriority:
+                    state.realtimePriority,
+                workers:
+                    state.workers,
+                noteSharding:
+                    state.noteSharding,
+                stealScoreCache:
+                    state.stealScoreCache,
+                fastNoteOff:
+                    state.fastNoteOff,
+                validateState:
+                    state.validateState,
+                softClip:
+                    state.softClip
             });
         }
 
         updateStatus(
-            "Reconfiguring SnappySynthV2…");
+            worker
+                ? "Reconfiguring SnappySynthV2…"
+                : "SnappySynthV2 settings ready");
     }
 
     globalThis.WasmidiSnappyBridge = {
@@ -622,6 +865,8 @@
         stop,
         seek,
         schedule,
+        scheduleSysEx,
+        clearSoundfonts,
         setVolume,
         setOverlapGain,
         configure,

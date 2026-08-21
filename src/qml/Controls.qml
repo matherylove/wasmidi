@@ -10,8 +10,7 @@ Item {
     signal colorRequested(int channel)
 
     property var postValues: [-1, 0.0, 0.1, 0.5, 1.0, 2.0]
-    property var synthVoiceValues: [2048, 4096, 8192, 16384, 32768, 65536, 131072]
-    property var synthBufferValues: [128, 256, 512, 1024, 2048]
+    property bool synthAdvancedVisible: false
 
     component SectionLabel: Text {
         color: "#6f6685"
@@ -44,6 +43,32 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
+        }
+    }
+
+    component ConfigField: TextField {
+        id: control
+        property int minValue: 0
+        property int maxValue: 2147483647
+        implicitHeight: 23
+        color: "#c4b5fd"
+        font.pixelSize: 8
+        font.bold: true
+        horizontalAlignment: Text.AlignRight
+        verticalAlignment: Text.AlignVCenter
+        selectByMouse: true
+        leftPadding: 5
+        rightPadding: 5
+        validator: IntValidator {
+            bottom: control.minValue
+            top: control.maxValue
+        }
+        background: Rectangle {
+            radius: 5
+            color: "#151126"
+            border.color: control.activeFocus ? "#7652d6" : "#352550"
+            border.width: 1
+            opacity: control.enabled ? 1.0 : 0.55
         }
     }
 
@@ -594,16 +619,26 @@ Item {
             }
 
             FlatButton {
-                Layout.preferredWidth: 61
+                Layout.preferredWidth: 68
                 implicitHeight: 21
-                text: "Load SF2"
+                enabled: !root.mainWindow.isPlaying
+                text: root.mainWindow.soundfontLoaded ? "Add Layer" : "Load SF2"
                 onClicked: root.mainWindow.openSoundfontPicker()
+            }
+
+            FlatButton {
+                Layout.preferredWidth: 43
+                implicitHeight: 21
+                visible: root.mainWindow.soundfontLoaded
+                enabled: !root.mainWindow.isPlaying
+                text: "Clear"
+                onClicked: root.mainWindow.clearSoundfonts()
             }
         }
 
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 126
+            Layout.preferredHeight: root.synthAdvancedVisible ? 336 : 188
             radius: 6
             color: "#0c0a1a"
             border.color: "#211834"
@@ -635,6 +670,14 @@ Item {
                         font.bold: root.mainWindow.soundfontLoaded
                         elide: Text.ElideMiddle
                     }
+
+                    Text {
+                        text: root.formatInteger(root.mainWindow.synthLayers) + " layer" +
+                              (root.mainWindow.synthLayers === 1 ? "" : "s")
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
                 }
 
                 Text {
@@ -650,33 +693,86 @@ Item {
                     spacing: 4
 
                     Text { text: "Voices"; color: "#6c627d"; font.pixelSize: 8 }
-                    FlatButton {
-                        Layout.preferredWidth: 61
-                        implicitHeight: 21
+                    ConfigField {
+                        id: maxVoicesField
+                        Layout.preferredWidth: 72
                         enabled: !root.mainWindow.isPlaying
-                        text: root.formatInteger(root.mainWindow.synthMaxVoices)
-                        onClicked: root.cycleSynthMaxVoices()
+                        minValue: 1
+                        maxValue: 5000000
+                        text: String(root.mainWindow.synthMaxVoices)
+                        onEditingFinished: {
+                            var n = parseInt(text)
+                            if (isFinite(n))
+                                root.mainWindow.synthMaxVoices = n
+                            text = String(root.mainWindow.synthMaxVoices)
+                        }
                     }
 
-                    Text { text: "Buffer"; color: "#6c627d"; font.pixelSize: 8 }
+                    Text { text: "Block"; color: "#6c627d"; font.pixelSize: 8 }
+                    ConfigField {
+                        id: blockFramesField
+                        Layout.preferredWidth: 55
+                        enabled: !root.mainWindow.isPlaying
+                        minValue: 1
+                        maxValue: 65536
+                        text: String(root.mainWindow.synthBufferFrames)
+                        onEditingFinished: {
+                            var n = parseInt(text)
+                            if (isFinite(n))
+                                root.mainWindow.synthBufferFrames = n
+                            text = String(root.mainWindow.synthBufferFrames)
+                        }
+                    }
+
+                    Text { text: "Bufs"; color: "#6c627d"; font.pixelSize: 8 }
+                    ConfigField {
+                        id: numBuffersField
+                        Layout.preferredWidth: 40
+                        enabled: !root.mainWindow.isPlaying
+                        minValue: 1
+                        maxValue: 128
+                        text: String(root.mainWindow.synthNumBuffers)
+                        onEditingFinished: {
+                            var n = parseInt(text)
+                            if (isFinite(n))
+                                root.mainWindow.synthNumBuffers = n
+                            text = String(root.mainWindow.synthNumBuffers)
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
                     FlatButton {
-                        Layout.preferredWidth: 47
+                        Layout.preferredWidth: 76
+                        implicitHeight: 21
+                        text: "Stack gain"
+                        normalColor: root.mainWindow.synthOverlapGain ? "#2a194b" : "#110e20"
+                        borderColor: root.mainWindow.synthOverlapGain ? "#6b48a8" : "#352550"
+                        textColor: root.mainWindow.synthOverlapGain ? "#c4b5fd" : "#746a87"
+                        onClicked: root.mainWindow.synthOverlapGain = !root.mainWindow.synthOverlapGain
+                    }
+
+                    FlatButton {
+                        Layout.preferredWidth: 68
                         implicitHeight: 21
                         enabled: !root.mainWindow.isPlaying
-                        text: root.mainWindow.synthBufferFrames + "f"
-                        onClicked: root.cycleSynthBuffer()
+                        text: "Soft clip"
+                        normalColor: root.mainWindow.synthSoftClip ? "#2a194b" : "#110e20"
+                        borderColor: root.mainWindow.synthSoftClip ? "#6b48a8" : "#352550"
+                        textColor: root.mainWindow.synthSoftClip ? "#c4b5fd" : "#746a87"
+                        onClicked: root.mainWindow.synthSoftClip = !root.mainWindow.synthSoftClip
                     }
 
                     Item { Layout.fillWidth: true }
 
                     FlatButton {
-                        Layout.preferredWidth: 79
+                        Layout.preferredWidth: 72
                         implicitHeight: 21
-                        text: "Overlap gain"
-                        normalColor: root.mainWindow.synthOverlapGain ? "#2a194b" : "#110e20"
-                        borderColor: root.mainWindow.synthOverlapGain ? "#6b48a8" : "#352550"
-                        textColor: root.mainWindow.synthOverlapGain ? "#c4b5fd" : "#746a87"
-                        onClicked: root.mainWindow.synthOverlapGain = !root.mainWindow.synthOverlapGain
+                        text: root.synthAdvancedVisible ? "Advanced ▲" : "Advanced ▼"
+                        onClicked: root.synthAdvancedVisible = !root.synthAdvancedVisible
                     }
                 }
 
@@ -694,15 +790,22 @@ Item {
                     }
 
                     Text {
-                        text: "VOICES " + root.formatInteger(root.mainWindow.synthActiveVoices)
+                        text: "ACTIVE " + root.formatInteger(root.mainWindow.synthActiveVoices)
                         color: "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }
 
                     Text {
-                        text: "UNDERRUNS " + root.formatInteger(root.mainWindow.synthUnderruns)
-                        color: root.mainWindow.synthUnderruns > 0 ? "#fb923c" : "#70667e"
+                        text: "FREE " + root.formatInteger(root.mainWindow.synthFreeVoices)
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+
+                    Text {
+                        text: "STEALS " + root.formatInteger(root.mainWindow.synthSteals)
+                        color: root.mainWindow.synthSteals > 0 ? "#fb923c" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }
@@ -710,9 +813,233 @@ Item {
                     Item { Layout.fillWidth: true }
                 }
 
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 7
+                    Text {
+                        text: "WORKERS " +
+                              (root.mainWindow.synthWorkerCount > 0
+                                  ? root.formatInteger(root.mainWindow.synthWorkerCount)
+                                  : "—")
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        text: "REGIONS " + root.formatInteger(root.mainWindow.synthRegions)
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        text: "UNDERRUNS " + root.formatInteger(root.mainWindow.synthUnderruns)
+                        color: root.mainWindow.synthUnderruns > 0 ? "#fb923c" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: root.synthAdvancedVisible
+                    spacing: 5
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: "#211834"
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Text { text: "Rate req"; color: "#6c627d"; font.pixelSize: 8 }
+                        ConfigField {
+                            id: requestedRateField
+                            Layout.preferredWidth: 67
+                            enabled: !root.mainWindow.synthReady
+                            minValue: 0
+                            maxValue: 384000
+                            text: String(root.mainWindow.synthRequestedSampleRate)
+                            onEditingFinished: {
+                                var n = parseInt(text)
+                                if (isFinite(n))
+                                    root.mainWindow.synthRequestedSampleRate = n
+                                text = String(root.mainWindow.synthRequestedSampleRate)
+                            }
+                            ToolTip.visible: hovered
+                            ToolTip.text: "0 = browser/device default. Change before the audio backend starts."
+                        }
+
+                        Text { text: "Ch"; color: "#6c627d"; font.pixelSize: 8 }
+                        FlatButton {
+                            Layout.preferredWidth: 39
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: root.mainWindow.synthChannels === 1 ? "1" : "2"
+                            onClicked: root.mainWindow.synthChannels =
+                                root.mainWindow.synthChannels === 1 ? 2 : 1
+                        }
+
+                        Text { text: "Bits"; color: "#6c627d"; font.pixelSize: 8 }
+                        FlatButton {
+                            Layout.preferredWidth: 42
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: String(root.mainWindow.synthBitsPerSample)
+                            onClicked: root.mainWindow.synthBitsPerSample =
+                                root.mainWindow.synthBitsPerSample === 16 ? 32 : 16
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Text { text: "Min voices"; color: "#6c627d"; font.pixelSize: 8 }
+                        ConfigField {
+                            id: minVoicesField
+                            Layout.preferredWidth: 68
+                            enabled: !root.mainWindow.isPlaying
+                            minValue: 0
+                            maxValue: 5000000
+                            text: String(root.mainWindow.synthMinVoices)
+                            onEditingFinished: {
+                                var n = parseInt(text)
+                                if (isFinite(n))
+                                    root.mainWindow.synthMinVoices = n
+                                text = String(root.mainWindow.synthMinVoices)
+                            }
+                        }
+
+                        Text { text: "Workers"; color: "#6c627d"; font.pixelSize: 8 }
+                        ConfigField {
+                            id: workersField
+                            Layout.preferredWidth: 43
+                            enabled: !root.mainWindow.isPlaying
+                            minValue: 0
+                            maxValue: 256
+                            text: String(root.mainWindow.synthWorkers)
+                            onEditingFinished: {
+                                var n = parseInt(text)
+                                if (isFinite(n))
+                                    root.mainWindow.synthWorkers = n
+                                text = String(root.mainWindow.synthWorkers)
+                            }
+                            ToolTip.visible: hovered
+                            ToolTip.text: "0 = original auto policy / all eligible logical cores."
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Text { text: "Sharding"; color: "#6c627d"; font.pixelSize: 8 }
+                        FlatButton {
+                            Layout.preferredWidth: 64
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: root.mainWindow.synthNoteSharding === 1 ? "Channel"
+                                : root.mainWindow.synthNoteSharding === 2 ? "Hash"
+                                : "Auto"
+                            onClicked: root.mainWindow.synthNoteSharding =
+                                (root.mainWindow.synthNoteSharding + 1) % 3
+                        }
+
+                        FlatButton {
+                            Layout.preferredWidth: 67
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: "RT priority"
+                            normalColor: root.mainWindow.synthRealtimePriority ? "#2a194b" : "#110e20"
+                            borderColor: root.mainWindow.synthRealtimePriority ? "#6b48a8" : "#352550"
+                            textColor: root.mainWindow.synthRealtimePriority ? "#c4b5fd" : "#746a87"
+                            onClicked: root.mainWindow.synthRealtimePriority =
+                                !root.mainWindow.synthRealtimePriority
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Preserves AudioConfig.realtime_priority. Browser thread priority itself is OS/browser managed."
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        FlatButton {
+                            Layout.preferredWidth: 78
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: "Steal cache"
+                            normalColor: root.mainWindow.synthStealScoreCache ? "#2a194b" : "#110e20"
+                            borderColor: root.mainWindow.synthStealScoreCache ? "#6b48a8" : "#352550"
+                            textColor: root.mainWindow.synthStealScoreCache ? "#c4b5fd" : "#746a87"
+                            onClicked: root.mainWindow.synthStealScoreCache =
+                                !root.mainWindow.synthStealScoreCache
+                        }
+
+                        FlatButton {
+                            Layout.preferredWidth: 83
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: "Fast note-off"
+                            normalColor: root.mainWindow.synthFastNoteOff ? "#2a194b" : "#110e20"
+                            borderColor: root.mainWindow.synthFastNoteOff ? "#6b48a8" : "#352550"
+                            textColor: root.mainWindow.synthFastNoteOff ? "#c4b5fd" : "#746a87"
+                            onClicked: root.mainWindow.synthFastNoteOff =
+                                !root.mainWindow.synthFastNoteOff
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        FlatButton {
+                            Layout.preferredWidth: 84
+                            implicitHeight: 21
+                            enabled: !root.mainWindow.isPlaying
+                            text: "Validate state"
+                            normalColor: root.mainWindow.synthValidateState ? "#4a2331" : "#110e20"
+                            borderColor: root.mainWindow.synthValidateState ? "#a94d68" : "#352550"
+                            textColor: root.mainWindow.synthValidateState ? "#fb7185" : "#746a87"
+                            onClicked: root.mainWindow.synthValidateState =
+                                !root.mainWindow.synthValidateState
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Debug consistency checks from SS_VALIDATE_STATE. Slower; leave off for performance."
+                        }
+
+                        Item { Layout.fillWidth: true }
+
+                        Text {
+                            text: "Audio: AudioWorklet"
+                            color: "#4f485b"
+                            font.pixelSize: 7
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Source-only desktop options: AudioAPI=WinMM/DirectSound and GPU DirectCompute mixer are not available in browser WASM."
+                        color: "#484252"
+                        font.pixelSize: 7
+                        wrapMode: Text.Wrap
+                    }
+                }
+
                 Text {
                     Layout.fillWidth: true
-                    text: "Worker → SnappySynthV2 WASM → AudioWorklet → system audio"
+                    text: "Worker → original SnappySynthV2 voice engine → AudioWorklet → system audio"
                     color: "#484252"
                     font.pixelSize: 7
                     elide: Text.ElideRight
@@ -794,29 +1121,6 @@ Item {
             (decimalPart.length > 0 ? "." + decimalPart : "")
     }
 
-    function cycleSynthMaxVoices() {
-        var current = root.mainWindow.synthMaxVoices
-        var next = root.synthVoiceValues[0]
-        for (var i = 0; i < root.synthVoiceValues.length; ++i) {
-            if (root.synthVoiceValues[i] >= current) {
-                next = root.synthVoiceValues[(i + 1) % root.synthVoiceValues.length]
-                break
-            }
-        }
-        root.mainWindow.synthMaxVoices = next
-    }
-
-    function cycleSynthBuffer() {
-        var current = root.mainWindow.synthBufferFrames
-        var next = root.synthBufferValues[0]
-        for (var i = 0; i < root.synthBufferValues.length; ++i) {
-            if (root.synthBufferValues[i] >= current) {
-                next = root.synthBufferValues[(i + 1) % root.synthBufferValues.length]
-                break
-            }
-        }
-        root.mainWindow.synthBufferFrames = next
-    }
 
     function formatTime(seconds) {
         var s = Math.max(0, Math.floor(seconds))

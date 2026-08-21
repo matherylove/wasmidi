@@ -1,43 +1,47 @@
-# WASMIDI Pass 9.4 — SnappySynthV2 pthread startup + ready race fix
+# WASMIDI Pass 10 — SnappySynthV2 source-fidelity engine
 
-Apply on top of Pass 9.3.
+This pass is based directly on the complete SnappySynthV2 archive supplied by
+the WASMIDI owner. Windows/KDMAPI/device plumbing remains excluded, but synth
+behavior is taken from the original source rather than approximated.
 
-## Browser error fixed
+## Performance restored
+- Voice engine worker policy restored from the original: `VOICE_WORKER_COUNT=0`
+  (all logical cores / source's own low-cap reductions).
+- Emscripten pthread pool uses `navigator.hardwareConcurrency`.
+- Browser `GetSystemInfo()` returns Emscripten logical core count instead of 2.
+- The original O(1)/sampled steal system remains untouched.
+- UI now exposes real `VoiceStats.steals` and free voices.
 
-Chrome showed:
+## Max Voices
+- User can type an exact voice count instead of cycling presets.
+- Accepted source-compatible range: 1..5,000,000.
+- Browser memory limits still apply at extreme settings.
 
-    snappysynth-core.worker.js:
-    TypeError: Failed to execute 'createObjectURL' on 'URL':
-    Overload resolution failed.
+## SoundFont layers / stack
+The original `SnappySynth_LoadSoundfont()` behavior is restored:
+- first SF2 becomes the base instrument;
+- additional SF2 files are appended;
+- later matching bank/program presets override earlier matching presets;
+- non-conflicting presets remain available;
+- sample caches and region cache invalidation follow the original functions.
 
-Emscripten's generated pthread worker was receiving `urlOrBlob=undefined`.
-This happens because `snappysynth-core.js` is MODULARIZE+pthreads and is loaded
-with importScripts() from another browser Worker. In that context the generated
-runtime cannot reliably infer the URL of its own main JS file.
+Use `Add Layer` repeatedly; `Clear` unloads the complete stack.
 
-The worker now instantiates SnappySynthCore with:
+## Audio fidelity
+- Realtime float output keeps SnappySynthV2's original soft clip/limiter path.
+- UI volume is now post-synth AudioWorklet gain; it no longer overwrites MIDI
+  Universal Master Volume inside SnappySynth.
+- Default UI output volume is 100%.
+- Original VOR stack mode remains default (`VOR=1`); `Stack gain` toggles mode 0.
+- GM/GM2, GS reset, XG reset, Universal Master Volume, GS receive-channel map,
+  GS drum-part assignment and GS scale tuning SysEx are routed through logic
+  adapted directly from the original `snappysynth.c`.
+- Short MIDI events honor the original GS part remapping path instead of calling
+  `voice_send_short_at()` blindly.
 
-    mainScriptUrlOrBlob:
-        new URL("./snappysynth-core.js", self.location.href).href
-
-and `locateFile()` also returns absolute URLs derived from the outer worker URL.
-
-## Second race fixed
-
-The console also showed:
-
-    SnappySynthV2 core is still starting.
-
-`ensureBackend()` previously returned after creating the Worker, not after the
-SnappySynth WASM module was ready. A fast SF2 selection therefore posted
-`loadSoundfont` while `Module === null`.
-
-The bridge now owns a `workerReadyPromise`:
-- resolves only on worker message `type: "ready"`
-- rejects on startup `type: "error"` or Worker.onerror
-- `ensureBackend()` awaits it
-- `loadSoundfontFile()` cannot send the SF2 before core initialization finishes
-
-Files:
-- web/snappysynth-worker.js
-- web/snappysynth_bridge.js
+## Browser-only adaptations retained
+- Windows audio/KDMAPI/configurator are not compiled.
+- Audio device output is AudioWorklet float32.
+- WORKERFS supplies selected SF2 files.
+- x86 intrinsics are guarded on wasm32; the previously-required scalar VOR
+  helper remains for non-AVX2 builds.

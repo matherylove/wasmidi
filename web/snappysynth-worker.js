@@ -10,14 +10,30 @@ let audioPort = null;
 
 let sampleRateHz = 44100;
 let blockFrames = 512;
+let numBuffers = 16;
 let maxVoices = 16384;
-let volume = 0.80;
+let minVoices = 0;
+let synthChannels = 2;
+let bitsPerSample = 32;
+let realtimePriority = 1;
+
+let requestedWorkers = 0;     // 0 = original automatic policy
+let noteSharding = 0;         // 0 auto, 1 channel, 2 hash
+let stealScoreCache = true;   // source default ON
+let fastNoteOff = true;       // source default ON
+let validateState = false;    // source default OFF
+let softClip = true;          // source realtime default ON
+
+let volume = 1.00;
 let vorMode = 1; // 1 = one-voice loudness for exact overlap
 
-let soundfontFile = null;
-let soundfontPath = "";
-let soundfontMounted = false;
+let soundfontFiles = [];
+let soundfontPaths = [];
+let soundfontMounts = [];
 let soundfontLoaded = false;
+let sysexEvents = [];
+let sysexPtr = 0;
+let sysexCapacity = 0;
 
 let playing = false;
 let renderSongTime = 0.0;
@@ -41,9 +57,23 @@ function postState(type, extra = {}) {
         type,
         sampleRate: sampleRateHz,
         activeVoices:
-            coreReady && Module
-                ? Module._ssw_active_voices()
-                : 0
+            coreReady && Module ? Module._ssw_active_voices() : 0,
+        freeVoices:
+            coreReady && Module ? Module._ssw_free_voices() : 0,
+        steals:
+            coreReady && Module ? Module._ssw_steals() : 0,
+        layers:
+            coreReady && Module ? Module._ssw_layer_count() : 0,
+        regions:
+            coreReady && Module ? Module._ssw_region_count() : 0,
+        workerCount:
+            coreReady && Module ? Module._ssw_worker_count() : 0,
+        channels:
+            coreReady && Module ? Module._ssw_channels() : synthChannels,
+        bitsPerSample:
+            coreReady && Module ? Module._ssw_bits_per_sample() : bitsPerSample,
+        numBuffers:
+            coreReady && Module ? Module._ssw_num_buffers() : numBuffers
     }, extra));
 }
 
@@ -59,6 +89,7 @@ function setError(error) {
 
 function resetEventQueue() {
     eventBatches.length = 0;
+    sysexEvents.length = 0;
     safeUntil = renderSongTime;
 }
 
@@ -113,35 +144,48 @@ function copyScratchToWasm(count) {
         offsetPtr >>> 2);
 }
 
+function ensureDir(path) {
+    try { Module.FS.mkdir(path); } catch (_) {}
+}
+
 function mountSoundfontFile(file) {
     if (!Module || !file)
         return "";
+    if (!Module.FS)
+        throw new Error("Emscripten FS is not available in SnappySynthV2 core.");
+    if (!Module.WORKERFS)
+        throw new Error("WORKERFS is not available in SnappySynthV2 core.");
 
-    if (soundfontMounted) {
-        try {
-            Module.FS.unmount("/soundfont");
-        } catch (_) {
-        }
-        soundfontMounted = false;
-    }
-
-    try {
-        Module.FS.mkdir("/soundfont");
-    } catch (_) {
-        // Directory already exists.
-    }
+    ensureDir("/soundfonts");
+    const index = soundfontFiles.length;
+    const mount = "/soundfonts/layer" + index;
+    ensureDir(mount);
 
     Module.FS.mount(
         Module.WORKERFS,
         { files: [file] },
-        "/soundfont");
+        mount);
 
-    soundfontMounted = true;
-    soundfontPath =
-        "/soundfont/" +
-        (file.name || "soundfont.sf2");
+    const path = mount + "/" + (file.name || ("layer" + index + ".sf2"));
+    const stat = Module.FS.stat(path);
+    if (!stat || stat.size <= 0) {
+        try { Module.FS.unmount(mount); } catch (_) {}
+        throw new Error("Selected SF2 is empty or WORKERFS could not expose it.");
+    }
 
-    return soundfontPath;
+    soundfontFiles.push(file);
+    soundfontPaths.push(path);
+    soundfontMounts.push(mount);
+    return path;
+}
+
+function unmountAllSoundfonts() {
+    for (let i = soundfontMounts.length - 1; i >= 0; --i) {
+        try { Module.FS.unmount(soundfontMounts[i]); } catch (_) {}
+    }
+    soundfontFiles.length = 0;
+    soundfontPaths.length = 0;
+    soundfontMounts.length = 0;
 }
 
 function callLoadSoundfont(path) {
@@ -167,7 +211,8 @@ function callLoadSoundfont(path) {
 }
 
 function applyCoreSettings() {
-    Module._ssw_set_volume(volume);
+    // MIDI master volume belongs to the synth and may be changed by SysEx.
+    // UI volume is applied after synthesis in the AudioWorklet.
     Module._ssw_set_vor_mode(vorMode);
 }
 
@@ -175,11 +220,21 @@ function initCore() {
     if (!Module)
         return;
 
-    Module._ssw_init(
+    Module._ssw_init_ex(
         sampleRateHz,
-        2,
+        synthChannels,
+        bitsPerSample,
         blockFrames,
-        maxVoices);
+        numBuffers,
+        realtimePriority,
+        maxVoices,
+        minVoices,
+        requestedWorkers,
+        noteSharding,
+        stealScoreCache ? 1 : 0,
+        fastNoteOff ? 1 : 0,
+        validateState ? 1 : 0,
+        softClip ? 1 : 0);
 
     applyCoreSettings();
     coreReady = true;
@@ -189,39 +244,35 @@ function reinitializeCore() {
     if (!Module)
         return;
 
-    Module._ssw_shutdown();
     freeScratch();
-
     coreReady = false;
-    soundfontLoaded = false;
 
+    // ssw_init() reinitializes only the voice engine and deliberately preserves
+    // the already-loaded merged instrument, matching SnappySynth config reload.
     initCore();
 
-    if (soundfontFile && soundfontPath) {
-        const regions =
-            callLoadSoundfont(
-                soundfontPath);
+    soundfontLoaded =
+        Module._ssw_region_count() > 0;
 
-        soundfontLoaded =
-            regions > 0;
-
-        postState(
-            soundfontLoaded
-                ? "soundfont"
-                : "error",
-            soundfontLoaded
-                ? {
-                    loaded: true,
-                    name:
-                        soundfontFile.name ||
-                        "soundfont.sf2",
-                    regions
-                }
-                : {
-                    message:
-                        "SnappySynthV2 could not reload the selected SF2."
-                });
-    }
+    postState("configured", {
+        maxVoices,
+        minVoices,
+        blockFrames,
+        numBuffers,
+        channels: synthChannels,
+        bitsPerSample,
+        realtimePriority,
+        requestedWorkers,
+        workerCount: Module._ssw_worker_count(),
+        noteSharding,
+        stealScoreCache,
+        fastNoteOff,
+        validateState,
+        softClip,
+        loaded: soundfontLoaded,
+        layers: Module._ssw_layer_count(),
+        regions: Module._ssw_region_count()
+    });
 
     renderSongTime = 0.0;
     resetEventQueue();
@@ -294,6 +345,31 @@ function collectEventsForBlock(blockStart, blockEnd, frames) {
     return out;
 }
 
+function ensureSysexScratch(required) {
+    if (required <= sysexCapacity)
+        return;
+    let capacity = Math.max(256, sysexCapacity || 256);
+    while (capacity < required) capacity *= 2;
+    if (sysexPtr) Module._free(sysexPtr);
+    sysexPtr = Module._malloc(capacity);
+    if (!sysexPtr) throw new Error("Could not allocate SysEx scratch buffer.");
+    sysexCapacity = capacity;
+}
+
+function dispatchSysexForBlock(blockStart, blockEnd, frames) {
+    while (sysexEvents.length > 0 && sysexEvents[0].time < blockEnd) {
+        const event = sysexEvents.shift();
+        const bytes = event.bytes;
+        if (!(bytes instanceof Uint8Array) || bytes.length === 0)
+            continue;
+        ensureSysexScratch(bytes.length);
+        Module.HEAPU8.set(bytes, sysexPtr);
+        const frame = Math.max(0, Math.min(frames - 1,
+            Math.round((event.time - blockStart) * sampleRateHz)));
+        Module._ssw_send_sysex(sysexPtr, bytes.length, frame >>> 0);
+    }
+}
+
 function renderOneBlock(frames) {
     const blockStart =
         renderSongTime;
@@ -304,6 +380,11 @@ function renderOneBlock(frames) {
 
     if (blockEnd > safeUntil + 1e-7)
         return false;
+
+    dispatchSysexForBlock(
+        blockStart,
+        blockEnd,
+        frames);
 
     const eventCount =
         collectEventsForBlock(
@@ -321,13 +402,18 @@ function renderOneBlock(frames) {
     if (!pcmPtr)
         throw new Error("SnappySynthV2 render returned a null PCM buffer.");
 
-    const samples =
+    // Browser output remains stereo, but the synth engine itself honors the
+    // original NumChannels configuration. Mono is duplicated only at the
+    // Worker -> AudioWorklet boundary.
+    const sourceChannels =
+        Math.max(1, Module._ssw_channels() | 0);
+
+    const outputSamples =
         frames * 2;
 
-    // One unavoidable copy crosses from Shared WebAssembly memory to a
-    // transferable ArrayBuffer. PCM then travels Worker -> AudioWorklet
-    // directly through MessageChannel; the Qt/main thread never touches it.
-    const bytes = samples * 4;
+    const bytes =
+        outputSamples * 4;
+
     let buffer = null;
 
     while (pcmBufferPool.length > 0 && !buffer) {
@@ -340,13 +426,32 @@ function renderOneBlock(frames) {
         buffer = new ArrayBuffer(bytes);
 
     const pcm =
-        new Float32Array(buffer, 0, samples);
+        new Float32Array(
+            buffer,
+            0,
+            outputSamples);
 
-    pcm.set(
-        Module.HEAPF32.subarray(
-            pcmPtr >>> 2,
-            (pcmPtr >>> 2) +
-            samples));
+    const source =
+        Module.HEAPF32;
+
+    const sourceIndex =
+        pcmPtr >>> 2;
+
+    if (sourceChannels === 1) {
+        for (let i = 0; i < frames; ++i) {
+            const sample =
+                source[sourceIndex + i];
+
+            pcm[i * 2] = sample;
+            pcm[i * 2 + 1] = sample;
+        }
+    } else {
+        pcm.set(
+            source.subarray(
+                sourceIndex,
+                sourceIndex +
+                outputSamples));
+    }
 
     audioPort.postMessage({
         type: "pcm",
@@ -456,42 +561,73 @@ onmessage = async event => {
         }
 
         if (data.type === "loadSoundfont") {
-            if (!Module)
+            if (!Module || !coreReady)
                 throw new Error("SnappySynthV2 core is still starting.");
 
             const file = data.file;
-
             if (!file)
                 throw new Error("No SF2 file was provided.");
 
-            soundfontFile = file;
+            const path = mountSoundfontFile(file);
+            const regions = callLoadSoundfont(path);
+            if (regions <= 0) {
+                // Roll back the failed layer mount/list entry.
+                const mount = soundfontMounts.pop();
+                soundfontPaths.pop();
+                soundfontFiles.pop();
+                try { Module.FS.unmount(mount); } catch (_) {}
+                throw new Error(
+                    "SnappySynthV2 SF2 parser returned 0 regions for " +
+                    (file.name || "soundfont.sf2") +
+                    " (" + Number(file.size || 0) + " bytes).");
+            }
 
-            const path =
-                mountSoundfontFile(file);
-
-            Module._ssw_reset();
-
-            const regions =
-                callLoadSoundfont(path);
-
-            soundfontLoaded =
-                regions > 0;
-
+            soundfontLoaded = true;
             renderSongTime = 0.0;
             resetEventQueue();
 
-            if (!soundfontLoaded)
-                throw new Error("SnappySynthV2 could not parse this SF2.");
-
+            const layers = Module._ssw_layer_count();
             postState("soundfont", {
                 loaded: true,
-                name:
-                    file.name ||
-                    "soundfont.sf2",
-                regions
+                name: layers > 1
+                    ? (file.name || "soundfont.sf2") + " (+" + (layers - 1) + " layer" + (layers > 2 ? "s" : "") + ")"
+                    : (file.name || "soundfont.sf2"),
+                layers,
+                regions: Module._ssw_region_count()
             });
 
             pump();
+            return;
+        }
+
+        if (data.type === "clearSoundfonts") {
+            playing = false;
+            resetEventQueue();
+            Module._ssw_clear_soundfonts();
+            unmountAllSoundfonts();
+            soundfontLoaded = false;
+            renderSongTime = 0.0;
+            postState("soundfont", {
+                loaded: false,
+                name: "",
+                layers: 0,
+                regions: 0
+            });
+            return;
+        }
+
+        if (data.type === "sysex") {
+            const bytes = data.bytes;
+            if (bytes instanceof Uint8Array && bytes.length > 0) {
+                const event = {
+                    bytes,
+                    time: Math.max(0.0, Number(data.time) || 0.0)
+                };
+                // C++ sends in chronological order; retain a defensive ordered insertion.
+                let pos = sysexEvents.length;
+                while (pos > 0 && sysexEvents[pos - 1].time > event.time) --pos;
+                sysexEvents.splice(pos, 0, event);
+            }
             return;
         }
 
@@ -573,17 +709,7 @@ onmessage = async event => {
         }
 
         if (data.type === "volume") {
-            volume =
-                Math.max(
-                    0.0,
-                    Math.min(
-                        1.0,
-                        Number(data.value) ||
-                        0.0));
-
-            if (coreReady)
-                Module._ssw_set_volume(volume);
-
+            volume = Math.max(0.0, Math.min(1.0, Number(data.value) || 0.0));
             return;
         }
 
@@ -610,23 +736,117 @@ onmessage = async event => {
 
             maxVoices =
                 Math.max(
-                    128,
-                    Number(data.maxVoices) |
-                    0);
+                    1,
+                    Math.min(
+                        5000000,
+                        Number(data.maxVoices) |
+                        0));
+
+            minVoices =
+                Math.max(
+                    0,
+                    Math.min(
+                        5000000,
+                        Number(data.minVoices) |
+                        0));
 
             blockFrames =
                 Math.max(
-                    128,
+                    1,
                     Number(data.blockFrames) |
                     0);
+
+            numBuffers =
+                Math.max(
+                    1,
+                    Math.min(
+                        128,
+                        Number(data.numBuffers) |
+                        0));
+
+            synthChannels =
+                Number(data.channels) === 1
+                    ? 1
+                    : 2;
+
+            bitsPerSample =
+                Number(data.bitsPerSample) === 16
+                    ? 16
+                    : 32;
+
+            realtimePriority =
+                data.realtimePriority
+                    ? 1
+                    : 0;
+
+            requestedWorkers =
+                Math.max(
+                    0,
+                    Number(data.workers) |
+                    0);
+
+            noteSharding =
+                Math.max(
+                    0,
+                    Math.min(
+                        2,
+                        Number(data.noteSharding) |
+                        0));
+
+            stealScoreCache =
+                data.stealScoreCache !== false;
+
+            fastNoteOff =
+                data.fastNoteOff !== false;
+
+            validateState =
+                !!data.validateState;
+
+            softClip =
+                data.softClip !== false;
 
             playing = false;
             reinitializeCore();
 
+            if (audioPort) {
+                audioPort.postMessage({
+                    type: "engineConfig",
+                    blockFrames,
+                    numBuffers
+                });
+            }
+
             postState("configured", {
                 maxVoices,
-                blockFrames
+                minVoices,
+                blockFrames,
+                numBuffers,
+                channels: synthChannels,
+                bitsPerSample,
+                realtimePriority,
+                requestedWorkers,
+                workerCount: Module._ssw_worker_count(),
+                noteSharding,
+                stealScoreCache,
+                fastNoteOff,
+                validateState,
+                softClip
             });
+            return;
+        }
+
+        if (data.type === "softClip") {
+            softClip =
+                data.enabled !== false;
+
+            if (coreReady)
+                Module._ssw_set_soft_clip(
+                    softClip ? 1 : 0);
+
+            postState("configured", {
+                softClip
+            });
+            return;
         }
     } catch (error) {
         setError(error);
@@ -675,7 +895,19 @@ SnappySynthCore({
     postState("ready", {
         ready: true,
         maxVoices,
-        blockFrames
+        minVoices,
+        blockFrames,
+        numBuffers,
+        channels: synthChannels,
+        bitsPerSample,
+        realtimePriority,
+        requestedWorkers,
+        workerCount: Module._ssw_worker_count(),
+        noteSharding,
+        stealScoreCache,
+        fastNoteOff,
+        validateState,
+        softClip
     });
 
     pump();
