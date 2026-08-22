@@ -247,3 +247,22 @@ The design intentionally mirrors SharpMIDI's important properties: source-backed
 parsing, two-pass indexing, long event counters/offsets, bounded playback buffers,
 and reconstruction of visible notes during a sweep instead of permanent storage
 of one render note per NoteOn.
+
+## Pass 13.1 — performance/stability follow-up
+
+The SharpMIDI-style mapped source now becomes playable after one indexing pass.
+Visual checkpoints are lazy and sparse. Horizontal rendering retains the last
+complete GPU page composite during cache misses and only rebuilds that composite
+when a page used by the viewport changes. The 64-page prefetch protocol sends
+missing masks instead of rebuilding overlapping pages. SnappySynth catch-up
+velocity shedding is debounced/rate-limited and the previous 100 ms hard-resync
+loop was replaced by immediate recovery resync plus a much larger healthy-drift
+safety threshold.
+
+### Pass 13.1 current mapped-store residency details
+
+The historical Pass 13.0 description above is superseded for the current build:
+track source checkpoints are now byte-spaced (4 MiB) rather than event-count
+spaced, and the initial load performs one full source scan. Visual-state
+checkpoints are generated lazily on demand, so a billion-note crashpoint does
+not create one checkpoint for every 65,536 channel events during loading.

@@ -16,11 +16,17 @@ namespace {
 // SharpMIDI maps the source file and parses directly from the mapping. Browser
 // File/Blob cannot be memory-mapped into WASM, so this is the equivalent: a
 // small shared LRU of fixed source windows. File size never determines heap
-// size. Thirty-two 1 MiB windows cap source-cache residency at 32 MiB.
-constexpr std::size_t SourcePageBytes = 1u << 20;
-constexpr std::size_t SourcePageCount = 32;
-constexpr uint64_t TrackCheckpointEventStride = 1u << 16; // 65,536 channel events
-constexpr uint64_t TrackCheckpointByteStride = 4u << 20;  // or every 4 MiB source
+// size. Eight 4 MiB windows cap source-cache residency at 32 MiB.
+// FileReaderSync/blob-slice calls are much more expensive than native mmap
+// page faults. Keep the same 32 MiB source-cache budget as Pass 13.0, but use
+// eight 4 MiB windows instead of thirty-two 1 MiB windows. Sequential scans
+// therefore cross the JS/WASM boundary 4x less often.
+constexpr std::size_t SourcePageBytes = 4u << 20;
+constexpr std::size_t SourcePageCount = 8;
+// Source checkpoints are for random access, not for retaining every event.
+// Byte spacing alone bounds seek work without creating one checkpoint per
+// 65,536 events at billion-note crashpoints.
+constexpr uint64_t TrackCheckpointByteStride = 4u << 20;
 constexpr std::size_t VisualCheckpointCount = 128;
 constexpr std::size_t VisualStateCount = 16u * 128u;
 
@@ -33,6 +39,7 @@ public:
         user_ = user;
         failed_ = false;
         stamp_ = 1;
+        lastPage_ = nullptr;
         for (auto& page : pages_) {
             page.start = 0;
             page.length = 0;
@@ -80,7 +87,31 @@ public:
 
     bool byte(uint64_t offset, uint8_t& value)
     {
-        return read(offset, &value, 1);
+        if (!readAt_ || offset >= size_) {
+            failed_ = true;
+            return false;
+        }
+
+        const uint64_t pageStart = offset & ~uint64_t(SourcePageBytes - 1u);
+        Page* page = lastPage_;
+        if (!page || !page->valid || page->start != pageStart) {
+            page = find(pageStart);
+            if (!page)
+                page = load(pageStart);
+        }
+        if (!page)
+            return false;
+
+        const std::size_t within = static_cast<std::size_t>(offset - pageStart);
+        if (within >= page->length) {
+            failed_ = true;
+            return false;
+        }
+
+        value = page->bytes[within];
+        page->stamp = ++stamp_;
+        lastPage_ = page;
+        return true;
     }
 
 private:
@@ -94,9 +125,14 @@ private:
 
     Page* find(uint64_t start)
     {
+        if (lastPage_ && lastPage_->valid && lastPage_->start == start) {
+            lastPage_->stamp = ++stamp_;
+            return lastPage_;
+        }
         for (auto& page : pages_) {
             if (page.valid && page.start == start) {
                 page.stamp = ++stamp_;
+                lastPage_ = &page;
                 return &page;
             }
         }
@@ -129,6 +165,7 @@ private:
         victim->length = length;
         victim->stamp = ++stamp_;
         victim->valid = true;
+        lastPage_ = victim;
         return victim;
     }
 
@@ -137,6 +174,7 @@ private:
     void* user_ = nullptr;
     bool failed_ = false;
     uint64_t stamp_ = 1;
+    Page* lastPage_ = nullptr;
     std::array<Page, SourcePageCount> pages_{};
 };
 
@@ -338,6 +376,7 @@ struct MidiMappedStore::Impl {
     std::array<uint8_t, 16> globalColors{};
     std::vector<std::array<uint8_t, 16>> trackColors;
     std::vector<VisualCheckpoint> checkpoints;
+    uint32_t visualCheckpointSpan = 1;
 
     struct Decoder {
         Impl* owner = nullptr;
@@ -673,8 +712,7 @@ struct MidiMappedStore::Impl {
             // TickGroup/CompactEvent per event/tick.
             const TrackCheckpoint& lastCp = track.checkpoints.back();
             if (channelEventIndex != 0 &&
-                ((channelEventIndex % TrackCheckpointEventStride) == 0 ||
-                 eventStart - lastCp.sourceOffset >= TrackCheckpointByteStride)) {
+                eventStart - lastCp.sourceOffset >= TrackCheckpointByteStride) {
                 track.checkpoints.push_back({
                     eventStart,
                     channelEventIndex,
@@ -824,6 +862,89 @@ struct MidiMappedStore::Impl {
         return *(it - 1);
     }
 
+    const VisualCheckpoint& ensureCheckpoint(uint32_t targetTick)
+    {
+        if (checkpoints.empty())
+            checkpoints.push_back({0, VisualState{}});
+
+        targetTick = std::min(targetTick, metadataMaxTick());
+
+        auto exact = std::lower_bound(
+            checkpoints.begin(), checkpoints.end(), targetTick,
+            [](const VisualCheckpoint& cp, uint32_t value) {
+                return cp.tick < value;
+            });
+        if (exact != checkpoints.end() && exact->tick == targetTick)
+            return *exact;
+
+        auto baseIt = exact;
+        if (baseIt == checkpoints.begin()) {
+            baseIt = checkpoints.begin();
+        } else {
+            --baseIt;
+        }
+
+        const uint32_t baseTick = baseIt->tick;
+        VisualState state = baseIt->state;
+        Iterator it;
+        it.reset(this, baseTick, targetTick);
+        if (it.failed())
+            return checkpointFor(baseTick);
+
+        uint32_t nextGrid = baseTick;
+        if (visualCheckpointSpan > 0) {
+            const uint64_t grid =
+                (uint64_t(baseTick) / visualCheckpointSpan + 1u) *
+                uint64_t(visualCheckpointSpan);
+            nextGrid = static_cast<uint32_t>(
+                std::min<uint64_t>(grid, metadataMaxTick()));
+        }
+
+        EventWord event;
+        while (it.peek(event) && event.tick < targetTick) {
+            while (visualCheckpointSpan > 0 &&
+                   nextGrid > baseTick &&
+                   nextGrid < targetTick &&
+                   nextGrid <= event.tick) {
+                auto pos = std::lower_bound(
+                    checkpoints.begin(), checkpoints.end(), nextGrid,
+                    [](const VisualCheckpoint& cp, uint32_t value) {
+                        return cp.tick < value;
+                    });
+                if (pos == checkpoints.end() || pos->tick != nextGrid)
+                    checkpoints.insert(pos, {nextGrid, state});
+
+                if (metadataMaxTick() - nextGrid < visualCheckpointSpan) {
+                    nextGrid = targetTick;
+                    break;
+                }
+                nextGrid += visualCheckpointSpan;
+            }
+
+            it.next(event);
+            applyVisualEvent(state, event, nullptr, nullptr);
+        }
+
+        if (it.failed())
+            return checkpointFor(baseTick);
+
+        auto pos = std::lower_bound(
+            checkpoints.begin(), checkpoints.end(), targetTick,
+            [](const VisualCheckpoint& cp, uint32_t value) {
+                return cp.tick < value;
+            });
+        if (pos == checkpoints.end() || pos->tick != targetTick)
+            pos = checkpoints.insert(pos, {targetTick, state});
+        return *pos;
+    }
+
+    uint32_t metadataMaxTick() const
+    {
+        return cachedMaxTick;
+    }
+
+    uint32_t cachedMaxTick = 0;
+
     bool buildCheckpoints(
         MidiDocument& metadata,
         MidiParseProgress progress,
@@ -966,6 +1087,8 @@ void MidiMappedStore::clear()
     impl_->sysex.clear();
     impl_->trackColors.clear();
     impl_->checkpoints.clear();
+    impl_->visualCheckpointSpan = 1;
+    impl_->cachedMaxTick = 0;
     impl_->eventCursor = {};
     impl_->eventCursorValid = false;
 }
@@ -1073,14 +1196,26 @@ bool MidiMappedStore::index(
         out.durationSeconds = static_cast<float>(out.tickToSeconds(out.maxTick));
         impl_->buildColorTables(out);
 
-        report(65, "SharpMIDI pass 2: building bounded playback checkpoints");
-        if (!impl_->buildCheckpoints(out, progress, progressUser, totalEvents)) {
-            error_ = impl_->reader.failed()
-                ? "Could not reread mapped MIDI source"
-                : "Could not build mapped playback checkpoints";
-            return false;
-        }
-        out.derivedStatsReady = true;
+        // Pass 13.1 deliberately does NOT scan every event a second time at
+        // load. The old global visual-checkpoint/statistics pass doubled load
+        // time and blocked playback on billion-note files. Start with the exact
+        // empty state at tick 0; render/key requests create sparse checkpoints
+        // lazily as playback advances. This is the browser equivalent of
+        // SharpMIDI's incremental renderer sweep.
+        impl_->cachedMaxTick = out.maxTick;
+        impl_->visualCheckpointSpan = std::max<uint32_t>(
+            1u,
+            static_cast<uint32_t>(
+                (uint64_t(out.maxTick) + VisualCheckpointCount - 1u) /
+                VisualCheckpointCount));
+        impl_->checkpoints.clear();
+        impl_->checkpoints.push_back({0, VisualState{}});
+        out.derivedPeakNps = 0;
+        out.derivedPeakNpsTime = 0.0f;
+        out.derivedPeakPolyphony = 0;
+        out.derivedNpsTimeline.clear();
+        out.derivedStatsReady = false;
+        report(92, "Mapped source indexed; visual state will warm lazily");
 
         std::stable_sort(
             impl_->sysex.begin(), impl_->sysex.end(),
@@ -1124,10 +1259,10 @@ bool MidiMappedStore::buildVisualPage(
     pageStart = std::min(pageStart, metadata_.maxTick);
     pageEnd = std::min(pageEnd, metadata_.maxTick);
 
-    const auto& cp = impl_->checkpointFor(pageStart);
+    const auto& cp = impl_->ensureCheckpoint(pageStart);
     VisualState state = cp.state;
     Impl::Iterator it;
-    it.reset(impl_, cp.tick, pageEnd);
+    it.reset(impl_, pageStart, pageEnd);
     if (it.failed())
         return false;
 
@@ -1191,10 +1326,10 @@ bool MidiMappedStore::buildKeySnapshot(
         return false;
     tick = std::min(tick, metadata_.maxTick);
 
-    const auto& cp = impl_->checkpointFor(tick);
+    const auto& cp = impl_->ensureCheckpoint(tick);
     VisualState state = cp.state;
     Impl::Iterator it;
-    it.reset(impl_, cp.tick, tick);
+    it.reset(impl_, tick, tick);
     if (it.failed())
         return false;
 

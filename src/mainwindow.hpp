@@ -418,6 +418,12 @@ private:
     bool synthPlaybackPrimed_ = false;
     bool synthWasSoundfontLoaded_ = false;
     bool synthWasStarved_ = false;
+    // Adaptive velocity shedding is a last-resort catch-up mechanism. Startup,
+    // seek and resync get a grace window so initial mapped-event decoding can
+    // never jump the floor straight to 127 before audio has had a chance to
+    // prime its rolling PCM ring.
+    qint64 synthStarvedSinceElapsedMs_ = -1;
+    qint64 synthCatchupGraceUntilElapsedMs_ = 0;
     std::size_t synthGroupCursor_ = 0;
     std::size_t synthSysExCursor_ = 0;
     double synthScheduledUntil_ = 0.0;

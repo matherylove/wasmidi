@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 13.0: SharpMIDI-style mapped-source parser. The browser File remains Chromium 133+ can grow one wasm64
+// Pass 13.1: SharpMIDI-style mapped-source parser. The browser File remains
 // outside the WASM heap; only compact indexes/checkpoints remain resident in
 // Memory64, and render/playback data are decoded into bounded pages on demand.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.0";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.1";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
@@ -169,7 +169,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 13.0 parser was built without Memory64 (pointer width " +
+                    "Pass 13.1 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 
@@ -245,6 +245,9 @@ postMessage({
 
 let mappedFileReady = false;
 let visualPrimeToken = 0;
+let visualBuiltGeneration = 0;
+let visualBuiltSpan = 0;
+const visualBuiltPages = new Set();
 
 function copyWasmBytes(Module, address, byteLength) {
     const base = pointerToNumber(address, "mapped result pointer");
@@ -264,20 +267,54 @@ async function buildVisualPages(message) {
     const first = Number(message.firstPage) >>> 0;
     const count = Math.max(0, Math.min(64, Number(message.count) >>> 0));
     const current = Number(message.currentPage) >>> 0;
+    const missingLo = Number(message.missingLo) >>> 0;
+    const missingHi = Number(message.missingHi) >>> 0;
     const token = ++visualPrimeToken;
 
+    if (generation !== visualBuiltGeneration || span !== visualBuiltSpan) {
+        visualBuiltGeneration = generation;
+        visualBuiltSpan = span;
+        visualBuiltPages.clear();
+    }
+
+    // Forget pages outside the current 64-tile rolling window. If the user
+    // seeks back later the renderer can explicitly request them again.
+    for (const page of visualBuiltPages) {
+        if (page < first || page >= first + count)
+            visualBuiltPages.delete(page);
+    }
+
+    const requested = i =>
+        i < 32
+            ? ((missingLo >>> i) & 1) !== 0
+            : ((missingHi >>> (i - 32)) & 1) !== 0;
+
     const pages = [];
-    for (let i = 0; i < count; ++i)
-        pages.push(first + i);
-    pages.sort((a, b) => {
-        if (a === current) return -1;
-        if (b === current) return 1;
-        return Math.abs(a - current) - Math.abs(b - current);
-    });
+    for (let i = 0; i < count; ++i) {
+        if (!requested(i))
+            continue;
+        const page = first + i;
+        if (!visualBuiltPages.has(page))
+            pages.push(page);
+    }
+
+    // The viewport can intersect the history tile, current tile and next tile.
+    // Finish those first. The other ~61 pages are speculative prefetch and are
+    // deliberately throttled so framebuffer preparation cannot steal the
+    // mapped Worker from keyboard/audio decoding.
+    const priority = page => {
+        if (current > 0 && page === current - 1) return 0;
+        if (page === current) return 1;
+        if (page === current + 1) return 2;
+        if (page > current) return 3 + (page - current);
+        return 1000 + (current - page);
+    };
+    pages.sort((a, b) => priority(a) - priority(b));
 
     for (const pageIndex of pages) {
         if (token !== visualPrimeToken)
             return;
+
         const start = pageIndex * span;
         const end = Math.min(0xffffffff, start + span);
         if (!Module._wmp_build_visual_page_js(start, end)) {
@@ -287,6 +324,8 @@ async function buildVisualPages(message) {
         const bytes = noteCount
             ? copyWasmBytes(Module, Module._wmp_visual_page_ptr_js(), noteCount * 12)
             : new Uint8Array(0);
+
+        visualBuiltPages.add(pageIndex);
         postMessage({
             type: "visual-page",
             generation,
@@ -296,7 +335,16 @@ async function buildVisualPages(message) {
             difficulty: noteCount,
             data: bytes.buffer
         }, [bytes.buffer]);
-        await new Promise(resolve => setTimeout(resolve, 0));
+
+        const critical =
+            pageIndex === current ||
+            pageIndex === current + 1 ||
+            (current > 0 && pageIndex === current - 1);
+
+        // Always yield so synth/key messages get a turn. Speculative 64-screen
+        // prefetch uses a small duty-cycle delay instead of monopolizing the
+        // same Worker that feeds SnappySynth.
+        await new Promise(resolve => setTimeout(resolve, critical ? 0 : 12));
     }
 }
 
@@ -451,7 +499,7 @@ self.onmessage = async event => {
 
         Module = await getModule();
 
-        // Pass 12.9: keep the browser File outside the wasm heap. C++ requests
+        // Pass 13.1: keep the browser File outside the wasm heap. C++ requests
         // only bounded 4 MiB windows through FileReaderSync as its two parser
         // passes move through the track ranges. A 500 MB/5 GB source therefore
         // does not require a 500 MB/5 GB raw allocation before parsing begins.

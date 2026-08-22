@@ -303,3 +303,24 @@ The horizontal renderer requests visible note pages, the keyboard requests its
 only MIDI metadata. This makes source size and total note count independent from
 the Qt wasm32 heap and is the intended path for multi-gigabyte / billion-note
 MIDIs, subject to actual browser/OS memory and processing-time limits.
+
+## Pass 13.1 — fast mapped load, stable visual pages, conservative synth catch-up
+
+Pass 13.1 removes the blocking second full-file mapped-store scan. Initial MIDI
+load now performs one source-index pass; exact visual-state checkpoints are
+created lazily at page/key request boundaries while playback proceeds. The
+32 MiB source cache uses 4 MiB windows plus a hot-page fast path, reducing
+FileReaderSync/blob crossings during sequential parsing.
+
+The remote 64-page visual buffer now requests only missing tiles when its
+rolling window advances. The three tiles that can intersect the live viewport
+are produced first; speculative pages are throttled so they cannot monopolize
+the mapped Worker. Qt caches the assembled remote VBO and reuses it between
+page boundaries rather than concatenating and uploading all cached notes every
+frame. If a required page is late, the last complete GPU geometry stays visible
+and is clipped by the new viewport until recovery completes.
+
+SnappySynth velocity shedding now has startup/seek grace and sustained-
+starvation debounce, climbs gradually instead of jumping to velocity 127, and
+ordinary 100 ms clock drift no longer causes repeated seek/ring flushes. Audio
+still resynchronizes immediately when a real starvation period recovers.

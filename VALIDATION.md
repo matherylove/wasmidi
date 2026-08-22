@@ -192,3 +192,18 @@ stage during the generated Memory64 parser smoke test.
 
 The final Qt 6.8 + Emscripten/Memory64 link and browser execution still require
 GitHub Actions because this container does not provide the project Qt WASM SDK.
+
+## Pass 13.1 validation targets
+
+- Initial mapped indexing is one source pass; no eager global visual/stat pass.
+- Source cache budget remains 32 MiB but uses 8 x 4 MiB pages and a hot-page
+  fast path.
+- Native 1,000,000-note dense benchmark: Pass 13.0.1 index ~141 ms versus
+  Pass 13.1 ~25 ms in this validation container (machine-dependent).
+- Long-note page reconstruction was checked across multiple out-of-order page
+  requests: open notes are carried into later pages and disappear only after
+  their NoteOff is before the requested page.
+- Rolling visual prefetch uses 64 logical pages but sends only missing-page
+  bitmasks and keeps speculative work low priority.
+- Remote page geometry is not rebuilt/uploaded every rendered frame.
+- Adaptive synth velocity floor cannot jump directly to 127 at playback start.

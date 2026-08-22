@@ -137,7 +137,8 @@ EM_JS(void, wasmidi_visual_cache_shutdown, (), {
 
 EM_JS(void, wasmidi_visual_cache_prime,
       (uint32_t generation, uint32_t spanTicks, uint32_t firstPage,
-       uint32_t pageCount, uint32_t currentPage), {
+       uint32_t pageCount, uint32_t currentPage,
+       uint32_t missingLo, uint32_t missingHi), {
     const mapped = globalThis.__wasmidiMappedMidi;
     if (mapped && mapped.worker && mapped.mappedStore) {
         mapped.worker.postMessage({
@@ -146,7 +147,9 @@ EM_JS(void, wasmidi_visual_cache_prime,
             spanTicks: spanTicks >>> 0,
             firstPage: firstPage >>> 0,
             count: pageCount >>> 0,
-            currentPage: currentPage >>> 0
+            currentPage: currentPage >>> 0,
+            missingLo: missingLo >>> 0,
+            missingHi: missingHi >>> 0
         });
         return;
     }
@@ -162,7 +165,9 @@ EM_JS(void, wasmidi_visual_cache_prime,
         spanTicks: spanTicks >>> 0,
         firstPage: firstPage >>> 0,
         count: pageCount >>> 0,
-        currentPage: currentPage >>> 0
+        currentPage: currentPage >>> 0,
+        missingLo: missingLo >>> 0,
+        missingHi: missingHi >>> 0
     });
 });
 
@@ -1159,6 +1164,7 @@ void GLRenderer::setNoteSpeed(float secondsPerWindow)
 
     noteSpeed_ = value;
     forceCacheReset_ = true;
+    resetVisualPageCache(true);
 }
 
 void GLRenderer::setPostBuffer(float seconds)
@@ -1174,6 +1180,7 @@ void GLRenderer::setPostBuffer(float seconds)
 
     postBuffer_ = value;
     forceCacheReset_ = true;
+    resetVisualPageCache(true);
 }
 
 void GLRenderer::setPerTrackColors(bool enabled)
@@ -1562,6 +1569,15 @@ void GLRenderer::resetVisualPageCache(bool reinstallDocument)
     visualWantedPageCount_ = 0;
     visualCurrentPage_ = 0;
     visualPrimeWidth_ = 0;
+    ++visualPageRevision_;
+    if (visualPageRevision_ == 0)
+        ++visualPageRevision_;
+    remoteDrawRevision_ = 0;
+    remoteDrawSpan_ = 0;
+    remoteDrawFirstPage_ = std::numeric_limits<uint32_t>::max();
+    remoteDrawLastPage_ = std::numeric_limits<uint32_t>::max();
+    remoteWantedDrawFirstPage_ = std::numeric_limits<uint32_t>::max();
+    remoteWantedDrawLastPage_ = std::numeric_limits<uint32_t>::max();
     denseNotes_.clear();
     denseSourceScratch_.clear();
 
@@ -1666,6 +1682,17 @@ void GLRenderer::receiveVisualPage(
     }
 
     visualPages_[pageIndex] = std::move(page);
+
+    // Far-ahead pages must not force the current VBO to be concatenated and
+    // re-uploaded. Only pages the current viewport is waiting for invalidate
+    // the assembled remote draw list.
+    if (remoteWantedDrawFirstPage_ == std::numeric_limits<uint32_t>::max() ||
+        (pageIndex >= remoteWantedDrawFirstPage_ &&
+         pageIndex <= remoteWantedDrawLastPage_)) {
+        ++visualPageRevision_;
+        if (visualPageRevision_ == 0)
+            ++visualPageRevision_;
+    }
 }
 
 void GLRenderer::primeVisualPageCache(
@@ -1680,23 +1707,12 @@ void GLRenderer::primeVisualPageCache(
         std::max<uint32_t>(1, viewEnd - viewStart);
 
     if (visualPageSpanTicks_ == 0) {
+        // A page is a cache tile, not a promise that every later viewport must
+        // equal exactly one page. Keep this span stable across tempo changes.
+        // Rebuilding all 64 pages whenever ticks-per-screen changes was far
+        // slower than rendering directly and caused visible cache holes.
         visualPageSpanTicks_ = actualSpan;
         visualPages_.clear();
-    } else {
-        const uint32_t difference =
-            actualSpan > visualPageSpanTicks_
-                ? actualSpan - visualPageSpanTicks_
-                : visualPageSpanTicks_ - actualSpan;
-        const uint32_t tolerance =
-            std::max<uint32_t>(8, visualPageSpanTicks_ / 16);
-
-        // Tempo changes can alter ticks-per-screen. Keep pages stable through
-        // +/-1 tick rounding noise, but rebuild when the scale really changes.
-        if (difference > tolerance) {
-            visualPageSpanTicks_ = actualSpan;
-            visualPages_.clear();
-            visualWantedPageCount_ = 0;
-        }
     }
 
     const uint32_t span = std::max<uint32_t>(1, visualPageSpanTicks_);
@@ -1707,7 +1723,7 @@ void GLRenderer::primeVisualPageCache(
         maxPage >= firstPage ? maxPage - firstPage + 1 : 1;
     const uint32_t pageCount = std::min<uint32_t>(64, available);
 
-    const bool changed =
+    const bool requestChanged =
         firstPage != visualWantedFirstPage_ ||
         pageCount != visualWantedPageCount_ ||
         currentPage != visualCurrentPage_;
@@ -1726,17 +1742,39 @@ void GLRenderer::primeVisualPageCache(
         }
     }
 
+    // Tell the Worker exactly which of the 64 rolling tiles are absent. Pass
+    // 13.0 rebuilt all 63 overlapping pages every time currentPage advanced by
+    // one, turning the cache into a large performance penalty.
+    uint32_t missingLo = 0;
+    uint32_t missingHi = 0;
+    for (uint32_t i = 0; i < pageCount; ++i) {
+        const uint32_t pageIndex = firstPage + i;
+        const auto it = visualPages_.find(pageIndex);
+        const bool missing =
+            it == visualPages_.end() || it->second.spanTicks != span;
+        if (!missing)
+            continue;
+        if (i < 32)
+            missingLo |= uint32_t(1) << i;
+        else
+            missingHi |= uint32_t(1) << (i - 32);
+    }
+
 #ifdef __EMSCRIPTEN__
-    if (changed) {
+    if (requestChanged && (missingLo != 0 || missingHi != 0)) {
         wasmidi_visual_cache_prime(
             visualCacheGeneration_,
             span,
             firstPage,
             pageCount,
-            currentPage);
+            currentPage,
+            missingLo,
+            missingHi);
     }
 #else
-    (void)changed;
+    (void)requestChanged;
+    (void)missingLo;
+    (void)missingHi;
 #endif
 }
 
@@ -1756,7 +1794,7 @@ bool GLRenderer::collectCachedPageNotes(
 
     // A normal viewport touches at most three screen pages (one history page
     // plus the visible/future range). Refuse pathological stale-scale cases.
-    if (lastPage < firstPage || lastPage - firstPage > 6)
+    if (lastPage < firstPage || lastPage - firstPage > 63)
         return false;
 
     std::size_t reserveCount = 0;
@@ -2496,18 +2534,38 @@ void GLRenderer::renderRoll()
     bool denseMode = false;
 
     if (document_->remoteIndexed) {
-        // The permanent note list does not exist in Pass 13. Draw only the
-        // bounded SharpMIDI-style RenderNote pages supplied by the persistent
-        // mapped Worker. Missing pages simply leave the previous/background
-        // frame visible until recovery finishes; they never trigger a giant
-        // fallback allocation in Qt.
-        std::vector<VisualNote> pageNotes;
-        if (!collectCachedPageNotes(searchStart, viewEnd, pageNotes))
-            return;
-        denseNotes_ = std::move(pageNotes);
+        // Keep the last complete geometry resident on the GPU while recovery
+        // pages are still being decoded. The shader clips old geometry against
+        // the new viewport, so notes leave only after scrolling off-screen
+        // instead of disappearing for a frame whenever one cache tile is late.
+        const uint32_t pageSpan = std::max<uint32_t>(1, visualPageSpanTicks_);
+        const uint32_t drawFirst = searchStart / pageSpan;
+        const uint32_t drawLast = viewEnd / pageSpan;
+        remoteWantedDrawFirstPage_ = drawFirst;
+        remoteWantedDrawLastPage_ = drawLast;
+
+        const bool needsComposite =
+            remoteDrawSpan_ != pageSpan ||
+            remoteDrawFirstPage_ != drawFirst ||
+            remoteDrawLastPage_ != drawLast ||
+            remoteDrawRevision_ != visualPageRevision_;
+
+        if (needsComposite) {
+            std::vector<VisualNote> pageNotes;
+            if (collectCachedPageNotes(searchStart, viewEnd, pageNotes)) {
+                denseNotes_ = std::move(pageNotes);
+                uploadDenseDrawList();
+                remoteDrawSpan_ = pageSpan;
+                remoteDrawFirstPage_ = drawFirst;
+                remoteDrawLastPage_ = drawLast;
+                remoteDrawRevision_ = visualPageRevision_;
+            }
+        }
+
+        // If a new composite is not ready, keep drawing the previous one. This
+        // is the frame-buffer recovery path requested by the player design.
         if (denseNotes_.empty())
             return;
-        uploadDenseDrawList();
         denseMode = true;
     } else {
         if (sourceEnd_ <= sourceBegin_ && carryNotes_.empty())

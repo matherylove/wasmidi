@@ -13,10 +13,11 @@ namespace wasmidi {
 // Browser equivalent of SharpMIDI's MemoryMappedFile + compact BigArray model.
 //
 // The original MIDI File/Blob remains the authoritative backing store. Loading
-// scans every byte twice but never materializes the raw file, the channel-event
-// stream, or one VisualNote per NoteOn inside the WASM heap. The retained index
-// is proportional to track/tick structure rather than total channel-event
-// count. Playback/render pages are decoded from the mapped source on demand.
+// scans every source byte once during initial indexing and never materializes
+// the raw file, channel-event stream, or one VisualNote per NoteOn inside the
+// WASM heap. Visual-state checkpoints are warmed lazily by render/key requests,
+// so playback can begin without a second full-file pass. Playback/render pages
+// are decoded from the mapped source on demand.
 class MidiMappedStore {
 public:
     struct EventWord {

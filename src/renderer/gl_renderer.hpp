@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -173,6 +174,16 @@ private:
     uint32_t visualWantedPageCount_ = 0;
     uint32_t visualCurrentPage_ = 0;
     int visualPrimeWidth_ = 0;
+    // Remote mapped pages are immutable. Cache the assembled GPU draw list and
+    // rebuild it only when one of the pages actually used by the viewport
+    // changes, rather than concatenating/re-uploading page geometry every frame.
+    uint64_t visualPageRevision_ = 1;
+    uint64_t remoteDrawRevision_ = 0;
+    uint32_t remoteDrawSpan_ = 0;
+    uint32_t remoteDrawFirstPage_ = std::numeric_limits<uint32_t>::max();
+    uint32_t remoteDrawLastPage_ = std::numeric_limits<uint32_t>::max();
+    uint32_t remoteWantedDrawFirstPage_ = std::numeric_limits<uint32_t>::max();
+    uint32_t remoteWantedDrawLastPage_ = std::numeric_limits<uint32_t>::max();
     std::size_t ringCapacity_ = 0;
     std::size_t ringMask_ = 0;
 

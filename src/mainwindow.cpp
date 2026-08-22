@@ -350,10 +350,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             // Fetch the Worker source explicitly with cache:no-store instead of
             // trusting the browser/Pages HTTP cache for a Worker constructor.
-            // This prevents a successful 12.9 deployment from silently running
-            // the old 12.7 "allocate file.size" loader.
+            // This prevents a successful earlier deployment from silently running
+            // the old monolithic "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=13.0', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.1', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -364,10 +364,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.0"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.1"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 13.0.');
+                    'Expected bootstrap 13.1.');
             }
 
             const parserBaseUrl =
@@ -503,12 +503,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '13.0' ||
+                        if (String(message.bootstrap || '') !== '13.1' ||
                             message.pagedSource !== true ||
                             message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected mapped-source bootstrap 13.0.');
+                                'Expected mapped-source bootstrap 13.1.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -653,7 +653,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         // 4 GiB Qt-document ceiling for giant MIDIs.
                         globalThis.__wasmidiMappedMidi = {
                             worker,
-                            bootstrap: '13.0',
+                            bootstrap: '13.1',
                             mappedStore: true,
                             keyPending: false,
                             keyQueuedTick: null,
@@ -1645,6 +1645,18 @@ void MainWindow::rebuildDerivedStats()
 
     bpm_ = tempoBpms_.front();
 
+    // Pass 13.1 mapped files intentionally become playable after the single
+    // source-index pass. Expensive peak-NPS/polyphony analysis warms in the
+    // background with render pages; never recreate a duration-sized fallback
+    // timeline on Qt's UI thread for a remote-indexed giant MIDI.
+    if (document_.remoteIndexed && !document_.derivedStatsReady) {
+        emit bpmChanged();
+        emit peakNpsChanged();
+        emit peakPolyphonyChanged();
+        emit timelineChanged();
+        return;
+    }
+
     if (document_.derivedStatsReady) {
         peakNps_ = static_cast<int>(
             std::min<uint32_t>(
@@ -1875,6 +1887,8 @@ void MainWindow::play()
     playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
     synthLastHardResyncElapsedMs_ = -100000;
     synthWasStarved_ = false;
+    synthStarvedSinceElapsedMs_ = -1;
+    synthCatchupGraceUntilElapsedMs_ = 750;
 
     scheduler_.seek(currentTime_);
     scheduler_.start();
@@ -1934,6 +1948,13 @@ void MainWindow::stop()
     playbackLastElapsedMs_ = 0;
     playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
     synthWasStarved_ = false;
+    synthStarvedSinceElapsedMs_ = -1;
+    synthCatchupGraceUntilElapsedMs_ = 0;
+    if (synthEffectiveVelocityFloor_ != synthVelocityFloor_) {
+        synthEffectiveVelocityFloor_ = synthVelocityFloor_;
+        skippedVelocity_ = synthEffectiveVelocityFloor_;
+        emit skippedVelocityChanged();
+    }
     playbackClock_.invalidate();
 
     if (currentTime_ != 0.0f) {
@@ -1979,6 +2000,8 @@ void MainWindow::seek(float seconds)
         playbackClock_.restart();
         playbackLastElapsedMs_ = 0;
         playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
+        synthStarvedSinceElapsedMs_ = -1;
+        synthCatchupGraceUntilElapsedMs_ = 600;
     }
 
     scheduler_.seek(clamped);
@@ -3144,13 +3167,14 @@ void MainWindow::updateEffectiveVelocityFloor(double synthLagSeconds)
 {
     int target = synthVelocityFloor_;
 
-    // While audio is behind, progressively drop quiet NoteOns. The user's
-    // configured floor is always the minimum. At >=350 ms lag the adaptive
-    // floor reaches 127, leaving only maximum-velocity NoteOns until recovery.
-    if (synthLagSeconds > 0.025) {
+    // Velocity shedding is intentionally conservative. Pass 13.0 mapped
+    // scheduling could spend a few hundred milliseconds producing the first
+    // event window; interpreting that startup gap as synth lag pushed this
+    // value directly to 127. Only sustained pressure reaches high floors now.
+    if (synthLagSeconds > 0.10) {
         const double pressure =
             std::clamp(
-                (synthLagSeconds - 0.025) / 0.325,
+                (synthLagSeconds - 0.10) / 1.40,
                 0.0,
                 1.0);
 
@@ -3165,15 +3189,13 @@ void MainWindow::updateEffectiveVelocityFloor(double synthLagSeconds)
     target = std::clamp(target, synthVelocityFloor_, 127);
 
     if (target > synthEffectiveVelocityFloor_) {
-        // Catch-up pressure takes effect immediately.
-        synthEffectiveVelocityFloor_ = target;
-    } else if (target < synthEffectiveVelocityFloor_) {
-        // Recover gradually so an oscillating deadline does not chatter the
-        // audible velocity cutoff on every 16 ms GUI tick.
+        // Never jump from the user's floor to 127 in one UI tick. A sustained
+        // overload can still climb all the way to 127, but progressively.
         synthEffectiveVelocityFloor_ =
-            std::max(
-                target,
-                synthEffectiveVelocityFloor_ - 2);
+            std::min(target, synthEffectiveVelocityFloor_ + 3);
+    } else if (target < synthEffectiveVelocityFloor_) {
+        synthEffectiveVelocityFloor_ =
+            std::max(target, synthEffectiveVelocityFloor_ - 4);
     }
 
     if (skippedVelocity_ != synthEffectiveVelocityFloor_) {
@@ -3187,6 +3209,7 @@ void MainWindow::updateSynthSynchronization()
 #ifdef __EMSCRIPTEN__
     if (!soundfontLoaded_) {
         updateEffectiveVelocityFloor(0.0);
+        synthStarvedSinceElapsedMs_ = -1;
         return;
     }
 
@@ -3197,33 +3220,58 @@ void MainWindow::updateSynthSynchronization()
     const double lag =
         double(currentTime_) - audioTime;
 
-    updateEffectiveVelocityFloor(lag);
-
     const bool starved =
         wasmidi_snappy_starved() != 0;
-
-    // Audio follows the visual timeline, never the reverse. During starvation
-    // the background renderer is allowed to refill without forcing the UI to
-    // wait. As soon as the AudioWorklet becomes healthy again, rebuild at the
-    // exact visual position so playback never resumes from an old lagged clock.
-    const bool recoveredFromStarvation =
-        synthWasStarved_ && !starved;
-    synthWasStarved_ = starved;
-
-    constexpr double HardResyncLagSeconds = 0.10;
-    constexpr qint64 HardResyncCooldownMs = 100;
 
     const qint64 elapsedMs =
         playbackClock_.isValid()
             ? playbackClock_.elapsed()
             : 0;
 
-    if (!starved &&
-        (recoveredFromStarvation ||
-         std::abs(lag) >= HardResyncLagSeconds) &&
-        elapsedMs - synthLastHardResyncElapsedMs_ >=
-            HardResyncCooldownMs) {
+    const bool recoveredFromStarvation =
+        synthWasStarved_ && !starved;
+
+    if (starved) {
+        if (!synthWasStarved_ || synthStarvedSinceElapsedMs_ < 0)
+            synthStarvedSinceElapsedMs_ = elapsedMs;
+    } else {
+        synthStarvedSinceElapsedMs_ = -1;
+    }
+
+    // Startup/seek scheduling latency is not evidence that SnappySynth itself
+    // is too slow. Require actual AudioWorklet starvation to persist beyond
+    // both the grace period and a short debounce before dropping velocities.
+    const bool sustainedCatchupPressure =
+        starved &&
+        elapsedMs >= synthCatchupGraceUntilElapsedMs_ &&
+        synthStarvedSinceElapsedMs_ >= 0 &&
+        elapsedMs - synthStarvedSinceElapsedMs_ >= 250;
+
+    updateEffectiveVelocityFloor(
+        sustainedCatchupPressure
+            ? std::max(0.0, lag)
+            : 0.0);
+
+    synthWasStarved_ = starved;
+
+    // Audio follows the visual timeline, never the reverse. The important
+    // instant resync is the transition from starved -> healthy. Pass 13.0 also
+    // sought every 100 ms for ordinary 100 ms drift, repeatedly flushing the
+    // PCM prebuffer and making a healthy synth look slow. Ordinary drift now
+    // needs to be large and persistent before a safety resync.
+    const bool severeHealthyDrift =
+        !starved &&
+        elapsedMs >= synthCatchupGraceUntilElapsedMs_ &&
+        std::abs(lag) >= 0.75;
+
+    const qint64 cooldownMs =
+        recoveredFromStarvation ? 150 : 1200;
+
+    if ((recoveredFromStarvation || severeHealthyDrift) &&
+        elapsedMs - synthLastHardResyncElapsedMs_ >= cooldownMs) {
         synthLastHardResyncElapsedMs_ = elapsedMs;
+        synthStarvedSinceElapsedMs_ = -1;
+        synthCatchupGraceUntilElapsedMs_ = elapsedMs + 500;
 
         wasmidi_snappy_seek(currentTime_);
         resetSynthSchedule(currentTime_);
