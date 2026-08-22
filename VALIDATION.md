@@ -240,6 +240,6 @@ GitHub Actions because this container does not provide the project Qt WASM SDK.
   the Qt WASM SDK is not installed in this container.
 
 
-## Pass 13.2.1 Memory64 growth regression
+## Pass 13.2.2 Memory64 growth regression
 
-The generated-module smoke test now verifies a real heap expansion beyond the 64 MiB initial Memory64 heap while constructing a dense visual page. The resulting heap must remain 64 KiB page aligned. This specifically covers the Emscripten 3.1.56 fractional-page-to-BigInt failure observed in GitHub Actions.
+CMake configure now applies an idempotent patch to Emscripten 3.1.56 `src/library.js` before linking and fails the configure if the expected buggy/fixed runtime pattern cannot be recognized. GitHub Actions runs the patcher again with `--check` before the generated-module smoke test. The smoke test still verifies a real heap expansion beyond the 64 MiB initial Memory64 heap while constructing a dense visual page, and the resulting heap must remain 64 KiB page aligned. Together these checks cover both the original fractional-page-to-BigInt failure and the 13.2.1 `--post-js` factory-scope failure.

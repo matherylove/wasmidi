@@ -265,7 +265,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 13.2.1 parser is not Memory64.");
+        throw new Error("Generated Pass 13.2.2 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -388,7 +388,7 @@ async function main() {
             parserErrorText(Module, "unknown visual-page failure"));
     }
 
-    // Pass 13.2.1 regression: Emscripten 3.1.56 MEMORY64 used to calculate
+    // Pass 13.2.2 regression: Emscripten 3.1.56 MEMORY64 used to calculate
     // a fractional Memory.grow page count here (for example
     // 10.999984741210938) and BigInt() aborted. The dense visual page is large
     // enough to force the 64 MiB initial heap to grow.

@@ -51,6 +51,29 @@ target_link_libraries(wasmidi PRIVATE
 )
 
 if(EMSCRIPTEN)
+    # Emscripten 3.1.56 MEMORY64 has a growMemory() bug: its generated JS can
+    # hand BigInt() a fractional page count. Patch the installed JS runtime
+    # template before any project link step so the corrected helper is emitted
+    # inside MODULARIZE's private factory scope. The patch is idempotent and
+    # recognizes newer Emscripten versions that already contain the fix.
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    execute_process(
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch_emscripten_memory64_growth.py"
+            "${CMAKE_CXX_COMPILER}"
+        RESULT_VARIABLE WASMIDI_MEMORY64_PATCH_RESULT
+        OUTPUT_VARIABLE WASMIDI_MEMORY64_PATCH_OUTPUT
+        ERROR_VARIABLE WASMIDI_MEMORY64_PATCH_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT WASMIDI_MEMORY64_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "Could not apply the Emscripten Memory64 growth fix: "
+            "${WASMIDI_MEMORY64_PATCH_ERROR}")
+    endif()
+    message(STATUS "${WASMIDI_MEMORY64_PATCH_OUTPUT}")
     # Parse large MIDI files in a dedicated Worker-owned WASM instance. The Qt
     # module receives only the compact finalized MidiDocument wire image, so the
     # browser UI/render thread never performs the two full MIDI parse passes.
@@ -115,16 +138,6 @@ if(EMSCRIPTEN)
         "-sINCOMING_MODULE_JS_API=['noInitialRun','noExitRuntime','onAbort','print','printErr']"
         "-sEXPORTED_FUNCTIONS=['_wmp_parse_file_js','_wmp_pack','_wmp_result_ptr_js','_wmp_result_size_js','_wmp_release_result','_wmp_build_visual_page_js','_wmp_visual_page_ptr_js','_wmp_visual_page_count_js','_wmp_build_key_snapshot_js','_wmp_key_snapshot_ptr_js','_wmp_key_snapshot_word_count_js','_wmp_reset_event_cursor_js','_wmp_build_event_batch_js','_wmp_event_batch_ptr_js','_wmp_event_batch_count_js','_wmp_event_batch_complete_js','_wmp_tick_to_seconds_js','_wmp_error_ptr_js','_wmp_error_size_js','_wmp_pointer_bits']"
         "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
-    )
-
-    # Emscripten 3.1.56 has a MEMORY64 growth-helper bug: it can feed a
-    # fractional page count to BigInt() while servicing malloc/sbrk. Keep the
-    # adaptive 64 MiB -> 16 GiB heap, but replace only growMemory() after the
-    # generated runtime has been emitted so every delta is an integer 64 KiB
-    # page count before conversion to BigInt.
-    target_link_options(midi_parser_core PRIVATE
-        "--post-js"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/memory64_growth_fix.js"
     )
 
     # Qt stays single-threaded. SnappySynthV2 is a completely separate WASM

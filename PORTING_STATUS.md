@@ -294,6 +294,6 @@ render cost alone never drops notes. Escalation is time-based (150 ms steps)
 instead of frame-based and recovery is faster than escalation.
 
 
-## Pass 13.2.1 - Emscripten 3.1.56 Memory64 growth hotfix
+## Pass 13.2.2 - Emscripten 3.1.56 Memory64 growth hotfix
 
-The generated Memory64 parser could fail on its first heap expansion because Emscripten 3.1.56 converted a fractional page count (for example 10.999984741210938) to BigInt. The parser now links a post-JS growth shim that rounds the byte delta to an integer number of 64 KiB WebAssembly pages before calling Memory.grow(BigInt(pageCount)). The adaptive 64 MiB initial / 16 GiB maximum policy is unchanged. CI now requires the dense visual-page smoke test to grow the heap beyond 64 MiB successfully.
+The generated Memory64 parser could fail on its first heap expansion because Emscripten 3.1.56 converted a fractional page count (for example 10.999984741210938) to BigInt. The first 13.2.1 workaround used `--post-js`, but `MODULARIZE=1` keeps `wasmMemory` and `growMemory` private to the module factory, so that shim could not safely reach them. Pass 13.2.2 instead patches the Emscripten 3.1.56 `src/library.js` template during CMake configure, before any project link step. The generated helper now truncates the rounded-up page count to an integer with `| 0`, matching the later upstream implementation, and then the normal Memory64 legalization can convert that integer to BigInt. The adaptive 64 MiB initial / 16 GiB maximum policy is unchanged. CI verifies the installed runtime patch and still requires the dense visual-page smoke test to grow beyond 64 MiB.

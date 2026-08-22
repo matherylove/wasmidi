@@ -353,7 +353,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             // This prevents a successful earlier deployment from silently running
             // the old monolithic "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=13.2.1', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.2.2', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -364,10 +364,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2.1"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2.2"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 13.2.1.');
+                    'Expected bootstrap 13.2.2.');
             }
 
             const parserBaseUrl =
@@ -503,12 +503,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '13.2.1' ||
+                        if (String(message.bootstrap || '') !== '13.2.2' ||
                             message.pagedSource !== true ||
                             message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected mapped-source bootstrap 13.2.1.');
+                                'Expected mapped-source bootstrap 13.2.2.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -653,7 +653,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         // 4 GiB Qt-document ceiling for giant MIDIs.
                         globalThis.__wasmidiMappedMidi = {
                             worker,
-                            bootstrap: '13.2.1',
+                            bootstrap: '13.2.2',
                             mappedStore: true,
                             keyPending: false,
                             keyQueuedTick: null,

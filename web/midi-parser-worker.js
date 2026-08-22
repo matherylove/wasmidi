@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 13.2.1: SharpMIDI-style mapped-source parser. The browser File remains
+// Pass 13.2.2: SharpMIDI-style mapped-source parser. The browser File remains
 // outside the WASM heap; only compact indexes/checkpoints remain resident in
 // Memory64, and render/playback data are decoded into bounded pages on demand.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2.1";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2.2";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 const SYNTH_EVENT_BATCH_EVENTS = 262144;
 
@@ -170,7 +170,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 13.2.1 parser was built without Memory64 (pointer width " +
+                    "Pass 13.2.2 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 

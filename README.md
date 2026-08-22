@@ -350,6 +350,6 @@ rate-limited instead of increasing once per UI frame, and a recovered underrun
 only hard-resynchronizes when audio is still materially behind.
 
 
-### Pass 13.2.1 Memory64 compatibility
+### Pass 13.2.2 Memory64 compatibility
 
-The dedicated MIDI parser keeps its 64 MiB initial heap and grows on demand. A small parser-only post-JS shim works around an Emscripten 3.1.56 Memory64 bug that could pass a fractional page count to BigInt during the first heap expansion; growth is now explicitly rounded to whole 64 KiB WebAssembly pages.
+The dedicated MIDI parser keeps its 64 MiB initial heap and grows on demand. Emscripten 3.1.56 has a Memory64 runtime-template bug that can pass a fractional page count to `BigInt()` during the first heap expansion. Pass 13.2.2 patches Emscripten's installed `src/library.js` during CMake configure, before the parser is linked, so `growMemory()` is generated inside the normal `MODULARIZE` factory with an integral page count (`| 0`). This avoids relying on private runtime symbols from `--post-js` and preserves the adaptive 64 MiB to 16 GiB policy.
