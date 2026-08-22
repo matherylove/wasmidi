@@ -53,7 +53,7 @@ public:
     const char* error() const { return error_.c_str(); }
     const MidiDocument& metadata() const { return metadata_; }
 
-    // One screen/page of SharpMIDI-style merged RenderNotes. Long notes that
+    // One screen/page of MPWGL2-compatible independent RenderNotes. Long notes that
     // began before PAGESTART are emitted as carry notes and open notes have
     // endTick=0 so the shader extends them to the current page edge.
     bool buildVisualPage(

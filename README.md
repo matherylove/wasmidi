@@ -324,3 +324,27 @@ SnappySynth velocity shedding now has startup/seek grace and sustained-
 starvation debounce, climbs gradually instead of jumping to velocity 127, and
 ordinary 100 ms clock drift no longer causes repeated seek/ring flushes. Audio
 still resynchronizes immediately when a real starvation period recovers.
+
+
+## Pass 13.2 — MPWGL2 draw order, seek recovery and SSv2 underrun gating
+
+Pass 13.2 fixes three regressions in the mapped-store player. The visual page
+builder now keeps an independent FIFO for every `(track, channel, pitch)` and
+reproduces MPWGL2's stable start-time draw order. If two still-open notes can
+actually overlap on the same row and their future NoteOff order is required to
+determine which color is on top, only that affected track is scanned forward;
+normal pages do not pay a second-pass cost. Adjacent pages are half-open and
+carry notes are reconciled instead of redrawn, so long notes remain resident
+until their real visible tail leaves the viewport.
+
+Arbitrary seeks now invalidate the complete asynchronous visual transaction,
+including in-flight page bookkeeping, and source checkpoints again have both a
+65,536-event and 4 MiB spacing. Exact active-note snapshots are stored under a
+global bounded budget so a far seek can reconstruct state near the target
+without replaying from tick zero or making memory proportional to note count.
+
+SnappySynth adaptive velocity shedding now requires measured core overload, a
+real AudioWorklet underrun, and positive audio-vs-visual lag at the same time.
+Mapped event delivery never raises the floor. The floor is wall-clock
+rate-limited instead of increasing once per UI frame, and a recovered underrun
+only hard-resynchronizes when audio is still materially behind.

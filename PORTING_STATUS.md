@@ -266,3 +266,29 @@ track source checkpoints are now byte-spaced (4 MiB) rather than event-count
 spaced, and the initial load performs one full source scan. Visual-state
 checkpoints are generated lazily on demand, so a billion-note crashpoint does
 not create one checkpoint for every 65,536 channel events during loading.
+
+
+## Pass 13.2 — exact visible ordering and seek-safe mapped pages
+
+The mapped renderer no longer merges simultaneous notes by channel/pitch. It
+tracks FIFO NoteOns per `(track,channel,pitch)`, matching the MPWGL2 worker's
+pairing rule. Page-local output is ordered as MPWGL2 paints it: start tick,
+track parse order, then closure/source order for equal starts. Ambiguous
+still-open overlaps on the same row are resolved by a targeted forward scan of
+only the affected track, so their visual stacking is correct even before their
+NoteOff enters the visible tile. Half-open page boundaries and carry
+reconciliation prevent duplicate boundary/carry draws.
+
+Far seeking is backed by sparse source checkpoints every 65,536 channel events
+or 4 MiB. Checkpoints may retain exact active-note FIFOs, but the total snapshot
+payload is capped at 1,048,576 active-note records; if the budget is exhausted
+correctness falls back to replay from an earlier exact snapshot rather than
+allocating unbounded memory. A seek increments the visual generation, clears
+pending-page state, and can re-request any missing tile after stale replies are
+discarded.
+
+SSv2 pressure is now separated into mapped scheduling pressure, AudioWorklet
+underrun state, and measured `_ssw_render_into()` load. Low-velocity shedding
+requires sustained agreement between the latter two plus positive audio lag;
+render cost alone never drops notes. Escalation is time-based (150 ms steps)
+instead of frame-based and recovery is faster than escalation.

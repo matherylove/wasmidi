@@ -265,7 +265,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 13.1 parser is not Memory64.");
+        throw new Error("Generated Pass 13.2 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([

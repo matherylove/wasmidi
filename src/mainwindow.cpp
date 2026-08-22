@@ -353,7 +353,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             // This prevents a successful earlier deployment from silently running
             // the old monolithic "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=13.1', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.2', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -364,10 +364,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.1"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 13.1.');
+                    'Expected bootstrap 13.2.');
             }
 
             const parserBaseUrl =
@@ -503,12 +503,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '13.1' ||
+                        if (String(message.bootstrap || '') !== '13.2' ||
                             message.pagedSource !== true ||
                             message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected mapped-source bootstrap 13.1.');
+                                'Expected mapped-source bootstrap 13.2.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -653,7 +653,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         // 4 GiB Qt-document ceiling for giant MIDIs.
                         globalThis.__wasmidiMappedMidi = {
                             worker,
-                            bootstrap: '13.1',
+                            bootstrap: '13.2',
                             mappedStore: true,
                             keyPending: false,
                             keyQueuedTick: null,
@@ -833,6 +833,23 @@ EM_JS(double, wasmidi_snappy_audio_clock, (), {
 EM_JS(int, wasmidi_snappy_starved, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state && b.state.starved ? 1 : 0;
+});
+
+EM_JS(double, wasmidi_snappy_render_load, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state
+        ? Math.max(0.0, Number(b.state.renderLoad) || 0.0)
+        : 0.0;
+});
+
+EM_JS(int, wasmidi_snappy_producer_overloaded, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state && b.state.producerOverloaded ? 1 : 0;
+});
+
+EM_JS(int, wasmidi_mapped_synth_pending, (), {
+    const mapped = globalThis.__wasmidiMappedMidi;
+    return mapped && mapped.mappedStore && mapped.synthPumpPending ? 1 : 0;
 });
 
 EM_JS(void, wasmidi_snappy_sync_visual_clock, (double time), {
@@ -1889,6 +1906,17 @@ void MainWindow::play()
     synthWasStarved_ = false;
     synthStarvedSinceElapsedMs_ = -1;
     synthCatchupGraceUntilElapsedMs_ = 750;
+    synthVelocityLastRaiseElapsedMs_ = -1;
+
+    // A previous overload must never leak its adaptive velocity threshold into
+    // a new play/resume transaction. Re-evaluate producer pressure from the
+    // fresh SSv2 render metrics instead of starting the first note at an old
+    // elevated "Skipped vel" value.
+    if (synthEffectiveVelocityFloor_ != synthVelocityFloor_) {
+        synthEffectiveVelocityFloor_ = synthVelocityFloor_;
+        skippedVelocity_ = synthEffectiveVelocityFloor_;
+        emit skippedVelocityChanged();
+    }
 
     scheduler_.seek(currentTime_);
     scheduler_.start();
@@ -1950,6 +1978,7 @@ void MainWindow::stop()
     synthWasStarved_ = false;
     synthStarvedSinceElapsedMs_ = -1;
     synthCatchupGraceUntilElapsedMs_ = 0;
+    synthVelocityLastRaiseElapsedMs_ = -1;
     if (synthEffectiveVelocityFloor_ != synthVelocityFloor_) {
         synthEffectiveVelocityFloor_ = synthVelocityFloor_;
         skippedVelocity_ = synthEffectiveVelocityFloor_;
@@ -2002,6 +2031,7 @@ void MainWindow::seek(float seconds)
         playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
         synthStarvedSinceElapsedMs_ = -1;
         synthCatchupGraceUntilElapsedMs_ = 600;
+        synthVelocityLastRaiseElapsedMs_ = -1;
     }
 
     scheduler_.seek(clamped);
@@ -3163,18 +3193,19 @@ void MainWindow::updateCurrentTime()
     updateLiveStats();
 }
 
-void MainWindow::updateEffectiveVelocityFloor(double synthLagSeconds)
+void MainWindow::updateEffectiveVelocityFloor(double renderLoadRatio)
 {
     int target = synthVelocityFloor_;
 
-    // Velocity shedding is intentionally conservative. Pass 13.0 mapped
-    // scheduling could spend a few hundred milliseconds producing the first
-    // event window; interpreting that startup gap as synth lag pushed this
-    // value directly to 127. Only sustained pressure reaches high floors now.
-    if (synthLagSeconds > 0.10) {
+    // Only the measured SSv2 render cost is allowed to raise this floor.
+    // AudioWorklet starvation is ambiguous: on a mapped Black MIDI it also
+    // happens while the parser is still delivering a huge same-tick batch.
+    // The worker filters startup/JIT transients and marks producerOverloaded
+    // only after sustained near/realtime render cost.
+    if (renderLoadRatio > 0.95) {
         const double pressure =
             std::clamp(
-                (synthLagSeconds - 0.10) / 1.40,
+                (renderLoadRatio - 0.95) / 1.05,
                 0.0,
                 1.0);
 
@@ -3189,13 +3220,42 @@ void MainWindow::updateEffectiveVelocityFloor(double synthLagSeconds)
     target = std::clamp(target, synthVelocityFloor_, 127);
 
     if (target > synthEffectiveVelocityFloor_) {
-        // Never jump from the user's floor to 127 in one UI tick. A sustained
-        // overload can still climb all the way to 127, but progressively.
-        synthEffectiveVelocityFloor_ =
-            std::min(target, synthEffectiveVelocityFloor_ + 3);
-    } else if (target < synthEffectiveVelocityFloor_) {
-        synthEffectiveVelocityFloor_ =
-            std::max(target, synthEffectiveVelocityFloor_ - 4);
+        // This function is called once per visual frame. Frame-based +2 steps
+        // made a sustained first-note spike reach 127 in about one second on a
+        // 60 Hz display. Make the ramp wall-clock based instead. Extremely
+        // overloaded cores may rise by three velocity levels per 150 ms, while
+        // marginal pressure rises only one. This remains responsive without
+        // turning one dense chord into an immediate full velocity cutoff.
+        const qint64 elapsedMs =
+            playbackClock_.isValid() ? playbackClock_.elapsed() : 0;
+        if (synthVelocityLastRaiseElapsedMs_ < 0)
+            synthVelocityLastRaiseElapsedMs_ = elapsedMs;
+
+        constexpr qint64 RaiseIntervalMs = 150;
+        const qint64 intervals =
+            std::max<qint64>(
+                0,
+                (elapsedMs - synthVelocityLastRaiseElapsedMs_) /
+                    RaiseIntervalMs);
+        if (intervals > 0) {
+            const int perInterval =
+                renderLoadRatio >= 1.75 ? 3 :
+                renderLoadRatio >= 1.25 ? 2 : 1;
+            const int raise = static_cast<int>(
+                std::min<qint64>(intervals, 4)) * perInterval;
+            synthEffectiveVelocityFloor_ =
+                std::min(target, synthEffectiveVelocityFloor_ + raise);
+            synthVelocityLastRaiseElapsedMs_ +=
+                std::min<qint64>(intervals, 4) * RaiseIntervalMs;
+        }
+    } else {
+        synthVelocityLastRaiseElapsedMs_ = -1;
+        if (target < synthEffectiveVelocityFloor_) {
+            // Recovery should be visibly faster than escalation so a temporary
+            // overload does not leave quiet notes suppressed for many seconds.
+            synthEffectiveVelocityFloor_ =
+                std::max(target, synthEffectiveVelocityFloor_ - 8);
+        }
     }
 
     if (skippedVelocity_ != synthEffectiveVelocityFloor_) {
@@ -3220,8 +3280,26 @@ void MainWindow::updateSynthSynchronization()
     const double lag =
         double(currentTime_) - audioTime;
 
-    const bool starved =
+    const bool workletStarved =
         wasmidi_snappy_starved() != 0;
+
+    // A mapped MIDI can report Worklet starvation while the parser Worker is
+    // still decoding/delivering a huge same-tick event batch. That is a MIDI
+    // scheduling backlog, not evidence that SSv2's render core is too slow.
+    // Do not let this state raise the adaptive velocity floor or trigger a
+    // seek/reset loop that throws away PCM which has already been rendered.
+    const bool mappedSchedulingPending =
+        document_.remoteIndexed &&
+        wasmidi_mapped_synth_pending() != 0;
+
+    const bool starved =
+        workletStarved && !mappedSchedulingPending;
+
+    const double renderLoad =
+        wasmidi_snappy_render_load();
+
+    const bool producerOverloaded =
+        wasmidi_snappy_producer_overloaded() != 0;
 
     const qint64 elapsedMs =
         playbackClock_.isValid()
@@ -3238,36 +3316,49 @@ void MainWindow::updateSynthSynchronization()
         synthStarvedSinceElapsedMs_ = -1;
     }
 
-    // Startup/seek scheduling latency is not evidence that SnappySynth itself
-    // is too slow. Require actual AudioWorklet starvation to persist beyond
-    // both the grace period and a short debounce before dropping velocities.
-    const bool sustainedCatchupPressure =
+    // Velocity shedding requires all three signals to agree:
+    //   1) the SSv2 core itself has measured sustained near/realtime cost,
+    //   2) the AudioWorklet is actually underrunning, and
+    //   3) the audio clock is genuinely behind the visual master clock.
+    // Render cost alone is not a failure: with a healthy prebuffer a 1.1x
+    // transient can be absorbed without dropping a single note. Mapped event
+    // delivery is also excluded because that is parser/scheduler pressure, not
+    // synth pressure.
+    const bool sustainedCoreUnderrun =
+        producerOverloaded &&
         starved &&
+        !mappedSchedulingPending &&
+        lag >= 0.08 &&
         elapsedMs >= synthCatchupGraceUntilElapsedMs_ &&
         synthStarvedSinceElapsedMs_ >= 0 &&
-        elapsedMs - synthStarvedSinceElapsedMs_ >= 250;
+        elapsedMs - synthStarvedSinceElapsedMs_ >= 500;
 
     updateEffectiveVelocityFloor(
-        sustainedCatchupPressure
-            ? std::max(0.0, lag)
-            : 0.0);
+        sustainedCoreUnderrun ? renderLoad : 0.0);
 
     synthWasStarved_ = starved;
 
-    // Audio follows the visual timeline, never the reverse. The important
-    // instant resync is the transition from starved -> healthy. Pass 13.0 also
-    // sought every 100 ms for ordinary 100 ms drift, repeatedly flushing the
-    // PCM prebuffer and making a healthy synth look slow. Ordinary drift now
-    // needs to be large and persistent before a safety resync.
+    // Audio follows the visual timeline, never the reverse. Do not hard-seek a
+    // producer while it is still receiving mapped events, or while the core is
+    // measurably overloaded: both cases turn one temporary delay into a loop
+    // that repeatedly flushes its pre-rendered PCM.
     const bool severeHealthyDrift =
         !starved &&
+        !mappedSchedulingPending &&
+        !producerOverloaded &&
         elapsedMs >= synthCatchupGraceUntilElapsedMs_ &&
-        std::abs(lag) >= 0.75;
+        std::abs(lag) >= 1.0;
+
+    // A brief underrun can naturally refill from the rolling PCM cache. Do not
+    // throw that recovered audio away unless it is still materially behind the
+    // visual clock. This removes another first-note reset loop on dense files.
+    const bool recoveredNeedsResync =
+        recoveredFromStarvation && lag >= 0.20;
 
     const qint64 cooldownMs =
-        recoveredFromStarvation ? 150 : 1200;
+        recoveredNeedsResync ? 250 : 1200;
 
-    if ((recoveredFromStarvation || severeHealthyDrift) &&
+    if ((recoveredNeedsResync || severeHealthyDrift) &&
         elapsedMs - synthLastHardResyncElapsedMs_ >= cooldownMs) {
         synthLastHardResyncElapsedMs_ = elapsedMs;
         synthStarvedSinceElapsedMs_ = -1;

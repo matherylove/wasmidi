@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wasmidi {
@@ -168,6 +169,10 @@ private:
     // every rejected note at Black-MIDI crashpoints.
     std::vector<uint64_t> denseCoverage_;
     std::unordered_map<uint32_t, VisualPage> visualPages_;
+    // Pages requested from the mapped Worker but not delivered yet. This
+    // prevents per-frame request storms while still allowing a seek to cancel
+    // the old window and immediately request the new one.
+    std::unordered_set<uint32_t> visualPendingPages_;
     uint32_t visualCacheGeneration_ = 1;
     uint32_t visualPageSpanTicks_ = 0;
     uint32_t visualWantedFirstPage_ = 0;

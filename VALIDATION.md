@@ -207,3 +207,34 @@ GitHub Actions because this container does not provide the project Qt WASM SDK.
   bitmasks and keeps speculative work low priority.
 - Remote page geometry is not rebuilt/uploaded every rendered frame.
 - Adaptive synth velocity floor cannot jump directly to 127 at playback start.
+
+
+## Pass 13.2 validation
+
+- Core parser/mapped-store/codec/worker sources compile as C++17 with
+  `-O2 -Wall -Wextra -Werror -pedantic`.
+- A synthetic overlap MIDI where channel 1 starts after channel 0 at the same
+  tick/pitch but closes first verifies MPWGL2 closure-order stacking: a page
+  ending before either NoteOff still returns channel 1 first, while the final
+  unresolved note remains open instead of receiving a fabricated EOT.
+- The same overlap page was requested after forward/backward/random page seeks
+  and returned byte-identical `VisualNote` order each time.
+- 100 randomized three-track MIDIs were compared against an independent
+  MPWGL2-style reference (FIFO `(track,channel,pitch)` pairing, EOT orphan
+  flush, stable start-only sort, global/per-track palette assignment and the
+  15 ms zero-length-note minimum). Every mapped `VisualNote` tuple matched in
+  order, start/end, pitch, velocity and both color slots.
+- A long-note tile test verified that a note remains an open carry through
+  successive pages, receives its real NoteOff on the page containing the end,
+  and is absent from later pages while the MIDI itself continues.
+- A 1,000,000-note sequential MIDI (~8.0 MiB) indexed in ~88 ms in this
+  validation container; a direct page seek near tick 1,800,000 took ~2.0 ms.
+  Repeated backward/forward seeks remained valid. Timings are machine-dependent.
+- The 1,000,000-note test used 4 MiB source reads and peaked at roughly 20 MiB
+  native RSS in the local harness.
+- All browser JS workers/bridge/AudioWorklet and the generated-module smoke
+  harness pass `node --check`.
+- The deployment bootstrap and Pages workflow both require parser bootstrap
+  `13.2`, preventing a successful build from publishing an older Worker.
+- Full Qt 6.8/Emscripten Memory64 linking still requires GitHub Actions because
+  the Qt WASM SDK is not installed in this container.

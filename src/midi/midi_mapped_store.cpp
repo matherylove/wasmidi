@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <deque>
 #include <memory>
 #include <queue>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,12 +25,18 @@ namespace {
 // therefore cross the JS/WASM boundary 4x less often.
 constexpr std::size_t SourcePageBytes = 4u << 20;
 constexpr std::size_t SourcePageCount = 8;
-// Source checkpoints are for random access, not for retaining every event.
-// Byte spacing alone bounds seek work without creating one checkpoint per
-// 65,536 events at billion-note crashpoints.
-constexpr uint64_t TrackCheckpointByteStride = 4u << 20;
+// Source checkpoints bound arbitrary-seek replay by both source distance and
+// event count. Even two billion channel events produce only ~30k lightweight
+// checkpoints; active-note snapshots have a separate hard memory budget below.
+constexpr uint64_t TrackCheckpointEventStride = 1u << 16; // 65,536 events
+constexpr uint64_t TrackCheckpointByteStride = 4u << 20;  // or 4 MiB source
 constexpr std::size_t VisualCheckpointCount = 128;
 constexpr std::size_t VisualStateCount = 16u * 128u;
+// Bound the total seek-snapshot payload. Exact sparse snapshots make arbitrary
+// seeks fast, but a pathological billion-note sustained chord must not be
+// duplicated at every source checkpoint. When this budget is exhausted we
+// simply fall back to an earlier exact snapshot and scan forward.
+constexpr uint64_t MaxSeekSnapshotNotes = 1u << 20;
 
 class MappedReader {
 public:
@@ -297,12 +305,24 @@ int systemBytes(uint8_t status)
     }
 }
 
+struct TrackActiveSnapshot {
+    uint16_t key = 0; // channel << 7 | pitch
+    uint32_t startTick = 0;
+    uint8_t velocity = 0;
+    uint64_t openOrder = 0;
+};
+
 struct TrackCheckpoint {
     uint64_t sourceOffset = 0;
     uint64_t channelEventIndex = 0;
     uint32_t tickBefore = 0;
     uint32_t firstTick = 0;
     uint8_t runningBefore = 0;
+    bool activeSnapshotValid = false;
+    // Exact active NoteOn state immediately before sourceOffset. This makes an
+    // arbitrary visual seek O(one sparse source interval) instead of rescanning
+    // from tick 0. Memory scales with checkpoint polyphony, not total notes.
+    std::vector<TrackActiveSnapshot> activeNotes;
 };
 
 struct TrackIndex {
@@ -310,6 +330,10 @@ struct TrackIndex {
     uint32_t length = 0;
     uint64_t channelEvents = 0;
     uint32_t maxTick = 0;
+    uint16_t firstNoteSeenMask = 0;
+    std::array<uint32_t, 16> firstNoteTick{};
+    std::array<uint64_t, 16> firstNoteOrder{};
+    std::array<uint64_t, 16> firstNoteCloseOrder{};
     std::vector<TrackCheckpoint> checkpoints;
 };
 
@@ -320,16 +344,35 @@ struct SysExRef {
     uint8_t status = 0xf0;
 };
 
+struct ActiveVisualNote {
+    uint32_t startTick = 0;
+    uint8_t velocity = 0;
+    uint8_t color = 0;
+    uint64_t openOrder = 0;
+};
+
+using ActiveVisualQueue = std::deque<ActiveVisualNote>;
+
 struct VisualState {
-    std::array<uint64_t, VisualStateCount> count{};
-    std::array<uint8_t, VisualStateCount> style{};
-    std::array<uint8_t, VisualStateCount> velocity{};
-    std::array<uint32_t, VisualStateCount> startTick{};
+    // MPWGL2 pairs NoteOn/NoteOff per (track, channel, pitch) with FIFO
+    // semantics. Keeping only one merged note per channel/pitch (Pass 13.0/13.1)
+    // changed both overlap geometry and draw stacking, especially in per-track
+    // mode. Store only currently-active queues: memory scales with polyphony,
+    // not total MIDI note count.
+    std::unordered_map<uint32_t, ActiveVisualQueue> pending;
 };
 
 struct VisualCheckpoint {
     uint32_t tick = 0;
     VisualState state;
+};
+
+struct VisualPageItem {
+    VisualNote note{};
+    uint32_t track = 0;
+    uint64_t closeOrder = std::numeric_limits<uint64_t>::max();
+    uint64_t openOrder = 0;
+    bool minimumDuration = false;
 };
 
 void buildTempoIndex(MidiDocument& output)
@@ -371,6 +414,7 @@ void buildTempoIndex(MidiDocument& output)
 struct MidiMappedStore::Impl {
     MappedReader reader;
     uint64_t sourceSize = 0;
+    uint64_t seekSnapshotNotesStored = 0;
     std::vector<TrackIndex> tracks;
     std::vector<SysExRef> sysex;
     std::array<uint8_t, 16> globalColors{};
@@ -386,9 +430,11 @@ struct MidiMappedStore::Impl {
         uint8_t running = 0;
         bool ok = true;
         bool currentValid = false;
+        uint64_t channelEventIndex = 0;
+        uint64_t currentOrder = 0;
         EventWord current{};
 
-        bool readNextChannel(EventWord& out)
+        bool readNextChannel(EventWord& out, uint64_t& order)
         {
             if (!cursor)
                 return false;
@@ -465,9 +511,31 @@ struct MidiMappedStore::Impl {
                              (uint32_t(data1) << 8) |
                              (uint32_t(data2) << 16) |
                              (uint32_t(color) << 24);
+                order = channelEventIndex++;
                 return true;
             }
             return false;
+        }
+
+        bool resetFromCheckpoint(
+            Impl* o,
+            uint32_t track,
+            const TrackCheckpoint& checkpoint)
+        {
+            owner = o;
+            trackIndex = track;
+            ok = true;
+            currentValid = false;
+
+            const TrackIndex& ti = owner->tracks[track];
+            cursor = std::make_unique<Cursor>(
+                owner->reader,
+                checkpoint.sourceOffset,
+                ti.offset + uint64_t(ti.length));
+            tick = checkpoint.tickBefore;
+            running = checkpoint.runningBefore;
+            channelEventIndex = checkpoint.channelEventIndex;
+            return true;
         }
 
         bool reset(Impl* o, uint32_t track, uint32_t startTick)
@@ -496,17 +564,14 @@ struct MidiMappedStore::Impl {
                 --it;
             }
 
-            cursor = std::make_unique<Cursor>(
-                owner->reader,
-                it->sourceOffset,
-                ti.offset + uint64_t(ti.length));
-            tick = it->tickBefore;
-            running = it->runningBefore;
+            resetFromCheckpoint(owner, track, *it);
 
             EventWord ev;
-            while (readNextChannel(ev)) {
+            uint64_t order = 0;
+            while (readNextChannel(ev, order)) {
                 if (ev.tick >= startTick) {
                     current = ev;
+                    currentOrder = order;
                     currentValid = true;
                     return true;
                 }
@@ -517,8 +582,10 @@ struct MidiMappedStore::Impl {
         bool advance()
         {
             EventWord ev;
-            if (readNextChannel(ev)) {
+            uint64_t order = 0;
+            if (readNextChannel(ev, order)) {
                 current = ev;
+                currentOrder = order;
                 currentValid = true;
                 return true;
             }
@@ -570,16 +637,27 @@ struct MidiMappedStore::Impl {
             }
         }
 
-        bool peek(EventWord& out) const
+        bool peek(
+            EventWord& out,
+            uint32_t* trackOut = nullptr,
+            uint64_t* orderOut = nullptr) const
         {
             if (heap.empty())
                 return false;
             const auto n = heap.top();
-            out = decoders[n.track].current;
+            const Decoder& decoder = decoders[n.track];
+            out = decoder.current;
+            if (trackOut)
+                *trackOut = n.track;
+            if (orderOut)
+                *orderOut = decoder.currentOrder;
             return true;
         }
 
-        bool next(EventWord& out)
+        bool next(
+            EventWord& out,
+            uint32_t* trackOut = nullptr,
+            uint64_t* orderOut = nullptr)
         {
             if (heap.empty())
                 return false;
@@ -587,6 +665,10 @@ struct MidiMappedStore::Impl {
             heap.pop();
             Decoder& decoder = decoders[n.track];
             out = decoder.current;
+            if (trackOut)
+                *trackOut = n.track;
+            if (orderOut)
+                *orderOut = decoder.currentOrder;
             if (!decoder.advance()) {
                 ok = false;
                 return true; // deliver the current valid event, fail afterwards
@@ -620,16 +702,57 @@ struct MidiMappedStore::Impl {
     {
         TrackIndex& track = tracks[trackIndex];
         track.checkpoints.clear();
+        track.channelEvents = 0;
+        track.maxTick = 0;
+        track.firstNoteSeenMask = 0;
+        track.firstNoteTick.fill(0);
+        track.firstNoteOrder.fill(0);
+        track.firstNoteCloseOrder.fill(std::numeric_limits<uint64_t>::max());
         track.checkpoints.reserve(
             static_cast<std::size_t>(track.length / TrackCheckpointByteStride) + 2u);
         // Initial checkpoint includes leading meta/SysEx and is always safe.
-        track.checkpoints.push_back({track.offset, 0, 0, 0, 0});
+        track.checkpoints.push_back({track.offset, 0, 0, 0, 0, true, {}});
 
         Cursor cursor(reader, track.offset, track.offset + uint64_t(track.length));
         uint32_t tick = 0;
         uint8_t running = 0;
         bool ok = true;
         uint64_t channelEventIndex = 0;
+        uint64_t noteClosureOrder = 0;
+
+        struct ScanActiveNote {
+            uint32_t startTick = 0;
+            uint8_t velocity = 0;
+            uint64_t openOrder = 0;
+        };
+        std::unordered_map<uint16_t, std::deque<ScanActiveNote>> scanActive;
+
+        auto snapshotActive = [this, &scanActive](TrackCheckpoint& checkpoint) {
+            std::size_t count = 0;
+            for (const auto& entry : scanActive)
+                count += entry.second.size();
+
+            if (uint64_t(count) > MaxSeekSnapshotNotes -
+                    std::min<uint64_t>(seekSnapshotNotesStored, MaxSeekSnapshotNotes)) {
+                checkpoint.activeSnapshotValid = false;
+                checkpoint.activeNotes.clear();
+                return;
+            }
+
+            checkpoint.activeNotes.reserve(count);
+            for (const auto& entry : scanActive) {
+                for (const ScanActiveNote& note : entry.second) {
+                    checkpoint.activeNotes.push_back({
+                        entry.first,
+                        note.startTick,
+                        note.velocity,
+                        note.openOrder
+                    });
+                }
+            }
+            checkpoint.activeSnapshotValid = true;
+            seekSnapshotNotesStored += count;
+        };
 
         while (cursor.remaining() && ok) {
             const uint64_t eventStart = cursor.position();
@@ -712,14 +835,19 @@ struct MidiMappedStore::Impl {
             // TickGroup/CompactEvent per event/tick.
             const TrackCheckpoint& lastCp = track.checkpoints.back();
             if (channelEventIndex != 0 &&
-                eventStart - lastCp.sourceOffset >= TrackCheckpointByteStride) {
-                track.checkpoints.push_back({
+                ((channelEventIndex % TrackCheckpointEventStride) == 0 ||
+                 eventStart - lastCp.sourceOffset >= TrackCheckpointByteStride)) {
+                TrackCheckpoint checkpoint{
                     eventStart,
                     channelEventIndex,
                     tickBefore,
                     tick,
-                    runningBefore
-                });
+                    runningBefore,
+                    false,
+                    {}
+                };
+                snapshotActive(checkpoint);
+                track.checkpoints.push_back(std::move(checkpoint));
             } else if (channelEventIndex == 0) {
                 // Refine the initial checkpoint to the actual first channel
                 // event so repeated random access does not rescan huge leading
@@ -732,11 +860,48 @@ struct MidiMappedStore::Impl {
             const bool control = command == 0xb0 || command == 0xc0 ||
                                  command == 0xd0 || command == 0xe0;
 
+            const uint16_t visualKey =
+                uint16_t((uint16_t(channel) << 7) | uint16_t(d1 & 0x7f));
+            if (noteOn) {
+                scanActive[visualKey].push_back({
+                    tick,
+                    d2,
+                    channelEventIndex
+                });
+            } else if (noteOff) {
+                auto active = scanActive.find(visualKey);
+                if (active != scanActive.end() && !active->second.empty()) {
+                    const ScanActiveNote closing = active->second.front();
+                    if ((track.firstNoteSeenMask & uint16_t(1u << channel)) != 0 &&
+                        closing.startTick == track.firstNoteTick[channel] &&
+                        track.firstNoteCloseOrder[channel] ==
+                            std::numeric_limits<uint64_t>::max()) {
+                        track.firstNoteCloseOrder[channel] = noteClosureOrder;
+                    }
+                    ++noteClosureOrder;
+                    active->second.pop_front();
+                    if (active->second.empty())
+                        scanActive.erase(active);
+                }
+            }
+
             ++channelEventIndex;
             ++track.channelEvents;
             ++totalEvents;
             metadata.activeChannelMasks[trackIndex] |= (1u << channel);
             if (noteOn) {
+                const uint16_t channelBit = uint16_t(1u << channel);
+                if ((track.firstNoteSeenMask & channelBit) == 0) {
+                    track.firstNoteSeenMask |= channelBit;
+                    track.firstNoteTick[channel] = tick;
+                    // channelEventIndex is the source order before this event
+                    // is committed below. MPWGL2 assigns per-track colors from
+                    // first appearance in its stable start-sorted note stream;
+                    // this preserves the same track/time/source ordering without
+                    // retaining every note in memory.
+                    track.firstNoteOrder[channel] = channelEventIndex;
+                }
+
                 ++totalNotes;
                 metadata.hasPitch = true;
                 metadata.minPitch = std::min(metadata.minPitch, d1);
@@ -745,6 +910,33 @@ struct MidiMappedStore::Impl {
             if (control)
                 ++totalControls;
             (void)noteOff;
+        }
+
+        // MPWGL2 flushes still-pending NoteOns at EndOfTrack by numeric
+        // pending key and FIFO queue order. Capture only the first emitted note
+        // for each channel so per-track palette assignment can match MPWGL2
+        // without retaining one closure record per note.
+        if (!scanActive.empty()) {
+            std::vector<uint16_t> orphanKeys;
+            orphanKeys.reserve(scanActive.size());
+            for (const auto& entry : scanActive)
+                orphanKeys.push_back(entry.first);
+            std::sort(orphanKeys.begin(), orphanKeys.end());
+            for (uint16_t key : orphanKeys) {
+                const uint8_t orphanChannel = uint8_t((key >> 7) & 0x0f);
+                const auto found = scanActive.find(key);
+                if (found == scanActive.end())
+                    continue;
+                for (const ScanActiveNote& closing : found->second) {
+                    if ((track.firstNoteSeenMask & uint16_t(1u << orphanChannel)) != 0 &&
+                        closing.startTick == track.firstNoteTick[orphanChannel] &&
+                        track.firstNoteCloseOrder[orphanChannel] ==
+                            std::numeric_limits<uint64_t>::max()) {
+                        track.firstNoteCloseOrder[orphanChannel] = noteClosureOrder;
+                    }
+                    ++noteClosureOrder;
+                }
+            }
         }
 
         track.maxTick = tick;
@@ -767,23 +959,170 @@ struct MidiMappedStore::Impl {
             globalColors[ch] = assigned[ch] >= 0 ? uint8_t(assigned[ch]) : uint8_t(ch);
 
         trackColors.resize(metadata.trackCount);
-        next = 0;
-        for (std::size_t t = 0; t < trackColors.size(); ++t) {
+        for (auto& colors : trackColors) {
             for (int ch = 0; ch < 16; ++ch)
-                trackColors[t][ch] = uint8_t(ch);
-            const uint32_t mask = metadata.activeChannelMasks[t];
-            for (int ch = 0; ch < 16; ++ch) {
-                if (mask & (1u << ch))
-                    trackColors[t][ch] = uint8_t(next++ & 15);
+                colors[ch] = uint8_t(ch);
+        }
+
+        // MPWGL2's per-track palette is assigned by first appearance in the
+        // globally start-sorted note stream, not merely track/channel number.
+        // The mapped index records each track/channel's first NoteOn during the
+        // one mandatory source scan, so reproduce that ordering without a
+        // second all-note pass or permanent note array.
+        struct FirstAppearance {
+            uint32_t tick = 0;
+            uint32_t track = 0;
+            uint64_t order = 0;
+            uint64_t closeOrder = std::numeric_limits<uint64_t>::max();
+            uint8_t channel = 0;
+        };
+
+        std::vector<FirstAppearance> appearances;
+        appearances.reserve(trackColors.size() * 4u);
+        for (uint32_t t = 0; t < tracks.size(); ++t) {
+            const TrackIndex& track = tracks[t];
+            for (uint8_t ch = 0; ch < 16; ++ch) {
+                if ((track.firstNoteSeenMask & uint16_t(1u << ch)) == 0)
+                    continue;
+                appearances.push_back({
+                    track.firstNoteTick[ch],
+                    t,
+                    track.firstNoteOrder[ch],
+                    track.firstNoteCloseOrder[ch],
+                    ch
+                });
             }
+        }
+
+        std::stable_sort(
+            appearances.begin(),
+            appearances.end(),
+            [](const FirstAppearance& a, const FirstAppearance& b) {
+                if (a.tick != b.tick)
+                    return a.tick < b.tick;
+                if (a.track != b.track)
+                    return a.track < b.track;
+                if (a.closeOrder != b.closeOrder)
+                    return a.closeOrder < b.closeOrder;
+                return a.order < b.order;
+            });
+
+        next = 0;
+        for (const FirstAppearance& appearance : appearances)
+            trackColors[appearance.track][appearance.channel] =
+                uint8_t(next++ & 15);
+    }
+
+    static uint32_t visualPendingKey(
+        uint32_t track,
+        uint8_t channel,
+        uint8_t pitch)
+    {
+        return (track << 11) |
+               (uint32_t(channel & 0x0f) << 7) |
+               uint32_t(pitch & 0x7f);
+    }
+
+    static VisualNote makeVisualNote(
+        uint32_t startTick,
+        uint32_t endTick,
+        uint8_t pitch,
+        uint8_t velocity,
+        uint8_t color,
+        uint32_t track)
+    {
+        return {
+            startTick,
+            endTick,
+            uint32_t(velocity & 0x7f) |
+            (uint32_t(pitch & 0x7f) << 8) |
+            (uint32_t(color & 0x0f) << 16) |
+            (uint32_t((color >> 4) & 0x0f) << 20) |
+            // The mapped renderer does not need the legacy channel nibble in
+            // bits 24..27 (keyboard state comes from KeySnapshot). Keep a low
+            // track byte in the otherwise-unused high byte so repeated carry
+            // notes from adjacent tiles can be disambiguated more strongly.
+            // Draw order itself is preserved by the page builder and never
+            // depends on this truncated value.
+            (uint32_t(track & 0xffu) << 24)
+        };
+    }
+
+    void closeExpiredOrphans(
+        VisualState& state,
+        uint32_t beforeTick)
+    {
+        for (auto it = state.pending.begin(); it != state.pending.end();) {
+            const uint32_t track = it->first >> 11;
+            if (track < tracks.size() &&
+                tracks[track].maxTick < beforeTick) {
+                it = state.pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void closePageOrphans(
+        VisualState& state,
+        uint32_t pageStart,
+        uint32_t pageEnd,
+        std::vector<VisualPageItem>& output,
+        std::unordered_map<uint32_t, std::deque<std::size_t>>& outputIndices)
+    {
+        for (auto it = state.pending.begin(); it != state.pending.end();) {
+            const uint32_t key = it->first;
+            const uint32_t track = key >> 11;
+            if (track >= tracks.size()) {
+                ++it;
+                continue;
+            }
+
+            const uint32_t endTick = tracks[track].maxTick;
+            if (endTick < pageStart || endTick > pageEnd) {
+                ++it;
+                continue;
+            }
+
+            auto oi = outputIndices.find(key);
+            while (!it->second.empty()) {
+                if (oi != outputIndices.end() && !oi->second.empty()) {
+                    const std::size_t index = oi->second.front();
+                    oi->second.pop_front();
+                    if (index < output.size()) {
+                        VisualPageItem& item = output[index];
+                        item.minimumDuration = endTick <= item.note.startTick;
+                        item.note.endTick =
+                            endTick > item.note.startTick
+                                ? endTick
+                                : (item.note.startTick ==
+                                           std::numeric_limits<uint32_t>::max()
+                                       ? item.note.startTick
+                                       : item.note.startTick + 1u);
+                        // MPWGL2 flushes orphan queues after the track parse.
+                        // Numeric pending keys are visited in ascending order.
+                        item.closeOrder =
+                            std::numeric_limits<uint64_t>::max() -
+                            uint64_t(0xffffffffu - key);
+                    }
+                }
+                it->second.pop_front();
+            }
+
+            if (oi != outputIndices.end())
+                outputIndices.erase(oi);
+            it = state.pending.erase(it);
         }
     }
 
     static void applyVisualEvent(
         VisualState& state,
         const EventWord& event,
-        std::vector<VisualNote>* output,
-        std::array<int64_t, VisualStateCount>* outputIndex)
+        uint32_t track,
+        uint64_t sourceOrder,
+        std::vector<VisualPageItem>* output,
+        std::unordered_map<uint32_t, std::deque<std::size_t>>* outputIndices,
+        bool emitNewNotes = true)
     {
         const uint8_t status = uint8_t(event.packed & 0xffu);
         const uint8_t command = status & 0xf0;
@@ -794,60 +1133,328 @@ struct MidiMappedStore::Impl {
         const uint8_t pitch = uint8_t((event.packed >> 8) & 0x7fu);
         const uint8_t velocity = uint8_t((event.packed >> 16) & 0x7fu);
         const uint8_t color = uint8_t((event.packed >> 24) & 0xffu);
-        const std::size_t idx = std::size_t(channel) * 128u + pitch;
+        const uint32_t key = visualPendingKey(track, channel, pitch);
         const bool noteOn = command == 0x90 && velocity != 0;
 
-        auto closeCurrent = [&](uint32_t endTick) {
-            if (!output || !outputIndex)
-                return;
-            const int64_t oi = (*outputIndex)[idx];
-            if (oi < 0 || static_cast<std::size_t>(oi) >= output->size())
-                return;
-            VisualNote& note = (*output)[static_cast<std::size_t>(oi)];
-            if (note.endTick != 0)
-                return;
-            // Zero means "still open" in the remote shader. Give a same-tick
-            // NoteOff one tick of visible width instead of colliding with that
-            // sentinel.
-            note.endTick = endTick > note.startTick
-                ? endTick
-                : (note.startTick == std::numeric_limits<uint32_t>::max()
-                    ? note.startTick
-                    : note.startTick + 1u);
-            (*outputIndex)[idx] = -1;
-        };
-
         if (noteOn) {
-            if (state.count[idx] != 0 && state.style[idx] != color) {
-                closeCurrent(event.tick);
-                state.count[idx] = 0;
-            }
-            if (state.count[idx] == 0) {
-                state.style[idx] = color;
-                state.velocity[idx] = velocity;
-                state.startTick[idx] = event.tick;
-                if (output && outputIndex) {
-                    (*outputIndex)[idx] = static_cast<int64_t>(output->size());
-                    output->push_back({
+            state.pending[key].push_back({
+                event.tick,
+                velocity,
+                color,
+                sourceOrder
+            });
+
+            if (emitNewNotes && output && outputIndices) {
+                const std::size_t index = output->size();
+                output->push_back({
+                    makeVisualNote(
                         event.tick,
                         0,
-                        uint32_t(velocity) |
-                        (uint32_t(pitch) << 8) |
-                        (uint32_t(color & 0x0f) << 16) |
-                        (uint32_t((color >> 4) & 0x0f) << 20) |
-                        (uint32_t(channel) << 24)
-                    });
-                }
+                        pitch,
+                        velocity,
+                        color,
+                        track),
+                    track,
+                    std::numeric_limits<uint64_t>::max(),
+                    sourceOrder
+                });
+                (*outputIndices)[key].push_back(index);
             }
-            ++state.count[idx];
             return;
         }
 
-        if (state.count[idx] != 0 && state.style[idx] == color) {
-            --state.count[idx];
-            if (state.count[idx] == 0)
-                closeCurrent(event.tick);
+        auto active = state.pending.find(key);
+        if (active == state.pending.end() || active->second.empty())
+            return;
+
+        active->second.pop_front();
+
+        if (output && outputIndices) {
+            auto oi = outputIndices->find(key);
+            if (oi != outputIndices->end() && !oi->second.empty()) {
+                const std::size_t index = oi->second.front();
+                oi->second.pop_front();
+                if (index < output->size()) {
+                    VisualPageItem& item = (*output)[index];
+                    item.minimumDuration = event.tick <= item.note.startTick;
+                    item.note.endTick =
+                        event.tick > item.note.startTick
+                            ? event.tick
+                            : (item.note.startTick ==
+                                       std::numeric_limits<uint32_t>::max()
+                                   ? item.note.startTick
+                                   : item.note.startTick + 1u);
+                    item.closeOrder = sourceOrder;
+                }
+                if (oi->second.empty())
+                    outputIndices->erase(oi);
+            }
         }
+
+        if (active->second.empty())
+            state.pending.erase(active);
+    }
+
+    void closeTrackOrphansForResolvedOrder(
+        uint32_t trackIndex,
+        VisualState& state,
+        std::vector<VisualPageItem>& output,
+        std::unordered_map<uint32_t, std::deque<std::size_t>>& outputIndices)
+    {
+        if (trackIndex >= tracks.size())
+            return;
+
+        std::vector<uint32_t> keys;
+        keys.reserve(32);
+        for (const auto& entry : state.pending) {
+            if ((entry.first >> 11) == trackIndex)
+                keys.push_back(entry.first);
+        }
+        std::sort(keys.begin(), keys.end());
+
+        const uint32_t endTick = tracks[trackIndex].maxTick;
+        for (uint32_t key : keys) {
+            auto active = state.pending.find(key);
+            if (active == state.pending.end())
+                continue;
+            auto oi = outputIndices.find(key);
+            uint64_t queueOrder = 0;
+            while (!active->second.empty()) {
+                if (oi != outputIndices.end() && !oi->second.empty()) {
+                    const std::size_t index = oi->second.front();
+                    oi->second.pop_front();
+                    if (index < output.size()) {
+                        VisualPageItem& item = output[index];
+                        item.minimumDuration = endTick <= item.note.startTick;
+                        item.note.endTick =
+                            endTick > item.note.startTick
+                                ? endTick
+                                : (item.note.startTick ==
+                                           std::numeric_limits<uint32_t>::max()
+                                       ? item.note.startTick
+                                       : item.note.startTick + 1u);
+                        // JS object integer keys enumerate ascending; notes in
+                        // one key retain FIFO queue order.
+                        item.closeOrder =
+                            (uint64_t(1) << 63) |
+                            (uint64_t(key) << 20) |
+                            std::min<uint64_t>(queueOrder, (1u << 20) - 1u);
+                    }
+                }
+                active->second.pop_front();
+                ++queueOrder;
+            }
+            if (oi != outputIndices.end())
+                outputIndices.erase(oi);
+            state.pending.erase(active);
+        }
+    }
+
+    void resolveAmbiguousOpenOrder(
+        uint32_t pageEnd,
+        VisualState& state,
+        std::vector<VisualPageItem>& output,
+        std::unordered_map<uint32_t, std::deque<std::size_t>>& outputIndices)
+    {
+        // MPWGL2 does not sort equal-start notes by NoteOn order. It appends a
+        // note only when its NoteOff is encountered, then performs a stable sort
+        // by start time. Therefore equal-start notes on the same track/row are
+        // visually ordered by closure order. A page ending before those
+        // NoteOffs used to fall back to NoteOn order, which made overlapping
+        // colors visibly different from MPWGL2. Resolve only genuinely
+        // ambiguous groups (2+ still-open notes with the same track/start/pitch)
+        // by scanning that track forward. Normal pages pay no second-pass cost.
+        const auto groupKeyFor = [](const VisualPageItem& item) -> uint64_t {
+            const uint64_t pitch = (item.note.packedData >> 8) & 0x7fu;
+            return (uint64_t(item.track) << 39) |
+                   (uint64_t(item.note.startTick) << 7) |
+                   pitch;
+        };
+
+        std::unordered_map<uint64_t, uint32_t> openCounts;
+        openCounts.reserve(output.size());
+        for (const VisualPageItem& item : output) {
+            if (item.note.endTick == 0)
+                ++openCounts[groupKeyFor(item)];
+        }
+
+        std::vector<uint8_t> needsResolution(output.size(), 0);
+        std::unordered_map<uint64_t, uint32_t> unresolved;
+        std::unordered_map<uint32_t, uint32_t> ambiguousGroupsByTrack;
+        unresolved.reserve(openCounts.size());
+        ambiguousGroupsByTrack.reserve(8);
+
+        for (std::size_t i = 0; i < output.size(); ++i) {
+            if (output[i].note.endTick != 0)
+                continue;
+            const uint64_t group = groupKeyFor(output[i]);
+            const auto countIt = openCounts.find(group);
+            if (countIt == openCounts.end() || countIt->second < 2)
+                continue;
+            needsResolution[i] = 1;
+            if (unresolved.emplace(group, countIt->second).second)
+                ++ambiguousGroupsByTrack[output[i].track];
+        }
+
+        if (ambiguousGroupsByTrack.empty() ||
+            pageEnd == std::numeric_limits<uint32_t>::max()) {
+            return;
+        }
+
+        const uint32_t futureStart = pageEnd + 1u;
+
+        for (auto trackEntry : ambiguousGroupsByTrack) {
+            const uint32_t trackIndex = trackEntry.first;
+            uint32_t groupsRemaining = trackEntry.second;
+            if (trackIndex >= tracks.size() || groupsRemaining == 0)
+                continue;
+
+            Decoder decoder;
+            if (!decoder.reset(this, trackIndex, futureStart) || !decoder.ok)
+                continue;
+
+            auto process = [&](const EventWord& event, uint64_t sourceOrder) {
+                const uint8_t status = uint8_t(event.packed & 0xffu);
+                const uint8_t command = status & 0xf0;
+                if (command == 0x80 ||
+                    (command == 0x90 && ((event.packed >> 16) & 0x7fu) == 0)) {
+                    const uint8_t channel = status & 0x0f;
+                    const uint8_t pitch = uint8_t((event.packed >> 8) & 0x7fu);
+                    const uint32_t pendingKey =
+                        visualPendingKey(trackIndex, channel, pitch);
+                    auto oi = outputIndices.find(pendingKey);
+                    if (oi != outputIndices.end() && !oi->second.empty()) {
+                        const std::size_t index = oi->second.front();
+                        if (index < needsResolution.size() && needsResolution[index]) {
+                            const uint64_t group = groupKeyFor(output[index]);
+                            auto unresolvedIt = unresolved.find(group);
+                            if (unresolvedIt != unresolved.end() &&
+                                unresolvedIt->second > 1) {
+                                --unresolvedIt->second;
+                                needsResolution[index] = 0;
+                                if (unresolvedIt->second == 1 && groupsRemaining > 0)
+                                    --groupsRemaining;
+                            }
+                        }
+                    }
+                }
+
+                // Keep future NoteOns in the FIFO state so subsequent NoteOffs
+                // still pair exactly, but never append notes that start outside
+                // this requested page to the page's output array.
+                applyVisualEvent(
+                    state,
+                    event,
+                    trackIndex,
+                    sourceOrder,
+                    &output,
+                    &outputIndices,
+                    false);
+            };
+
+            if (decoder.currentValid) {
+                process(decoder.current, decoder.currentOrder);
+                decoder.advance();
+            }
+            while (groupsRemaining > 0 && decoder.currentValid && decoder.ok) {
+                process(decoder.current, decoder.currentOrder);
+                decoder.advance();
+            }
+
+            // If we genuinely reached EndOfTrack before the ambiguous group
+            // could be reduced to one open note, its remaining NoteOns are
+            // orphans. Resolve them using MPWGL2's numeric pending-key order.
+            if (groupsRemaining > 0 && !decoder.currentValid && decoder.ok) {
+                closeTrackOrphansForResolvedOrder(
+                    trackIndex,
+                    state,
+                    output,
+                    outputIndices);
+            }
+        }
+
+        // Do not manufacture an EndOfTrack close for the one unresolved note
+        // left in a group after its relative order is already known. The page
+        // intentionally keeps that note open (endTick=0); a later tile will
+        // reveal its real NoteOff. EOT orphans are closed by closePageOrphans()
+        // when the requested tile actually reaches that track's end.
+    }
+
+    bool rebuildVisualStateAt(
+        uint32_t targetTick,
+        VisualState& state)
+    {
+        state.pending.clear();
+
+        for (uint32_t trackIndex = 0;
+             trackIndex < tracks.size();
+             ++trackIndex) {
+            const TrackIndex& track = tracks[trackIndex];
+            if (track.checkpoints.empty())
+                continue;
+
+            // Find the nearest source checkpoint at/before the target. If a
+            // pathological high-polyphony checkpoint exceeded the bounded
+            // snapshot budget, walk backward to the nearest checkpoint whose
+            // active-note state was retained. Correctness is never sacrificed;
+            // only the amount of source that must be replayed increases.
+            auto cp = std::lower_bound(
+                track.checkpoints.begin(),
+                track.checkpoints.end(),
+                targetTick,
+                [](const TrackCheckpoint& item, uint32_t value) {
+                    return item.firstTick < value;
+                });
+
+            if (cp == track.checkpoints.end() || cp->firstTick > targetTick) {
+                if (cp != track.checkpoints.begin())
+                    --cp;
+            }
+
+            while (cp != track.checkpoints.begin() &&
+                   !cp->activeSnapshotValid) {
+                --cp;
+            }
+            if (!cp->activeSnapshotValid)
+                cp = track.checkpoints.begin();
+
+            for (const TrackActiveSnapshot& active : cp->activeNotes) {
+                const uint8_t channel = uint8_t((active.key >> 7) & 0x0f);
+                const uint8_t pitch = uint8_t(active.key & 0x7f);
+                const uint8_t color = static_cast<uint8_t>(
+                    (globalColors[channel] & 0x0f) |
+                    ((trackColors[trackIndex][channel] & 0x0f) << 4));
+                state.pending[
+                    visualPendingKey(trackIndex, channel, pitch)]
+                    .push_back({
+                        active.startTick,
+                        active.velocity,
+                        color,
+                        active.openOrder
+                    });
+            }
+
+            Decoder decoder;
+            decoder.resetFromCheckpoint(this, trackIndex, *cp);
+            EventWord event;
+            uint64_t order = 0;
+            while (decoder.readNextChannel(event, order)) {
+                if (event.tick >= targetTick)
+                    break;
+                applyVisualEvent(
+                    state,
+                    event,
+                    trackIndex,
+                    order,
+                    nullptr,
+                    nullptr);
+            }
+            if (!decoder.ok)
+                return false;
+        }
+
+        closeExpiredOrphans(state, targetTick);
+        return true;
     }
 
     const VisualCheckpoint& checkpointFor(uint32_t tick) const
@@ -886,6 +1493,31 @@ struct MidiMappedStore::Impl {
 
         const uint32_t baseTick = baseIt->tick;
         VisualState state = baseIt->state;
+
+        // A far seek should not replay the global visual state from tick zero.
+        // Reconstruct it independently from each track's bounded source
+        // checkpoint, whose active-note snapshot was captured during the one
+        // mandatory indexing pass. Sequential page warming still uses the
+        // existing previous visual checkpoint because that is cheaper.
+        const uint64_t gap = uint64_t(targetTick) - uint64_t(baseTick);
+        const uint64_t directThreshold =
+            std::max<uint64_t>(
+                1u,
+                uint64_t(visualCheckpointSpan) / 2u);
+        if (gap > directThreshold) {
+            if (!rebuildVisualStateAt(targetTick, state))
+                return checkpointFor(baseTick);
+
+            auto pos = std::lower_bound(
+                checkpoints.begin(), checkpoints.end(), targetTick,
+                [](const VisualCheckpoint& cp, uint32_t value) {
+                    return cp.tick < value;
+                });
+            if (pos == checkpoints.end() || pos->tick != targetTick)
+                pos = checkpoints.insert(pos, {targetTick, state});
+            return *pos;
+        }
+
         Iterator it;
         it.reset(this, baseTick, targetTick);
         if (it.failed())
@@ -901,7 +1533,10 @@ struct MidiMappedStore::Impl {
         }
 
         EventWord event;
-        while (it.peek(event) && event.tick < targetTick) {
+        uint32_t eventTrack = 0;
+        uint64_t eventOrder = 0;
+        while (it.peek(event, &eventTrack, &eventOrder) &&
+               event.tick < targetTick) {
             while (visualCheckpointSpan > 0 &&
                    nextGrid > baseTick &&
                    nextGrid < targetTick &&
@@ -911,6 +1546,7 @@ struct MidiMappedStore::Impl {
                     [](const VisualCheckpoint& cp, uint32_t value) {
                         return cp.tick < value;
                     });
+                closeExpiredOrphans(state, nextGrid);
                 if (pos == checkpoints.end() || pos->tick != nextGrid)
                     checkpoints.insert(pos, {nextGrid, state});
 
@@ -921,12 +1557,20 @@ struct MidiMappedStore::Impl {
                 nextGrid += visualCheckpointSpan;
             }
 
-            it.next(event);
-            applyVisualEvent(state, event, nullptr, nullptr);
+            it.next(event, &eventTrack, &eventOrder);
+            applyVisualEvent(
+                state,
+                event,
+                eventTrack,
+                eventOrder,
+                nullptr,
+                nullptr);
         }
 
         if (it.failed())
             return checkpointFor(baseTick);
+
+        closeExpiredOrphans(state, targetTick);
 
         auto pos = std::lower_bound(
             checkpoints.begin(), checkpoints.end(), targetTick,
@@ -982,6 +1626,8 @@ struct MidiMappedStore::Impl {
             return false;
 
         EventWord event;
+        uint32_t eventTrack = 0;
+        uint64_t eventOrder = 0;
         uint64_t processed = 0;
         auto saveBefore = [&](uint32_t eventTick) {
             while (nextCheckpoint <= metadata.maxTick &&
@@ -998,7 +1644,7 @@ struct MidiMappedStore::Impl {
             }
         };
 
-        while (it.next(event)) {
+        while (it.next(event, &eventTrack, &eventOrder)) {
             // A checkpoint at T means state strictly before events at T.
             if (event.tick >= nextCheckpoint)
                 saveBefore(event.tick);
@@ -1032,7 +1678,13 @@ struct MidiMappedStore::Impl {
                 }
             }
 
-            applyVisualEvent(visualState, event, nullptr, nullptr);
+            applyVisualEvent(
+                visualState,
+                event,
+                eventTrack,
+                eventOrder,
+                nullptr,
+                nullptr);
             ++processed;
             if (progress && (processed & ((1u << 20) - 1u)) == 0) {
                 const int p = 70 + int(std::min<uint64_t>(23, processed * 23 /
@@ -1083,6 +1735,7 @@ void MidiMappedStore::clear()
     if (!impl_)
         impl_ = new Impl;
     impl_->sourceSize = 0;
+    impl_->seekSnapshotNotesStored = 0;
     impl_->tracks.clear();
     impl_->sysex.clear();
     impl_->trackColors.clear();
@@ -1259,61 +1912,132 @@ bool MidiMappedStore::buildVisualPage(
     pageStart = std::min(pageStart, metadata_.maxTick);
     pageEnd = std::min(pageEnd, metadata_.maxTick);
 
+    // Checkpoints contain the exact FIFO set strictly before PAGESTART.
+    // Unlike Pass 13.0/13.1, overlapping same-pitch notes are never collapsed.
     const auto& cp = impl_->ensureCheckpoint(pageStart);
     VisualState state = cp.state;
+
+    std::vector<VisualPageItem> items;
+    std::unordered_map<uint32_t, std::deque<std::size_t>> outputIndices;
+
+    std::size_t activeCount = 0;
+    for (const auto& entry : state.pending)
+        activeCount += entry.second.size();
+    items.reserve(activeCount + 1024);
+    outputIndices.reserve(state.pending.size() + 64);
+
+    // Carry notes are emitted once for this page. The renderer discards carry
+    // duplicates from later tiles when composing several pages.
+    for (const auto& entry : state.pending) {
+        const uint32_t key = entry.first;
+        const uint32_t track = key >> 11;
+        const uint8_t pitch = uint8_t(key & 0x7f);
+        auto& indices = outputIndices[key];
+
+        for (const ActiveVisualNote& active : entry.second) {
+            const std::size_t index = items.size();
+            items.push_back({
+                Impl::makeVisualNote(
+                    active.startTick,
+                    0,
+                    pitch,
+                    active.velocity,
+                    active.color,
+                    track),
+                track,
+                std::numeric_limits<uint64_t>::max(),
+                active.openOrder
+            });
+            indices.push_back(index);
+        }
+    }
+
     Impl::Iterator it;
     it.reset(impl_, pageStart, pageEnd);
     if (it.failed())
         return false;
 
-    EventWord pending{};
-    bool hasPending = false;
     EventWord ev{};
-    while (it.peek(ev) && ev.tick < pageStart) {
-        it.next(ev);
-        Impl::applyVisualEvent(state, ev, nullptr, nullptr);
-    }
-    if (it.failed())
-        return false;
-    if (it.peek(pending) && pending.tick <= pageEnd)
-        hasPending = true;
-
-    std::array<int64_t, VisualStateCount> outputIndex{};
-    outputIndex.fill(-1);
-    for (std::size_t idx = 0; idx < VisualStateCount; ++idx) {
-        if (!state.count[idx])
-            continue;
-        const uint8_t channel = uint8_t(idx / 128u);
-        const uint8_t pitch = uint8_t(idx % 128u);
-        const uint8_t color = state.style[idx];
-        outputIndex[idx] = static_cast<int64_t>(output.size());
-        output.push_back({
-            state.startTick[idx],
-            0,
-            uint32_t(state.velocity[idx]) |
-            (uint32_t(pitch) << 8) |
-            (uint32_t(color & 0x0f) << 16) |
-            (uint32_t((color >> 4) & 0x0f) << 20) |
-            (uint32_t(channel) << 24)
-        });
-    }
-
-    while (hasPending || it.peek(ev)) {
-        if (hasPending) {
-            it.next(ev);
-            hasPending = false;
-        } else {
-            it.next(ev);
-        }
+    uint32_t eventTrack = 0;
+    uint64_t eventOrder = 0;
+    while (it.peek(ev, &eventTrack, &eventOrder)) {
         if (ev.tick > pageEnd)
             break;
-        Impl::applyVisualEvent(state, ev, &output, &outputIndex);
+
+        it.next(ev, &eventTrack, &eventOrder);
+        Impl::applyVisualEvent(
+            state,
+            ev,
+            eventTrack,
+            eventOrder,
+            &items,
+            &outputIndices);
     }
     if (it.failed())
         return false;
 
-    // Open notes intentionally retain endTick=0. The remote renderer extends
-    // that sentinel to uViewEnd exactly like SharpMIDI-raylib.
+    // MPWGL2 closes orphan NoteOns at that track's EndOfTrack. First close
+    // those whose EOT is inside this tile, then resolve the closure order of
+    // still-open equal-start overlaps by scanning only the affected tracks.
+    impl_->closePageOrphans(
+        state,
+        pageStart,
+        pageEnd,
+        items,
+        outputIndices);
+    impl_->resolveAmbiguousOpenOrder(
+        pageEnd,
+        state,
+        items,
+        outputIndices);
+
+    // MPWGL2 gives a zero-length note a 15 ms visible minimum. The mapped
+    // pairing code marks those cases while closing them, then converts the same
+    // duration through the MIDI tempo map here. A one-tick substitute was
+    // visibly shorter at normal PPQ/tempo values.
+    for (VisualPageItem& item : items) {
+        if (!item.minimumDuration)
+            continue;
+        const double minEndSeconds =
+            metadata_.tickToSeconds(item.note.startTick) + 0.015;
+        const double minEndTick =
+            std::ceil(metadata_.secondsToTick(minEndSeconds));
+        item.note.endTick = static_cast<uint32_t>(
+            std::clamp<double>(
+                minEndTick,
+                double(item.note.startTick) + 1.0,
+                double(std::numeric_limits<uint32_t>::max())));
+    }
+
+    // MPWGL2's worker appends notes while parsing tracks, then performs a
+    // stable sort by start time. Because tracks are parsed sequentially, equal
+    // starts are ordered by track; within one track the append order is the
+    // NoteOff/closure order. Recreate that ordering explicitly so opaque
+    // WebGL draws overwrite pixels exactly like MPWGL2's _writeStrip loop.
+    std::stable_sort(
+        items.begin(),
+        items.end(),
+        [](const VisualPageItem& a, const VisualPageItem& b) {
+            if (a.note.startTick != b.note.startTick)
+                return a.note.startTick < b.note.startTick;
+            if (a.track != b.track)
+                return a.track < b.track;
+            // MPWGL2 sorts only by start time. Its worker has already appended
+            // equal-start notes in NoteOff/EOT closure order, so that closure
+            // order -- not the displayed end tick -- is the stable tie-breaker.
+            // This matters for zero-length notes: MPWGL2 expands them to 15 ms
+            // *after* they were appended, without changing their draw order.
+            if (a.closeOrder != b.closeOrder)
+                return a.closeOrder < b.closeOrder;
+            return a.openOrder < b.openOrder;
+        });
+
+    output.reserve(items.size());
+    for (const VisualPageItem& item : items)
+        output.push_back(item.note);
+
+    // Notes whose real NoteOff is beyond this tile intentionally retain
+    // endTick=0. The remote shader extends the sentinel to the current viewEnd.
     return true;
 }
 
@@ -1334,30 +2058,52 @@ bool MidiMappedStore::buildKeySnapshot(
         return false;
 
     EventWord ev;
-    while (it.peek(ev)) {
+    uint32_t eventTrack = 0;
+    uint64_t eventOrder = 0;
+    while (it.peek(ev, &eventTrack, &eventOrder)) {
         if (ev.tick > tick)
             break;
-        it.next(ev);
+        it.next(ev, &eventTrack, &eventOrder);
         const uint8_t command = uint8_t(ev.packed & 0xf0u);
-        // Inclusive end interval: a NoteOff at T turns the key off immediately
-        // after T, matching the horizontal bar's [start,end] semantics.
+        // Inclusive end interval: a NoteOff at T remains visible at T.
         if (ev.tick == tick && command == 0x80)
             continue;
-        Impl::applyVisualEvent(state, ev, nullptr, nullptr);
+        Impl::applyVisualEvent(
+            state,
+            ev,
+            eventTrack,
+            eventOrder,
+            nullptr,
+            nullptr);
     }
     if (it.failed())
         return false;
 
-    for (std::size_t idx = 0; idx < VisualStateCount; ++idx) {
-        if (!state.count[idx])
-            continue;
-        const uint8_t pitch = uint8_t(idx % 128u);
-        const uint8_t color = state.style[idx];
-        const uint64_t sum = uint64_t(output.counts[pitch]) + state.count[idx];
-        output.counts[pitch] = static_cast<uint32_t>(
-            std::min<uint64_t>(sum, std::numeric_limits<uint32_t>::max()));
-        output.globalColors[pitch] = color & 0x0f;
-        output.trackColors[pitch] = (color >> 4) & 0x0f;
+    // Any orphan whose EndOfTrack is strictly before T is no longer active.
+    impl_->closeExpiredOrphans(state, tick);
+
+    std::array<uint64_t, 128> ownerRank{};
+    for (const auto& entry : state.pending) {
+        const uint32_t key = entry.first;
+        const uint32_t track = key >> 11;
+        const uint8_t pitch = uint8_t(key & 0x7f);
+        uint64_t queueOrder = 0;
+
+        for (const ActiveVisualNote& active : entry.second) {
+            if (output.counts[pitch] != std::numeric_limits<uint32_t>::max())
+                ++output.counts[pitch];
+
+            const uint64_t rank =
+                (uint64_t(active.startTick) << 32) |
+                (uint64_t(track & 0xffffu) << 16) |
+                (queueOrder++ & 0xffffu);
+
+            if (output.counts[pitch] == 1 || rank >= ownerRank[pitch]) {
+                ownerRank[pitch] = rank;
+                output.globalColors[pitch] = active.color & 0x0f;
+                output.trackColors[pitch] = (active.color >> 4) & 0x0f;
+            }
+        }
     }
     return true;
 }

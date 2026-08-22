@@ -1146,6 +1146,13 @@ void GLRenderer::setCurrentTime(float seconds)
     if (delta < -0.0005f ||
         std::abs(delta) > std::max(0.25f, noteSpeed_ * 0.50f)) {
         forceCacheReset_ = true;
+
+        // A mapped-source seek invalidates the entire asynchronous tile
+        // transaction, not just the legacy source ring. Pass 13.1 left old
+        // pending pages/generation alive, so late replies from the previous
+        // position could strand the new viewport with permanent holes.
+        if (document_ && document_->remoteIndexed)
+            resetVisualPageCache(false);
     }
 
     currentTime_ = value;
@@ -1564,6 +1571,7 @@ void GLRenderer::renderBackground()
 void GLRenderer::resetVisualPageCache(bool reinstallDocument)
 {
     visualPages_.clear();
+    visualPendingPages_.clear();
     visualPageSpanTicks_ = 0;
     visualWantedFirstPage_ = 0;
     visualWantedPageCount_ = 0;
@@ -1581,12 +1589,14 @@ void GLRenderer::resetVisualPageCache(bool reinstallDocument)
     denseNotes_.clear();
     denseSourceScratch_.clear();
 
-    if (!reinstallDocument)
-        return;
-
+    // Every reset starts a new asynchronous page transaction. This is required
+    // even for a seek-only reset where the document itself stays installed.
     ++visualCacheGeneration_;
     if (visualCacheGeneration_ == 0)
         ++visualCacheGeneration_;
+
+    if (!reinstallDocument)
+        return;
 
 #ifdef __EMSCRIPTEN__
     // Remote-indexed documents keep source events in the persistent Memory64
@@ -1648,6 +1658,8 @@ void GLRenderer::receiveVisualPage(
         pageIndex >= visualWantedFirstPage_ + visualWantedPageCount_) {
         return;
     }
+
+    visualPendingPages_.erase(pageIndex);
 
     VisualPage page;
     page.spanTicks = spanTicks;
@@ -1732,6 +1744,13 @@ void GLRenderer::primeVisualPageCache(
     visualWantedPageCount_ = pageCount;
     visualCurrentPage_ = currentPage;
 
+    // A new prime message supersedes the Worker's current speculative build.
+    // Forget in-flight bookkeeping so every still-missing tile in the new
+    // window is explicitly requested again; otherwise a cancelled old request
+    // can leave a permanent hole after seeking.
+    if (requestChanged)
+        visualPendingPages_.clear();
+
     for (auto it = visualPages_.begin(); it != visualPages_.end();) {
         if (it->second.spanTicks != span ||
             it->first < firstPage ||
@@ -1742,17 +1761,25 @@ void GLRenderer::primeVisualPageCache(
         }
     }
 
-    // Tell the Worker exactly which of the 64 rolling tiles are absent. Pass
-    // 13.0 rebuilt all 63 overlapping pages every time currentPage advanced by
-    // one, turning the cache into a large performance penalty.
+    for (auto it = visualPendingPages_.begin();
+         it != visualPendingPages_.end();) {
+        if (*it < firstPage || *it >= firstPage + pageCount)
+            it = visualPendingPages_.erase(it);
+        else
+            ++it;
+    }
+
+    // Tell the Worker exactly which rolling tiles are absent AND not already
+    // in flight. Unlike Pass 13.1, this is not gated solely on requestChanged:
+    // if a page reply was dropped/cancelled, the renderer can recover it.
     uint32_t missingLo = 0;
     uint32_t missingHi = 0;
     for (uint32_t i = 0; i < pageCount; ++i) {
         const uint32_t pageIndex = firstPage + i;
-        const auto it = visualPages_.find(pageIndex);
+        const auto cached = visualPages_.find(pageIndex);
         const bool missing =
-            it == visualPages_.end() || it->second.spanTicks != span;
-        if (!missing)
+            cached == visualPages_.end() || cached->second.spanTicks != span;
+        if (!missing || visualPendingPages_.find(pageIndex) != visualPendingPages_.end())
             continue;
         if (i < 32)
             missingLo |= uint32_t(1) << i;
@@ -1761,7 +1788,16 @@ void GLRenderer::primeVisualPageCache(
     }
 
 #ifdef __EMSCRIPTEN__
-    if (requestChanged && (missingLo != 0 || missingHi != 0)) {
+    if (missingLo != 0 || missingHi != 0) {
+        for (uint32_t i = 0; i < pageCount; ++i) {
+            const bool requested =
+                i < 32
+                    ? ((missingLo >> i) & 1u) != 0
+                    : ((missingHi >> (i - 32)) & 1u) != 0;
+            if (requested)
+                visualPendingPages_.insert(firstPage + i);
+        }
+
         wasmidi_visual_cache_prime(
             visualCacheGeneration_,
             span,
@@ -1811,21 +1847,97 @@ bool GLRenderer::collectCachedPageNotes(
 
     output.reserve(reserveCount);
 
+    // Each tile is independently seekable, so it repeats notes that began in
+    // an earlier tile and are still alive at this tile's left edge. Never draw
+    // those carries twice: doing so changes MPWGL2's stable-start overwrite
+    // order. Instead reconcile a later carry with the already-emitted open
+    // instance. If the later tile contains its NoteOff, it also supplies the
+    // real endTick so a long note stops at exactly the correct position.
+    std::unordered_map<uint64_t, std::vector<std::size_t>> openByVisualKey;
+    openByVisualKey.reserve(1024);
+
+    const auto visualKey = [](const VisualNote& note) -> uint64_t {
+        return (uint64_t(note.startTick) << 32) |
+               uint64_t(note.packedData);
+    };
+
     for (uint32_t pageIndex = firstPage;
          pageIndex <= lastPage;
          ++pageIndex) {
         const auto& page = visualPages_.at(pageIndex);
+        const uint64_t pageStart64 = uint64_t(pageIndex) * uint64_t(span);
+        const uint32_t pageStart = static_cast<uint32_t>(
+            std::min<uint64_t>(
+                pageStart64,
+                std::numeric_limits<uint32_t>::max()));
+
+        // For identical-looking overlapping notes, map carries to prior open
+        // instances in FIFO order. MPWGL2 also pairs repeated NoteOns FIFO.
+        std::unordered_map<uint64_t, std::size_t> carryCursor;
+
         for (const VisualNote& note : page.notes) {
             if (document_ && document_->remoteIndexed) {
                 if (note.startTick > viewEnd ||
-                    (note.endTick != 0 && note.endTick < searchStart))
+                    (note.endTick != 0 && note.endTick < searchStart)) {
                     continue;
-            } else if (note.startTick < searchStart || note.startTick > viewEnd) {
+                }
+
+                const bool carry =
+                    pageIndex != firstPage &&
+                    note.startTick < pageStart;
+
+                bool reconciledCarry = false;
+                if (carry) {
+                    const uint64_t key = visualKey(note);
+                    const auto found = openByVisualKey.find(key);
+                    if (found != openByVisualKey.end()) {
+                        std::size_t& cursor = carryCursor[key];
+                        auto& candidates = found->second;
+
+                        while (cursor < candidates.size()) {
+                            const std::size_t outputIndex = candidates[cursor++];
+                            if (outputIndex >= output.size())
+                                continue;
+
+                            VisualNote& existing = output[outputIndex];
+                            if (existing.endTick != 0 &&
+                                existing.endTick < pageStart) {
+                                continue;
+                            }
+
+                            if (note.endTick != 0)
+                                existing.endTick = note.endTick;
+
+                            reconciledCarry = true;
+                            break;
+                        }
+                    }
+                    // No earlier copy is resident (normally only possible when
+                    // the first requested tile changed during recovery). Keep
+                    // this carry so the screen remains complete.
+                }
+
+                if (!reconciledCarry) {
+                    output.push_back(note);
+                    if (note.endTick == 0) {
+                        openByVisualKey[visualKey(note)].push_back(
+                            output.size() - 1);
+                    }
+                }
                 continue;
             }
+
+            if (note.startTick < searchStart || note.startTick > viewEnd)
+                continue;
             output.push_back(note);
         }
     }
+
+    // Pages are already emitted in MPWGL2 stable-start order. Because the
+    // cache uses half-open tick tiles, every non-carry note belongs to exactly
+    // one page; concatenating pages in ascending page order therefore preserves
+    // that global order. Re-sorting here used incomplete carry end-times and
+    // could undo the parser's exact closure ordering after a seek.
 
     return true;
 }

@@ -282,7 +282,7 @@ private:
     void resetSynthSchedule(float seconds);
     void scheduleSynthAhead();
     void updateSynthSynchronization();
-    void updateEffectiveVelocityFloor(double synthLagSeconds);
+    void updateEffectiveVelocityFloor(double renderLoadRatio);
     void publishSynthPrebufferConfig();
     uint32_t packSynthMessage(const wasmidi::CompactEvent& event) const;
 
@@ -424,6 +424,10 @@ private:
     // prime its rolling PCM ring.
     qint64 synthStarvedSinceElapsedMs_ = -1;
     qint64 synthCatchupGraceUntilElapsedMs_ = 0;
+    // Rate-limit adaptive velocity shedding. A high render-cost estimate is
+    // not itself an underrun, and the floor must never sprint to 127 merely
+    // because the first dense chord is expensive to initialize.
+    qint64 synthVelocityLastRaiseElapsedMs_ = -1;
     std::size_t synthGroupCursor_ = 0;
     std::size_t synthSysExCursor_ = 0;
     double synthScheduledUntil_ = 0.0;
