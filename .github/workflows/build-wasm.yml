@@ -81,6 +81,7 @@ jobs:
         run: |
           node --check build/wasmidi-midi-parser.js
           node --check web/midi-parser-worker.js
+          node --check tools/memory64_growth_fix.js
           node tools/midi_parser_bootstrap_smoke.cjs build/wasmidi-midi-parser.js
 
       - name: Prepare Pages artifact
@@ -187,7 +188,7 @@ jobs:
           # Pass 13 mapped-store validation. Keep deployment checks in sync with
           # the actual worker source instead of retaining the old Pass 12.9 pin.
           cmp -s web/midi-parser-worker.js site/midi-parser-worker.js
-          grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2"' site/midi-parser-worker.js
+          grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2.1"' site/midi-parser-worker.js
           grep -q 'mappedStore: true' site/midi-parser-worker.js
           grep -q 'wasmidi.js?v=' site/index.html
           grep -q 'coi-serviceworker.js?v=' site/index.html
