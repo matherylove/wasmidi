@@ -238,3 +238,8 @@ GitHub Actions because this container does not provide the project Qt WASM SDK.
   `13.2`, preventing a successful build from publishing an older Worker.
 - Full Qt 6.8/Emscripten Memory64 linking still requires GitHub Actions because
   the Qt WASM SDK is not installed in this container.
+
+
+## Pass 13.2.1 Memory64 growth regression
+
+The generated-module smoke test now verifies a real heap expansion beyond the 64 MiB initial Memory64 heap while constructing a dense visual page. The resulting heap must remain 64 KiB page aligned. This specifically covers the Emscripten 3.1.56 fractional-page-to-BigInt failure observed in GitHub Actions.

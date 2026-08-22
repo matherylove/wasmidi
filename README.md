@@ -348,3 +348,8 @@ real AudioWorklet underrun, and positive audio-vs-visual lag at the same time.
 Mapped event delivery never raises the floor. The floor is wall-clock
 rate-limited instead of increasing once per UI frame, and a recovered underrun
 only hard-resynchronizes when audio is still materially behind.
+
+
+### Pass 13.2.1 Memory64 compatibility
+
+The dedicated MIDI parser keeps its 64 MiB initial heap and grows on demand. A small parser-only post-JS shim works around an Emscripten 3.1.56 Memory64 bug that could pass a fractional page count to BigInt during the first heap expansion; growth is now explicitly rounded to whole 64 KiB WebAssembly pages.

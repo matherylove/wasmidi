@@ -2,11 +2,12 @@
 
 "use strict";
 
-// Pass 13.1: SharpMIDI-style mapped-source parser. The browser File remains
+// Pass 13.2.1: SharpMIDI-style mapped-source parser. The browser File remains
 // outside the WASM heap; only compact indexes/checkpoints remain resident in
 // Memory64, and render/playback data are decoded into bounded pages on demand.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.1";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.2.1";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
+const SYNTH_EVENT_BATCH_EVENTS = 262144;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
 self.__wasmidiMidiParserPercent = 14;
@@ -169,7 +170,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 13.1 parser was built without Memory64 (pointer width " +
+                    "Pass 13.2.1 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 
@@ -293,9 +294,11 @@ async function buildVisualPages(message) {
     for (let i = 0; i < count; ++i) {
         if (!requested(i))
             continue;
-        const page = first + i;
-        if (!visualBuiltPages.has(page))
-            pages.push(page);
+        // The renderer's missing bitmap is authoritative. A previous build may
+        // have completed just as a seek changed generations/windows, causing
+        // its reply to be discarded. Rebuild any tile explicitly requested
+        // instead of trusting Worker-local "built" bookkeeping.
+        pages.push(first + i);
     }
 
     // The viewport can intersect the history tile, current tile and next tile.
@@ -316,7 +319,12 @@ async function buildVisualPages(message) {
             return;
 
         const start = pageIndex * span;
-        const end = Math.min(0xffffffff, start + span);
+        // Page ranges are integer-tick half-open tiles [start,start+span).
+        // Pass 13.1 used an inclusive end at start+span, duplicating every
+        // boundary NoteOn in two adjacent tiles and changing draw order.
+        const end = Math.min(
+            0xffffffff,
+            start + Math.max(0, span - 1));
         if (!Module._wmp_build_visual_page_js(start, end)) {
             throw new Error(parserErrorText(Module, "Could not build mapped visual page"));
         }
@@ -383,13 +391,19 @@ async function pumpSynthWindow(message) {
     const maxBatches = Math.max(1, Math.min(64, Number(message.maxBatches) | 0 || 8));
 
     for (let batchIndex = 0; batchIndex < maxBatches; ++batchIndex) {
-        if (!Module._wmp_build_event_batch_js(endTick, 65536))
+        if (!Module._wmp_build_event_batch_js(endTick, SYNTH_EVENT_BATCH_EVENTS))
             throw new Error(parserErrorText(Module, "Could not build mapped synth batch"));
         const count = sizeToNumber(Module._wmp_event_batch_count_js(), "event batch count");
         const complete = !!Module._wmp_event_batch_complete_js();
         const ptr = pointerToNumber(Module._wmp_event_batch_ptr_js(), "event batch pointer");
-        const messages = [];
-        const times = [];
+        // Avoid Array.push() + Uint32Array.from()/Float64Array.from() for a
+        // crashpoint. Those paths allocate several temporary JS arrays and can
+        // make event delivery look slower than the synth itself. Allocate the
+        // transfer buffers once at their maximum batch size and compact them
+        // in-place while applying the velocity/overlap rules.
+        const messageScratch = new Uint32Array(count);
+        const timeScratch = new Float64Array(count);
+        let outCount = 0;
 
         let lastTick = -1;
         let lastTime = 0;
@@ -433,13 +447,20 @@ async function pumpSynthWindow(message) {
                 }
             }
 
-            messages.push(messageWord >>> 0);
-            times.push(lastTime);
+            messageScratch[outCount] = messageWord >>> 0;
+            timeScratch[outCount] = lastTime;
+            ++outCount;
             ++i;
         }
 
-        const msgArray = Uint32Array.from(messages);
-        const timeArray = Float64Array.from(times);
+        const msgArray =
+            outCount === count
+                ? messageScratch
+                : messageScratch.slice(0, outCount);
+        const timeArray =
+            outCount === count
+                ? timeScratch
+                : timeScratch.slice(0, outCount);
         postMessage({
             type: "synth-batch",
             messages: msgArray.buffer,

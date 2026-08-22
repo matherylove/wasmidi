@@ -117,6 +117,16 @@ if(EMSCRIPTEN)
         "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
     )
 
+    # Emscripten 3.1.56 has a MEMORY64 growth-helper bug: it can feed a
+    # fractional page count to BigInt() while servicing malloc/sbrk. Keep the
+    # adaptive 64 MiB -> 16 GiB heap, but replace only growMemory() after the
+    # generated runtime has been emitted so every delta is an integer 64 KiB
+    # page count before conversion to BigInt.
+    target_link_options(midi_parser_core PRIVATE
+        "--post-js"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/memory64_growth_fix.js"
+    )
+
     # Qt stays single-threaded. SnappySynthV2 is a completely separate WASM
     # module hosted in its own browser Worker and may therefore use pthreads
     # without moving the QML/renderer runtime off Qt's wasm_singlethread build.

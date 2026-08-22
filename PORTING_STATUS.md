@@ -292,3 +292,8 @@ underrun state, and measured `_ssw_render_into()` load. Low-velocity shedding
 requires sustained agreement between the latter two plus positive audio lag;
 render cost alone never drops notes. Escalation is time-based (150 ms steps)
 instead of frame-based and recovery is faster than escalation.
+
+
+## Pass 13.2.1 - Emscripten 3.1.56 Memory64 growth hotfix
+
+The generated Memory64 parser could fail on its first heap expansion because Emscripten 3.1.56 converted a fractional page count (for example 10.999984741210938) to BigInt. The parser now links a post-JS growth shim that rounds the byte delta to an integer number of 64 KiB WebAssembly pages before calling Memory.grow(BigInt(pageCount)). The adaptive 64 MiB initial / 16 GiB maximum policy is unchanged. CI now requires the dense visual-page smoke test to grow the heap beyond 64 MiB successfully.

@@ -265,7 +265,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 13.2 parser is not Memory64.");
+        throw new Error("Generated Pass 13.2.1 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -386,6 +386,18 @@ async function main() {
         throw new Error(
             "Mapped parser could not build a visual page after dense indexing: " +
             parserErrorText(Module, "unknown visual-page failure"));
+    }
+
+    // Pass 13.2.1 regression: Emscripten 3.1.56 MEMORY64 used to calculate
+    // a fractional Memory.grow page count here (for example
+    // 10.999984741210938) and BigInt() aborted. The dense visual page is large
+    // enough to force the 64 MiB initial heap to grow.
+    const grownHeapBytes = Module.HEAPU8.buffer.byteLength;
+    if (grownHeapBytes <= 64 * 1024 * 1024 ||
+        (grownHeapBytes % (64 * 1024)) !== 0) {
+        throw new Error(
+            "Memory64 growth regression probe did not produce an aligned heap " +
+            "larger than 64 MiB: " + grownHeapBytes);
     }
 
     if (!Module._wmp_build_key_snapshot_js(0) ||
