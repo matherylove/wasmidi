@@ -169,3 +169,26 @@ stage during the generated Memory64 parser smoke test.
 - `node --check` passes for both browser workers and the generated-module smoke
   harness; workflow YAML parses successfully; the artifact post-processing
   Python was executed against a representative Qt HTML bootstrap.
+
+## Pass 13.0 — SharpMIDI-style mapped-store validation
+
+- `src/midi/midi_mapped_store.cpp` compiles under C++17 with
+  `-Wall -Wextra -Werror` together with the existing parser/codec/worker core.
+- A native parity smoke MIDI containing tempo, explicit status, running status,
+  CC, NoteOff and velocity-zero NoteOn validated mapped metadata, visual-page
+  reconstruction, inclusive keyboard state and bounded playback batches.
+- A 1,000,000-note same-pitch crashpoint used an ~8 MiB source, retained only
+  the sparse mapped index, reconstructed one merged visible note, and returned a
+  bounded 65,536-event playback batch. Native test peak RSS was ~31 MiB.
+- A virtual single-track MIDI larger than 2 GiB (2,500,000,022 bytes) indexed
+  successfully without materializing its source. The largest source read was
+  exactly 1 MiB and only 11 source-page reads were required for the synthetic
+  sparse file.
+- `node --check` passes for the parser Worker, visual worker, SnappySynth bridge,
+  SnappySynth worker, AudioWorklet and generated-module smoke harness.
+- The generated-module smoke harness now requires the mapped visual-page,
+  keyboard-snapshot and bounded-event APIs and rejects a dense source if the Qt
+  metadata wire image grows proportionally with note count.
+
+The final Qt 6.8 + Emscripten/Memory64 link and browser execution still require
+GitHub Actions because this container does not provide the project Qt WASM SDK.

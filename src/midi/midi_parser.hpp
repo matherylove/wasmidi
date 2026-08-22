@@ -81,6 +81,12 @@ struct MidiDocument {
     uint16_t ticksPerBeat = 480;
     uint16_t _pad = 0;
 
+    // Browser-only huge-MIDI mode. When true, this object contains metadata
+    // only; channel events/visual notes remain in the persistent Memory64
+    // mapped-source Worker and are supplied as bounded pages on demand.
+    bool remoteIndexed = false;
+    uint8_t _remotePad[3]{};
+
     uint32_t maxTick = 0;
     float durationSeconds = 0.0f;
 

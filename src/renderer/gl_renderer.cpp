@@ -138,6 +138,19 @@ EM_JS(void, wasmidi_visual_cache_shutdown, (), {
 EM_JS(void, wasmidi_visual_cache_prime,
       (uint32_t generation, uint32_t spanTicks, uint32_t firstPage,
        uint32_t pageCount, uint32_t currentPage), {
+    const mapped = globalThis.__wasmidiMappedMidi;
+    if (mapped && mapped.worker && mapped.mappedStore) {
+        mapped.worker.postMessage({
+            type: 'visual-prime',
+            generation: generation >>> 0,
+            spanTicks: spanTicks >>> 0,
+            firstPage: firstPage >>> 0,
+            count: pageCount >>> 0,
+            currentPage: currentPage >>> 0
+        });
+        return;
+    }
+
     const state = globalThis.__wasmidiVisualCache;
     if (!state || !state.worker ||
         state.generation !== (generation >>> 0))
@@ -336,9 +349,15 @@ void main()
         snapTickX(
             float(aStartTick));
 
+    // SharpMIDI keeps currently-open notes with EndTick=0 and lets the
+    // renderer extend them to the current view edge. This avoids ever needing
+    // a permanent VisualNote object just to know a future NoteOff.
+    float effectiveEndTick =
+        aEndTick == 0u ? uViewEnd : float(aEndTick);
+
     float endX =
         snapTickX(
-            float(aEndTick));
+            effectiveEndTick);
 
     float x =
         mix(
@@ -402,7 +421,7 @@ void main()
         (uCurrentTick >=
              float(aStartTick) &&
          uCurrentTick <=
-             float(aEndTick))
+             effectiveEndTick)
             ? 1.0
             : 0.0;
 
@@ -1554,7 +1573,13 @@ void GLRenderer::resetVisualPageCache(bool reinstallDocument)
         ++visualCacheGeneration_;
 
 #ifdef __EMSCRIPTEN__
-    if (document_ && !document_->visualNotes.empty()) {
+    // Remote-indexed documents keep source events in the persistent Memory64
+    // parser Worker. There is intentionally nothing to copy into the legacy
+    // visual-cache Worker here. visual_cache_prime() routes page requests to
+    // the mapped Worker instead.
+    if (document_ && document_->remoteIndexed) {
+        wasmidi_visual_cache_shutdown();
+    } else if (document_ && !document_->visualNotes.empty()) {
         const std::size_t count = document_->visualNotes.size();
         const uint32_t safeCount =
             static_cast<uint32_t>(
@@ -1647,7 +1672,8 @@ void GLRenderer::primeVisualPageCache(
     uint32_t viewStart,
     uint32_t viewEnd)
 {
-    if (!document_ || document_->visualNotes.empty())
+    if (!document_ ||
+        (!document_->remoteIndexed && document_->visualNotes.empty()))
         return;
 
     const uint32_t actualSpan =
@@ -1752,8 +1778,13 @@ bool GLRenderer::collectCachedPageNotes(
          ++pageIndex) {
         const auto& page = visualPages_.at(pageIndex);
         for (const VisualNote& note : page.notes) {
-            if (note.startTick < searchStart || note.startTick > viewEnd)
+            if (document_ && document_->remoteIndexed) {
+                if (note.startTick > viewEnd ||
+                    (note.endTick != 0 && note.endTick < searchStart))
+                    continue;
+            } else if (note.startTick < searchStart || note.startTick > viewEnd) {
                 continue;
+            }
             output.push_back(note);
         }
     }
@@ -2224,6 +2255,16 @@ void GLRenderer::syncVisualCache(
     uint32_t viewStart,
     uint32_t viewEnd)
 {
+    if (document_ && document_->remoteIndexed) {
+        sourceBegin_ = 0;
+        sourceEnd_ = 0;
+        if (!carryNotes_.empty()) {
+            carryNotes_.clear();
+            uploadCarryCache();
+        }
+        return;
+    }
+
     if (!document_ ||
         document_->visualNotes.empty()) {
         sourceBegin_ = 0;
@@ -2422,7 +2463,7 @@ void GLRenderer::renderRoll()
     renderBackground();
 
     if (!document_ ||
-        document_->visualNotes.empty()) {
+        (!document_->remoteIndexed && document_->visualNotes.empty())) {
         return;
     }
 
@@ -2443,27 +2484,43 @@ void GLRenderer::renderRoll()
         viewStart,
         viewEnd);
 
-    if (sourceEnd_ <= sourceBegin_ &&
-        carryNotes_.empty())
-        return;
-
     const uint32_t visibleSpan =
         std::max<uint32_t>(1, viewEnd - viewStart);
     const uint32_t searchStart =
         viewStart > visibleSpan
             ? viewStart - visibleSpan
             : 0;
-    const std::size_t desiredBegin =
-        document_->lowerBoundVisualStart(double(searchStart));
-    const std::size_t desiredEnd =
-        document_->upperBoundVisualStart(double(viewEnd));
 
-    const bool denseMode =
-        buildDenseDrawList(
+    std::size_t desiredBegin = 0;
+    std::size_t desiredEnd = 0;
+    bool denseMode = false;
+
+    if (document_->remoteIndexed) {
+        // The permanent note list does not exist in Pass 13. Draw only the
+        // bounded SharpMIDI-style RenderNote pages supplied by the persistent
+        // mapped Worker. Missing pages simply leave the previous/background
+        // frame visible until recovery finishes; they never trigger a giant
+        // fallback allocation in Qt.
+        std::vector<VisualNote> pageNotes;
+        if (!collectCachedPageNotes(searchStart, viewEnd, pageNotes))
+            return;
+        denseNotes_ = std::move(pageNotes);
+        if (denseNotes_.empty())
+            return;
+        uploadDenseDrawList();
+        denseMode = true;
+    } else {
+        if (sourceEnd_ <= sourceBegin_ && carryNotes_.empty())
+            return;
+
+        desiredBegin = document_->lowerBoundVisualStart(double(searchStart));
+        desiredEnd = document_->upperBoundVisualStart(double(viewEnd));
+        denseMode = buildDenseDrawList(
             viewStart,
             viewEnd,
             desiredBegin,
             desiredEnd);
+    }
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);

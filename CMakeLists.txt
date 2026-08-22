@@ -57,6 +57,7 @@ if(EMSCRIPTEN)
     add_executable(midi_parser_core
         src/midi/midi_parser.cpp
         src/midi/midi_document_codec.cpp
+        src/midi/midi_mapped_store.cpp
         src/midi/midi_worker_core.cpp
     )
 
@@ -112,7 +113,7 @@ if(EMSCRIPTEN)
         # they do not affect the real-time renderer or SnappySynth hot paths.
         "-sASSERTIONS=1"
         "-sINCOMING_MODULE_JS_API=['noInitialRun','noExitRuntime','onAbort','print','printErr']"
-        "-sEXPORTED_FUNCTIONS=['_wmp_alloc_js','_wmp_free_js','_wmp_parse_js','_wmp_parse_file_js','_wmp_pack','_wmp_result_ptr_js','_wmp_result_size_js','_wmp_release_result','_wmp_error_ptr_js','_wmp_error_size_js','_wmp_pointer_bits']"
+        "-sEXPORTED_FUNCTIONS=['_wmp_parse_file_js','_wmp_pack','_wmp_result_ptr_js','_wmp_result_size_js','_wmp_release_result','_wmp_build_visual_page_js','_wmp_visual_page_ptr_js','_wmp_visual_page_count_js','_wmp_build_key_snapshot_js','_wmp_key_snapshot_ptr_js','_wmp_key_snapshot_word_count_js','_wmp_reset_event_cursor_js','_wmp_build_event_batch_js','_wmp_event_batch_ptr_js','_wmp_event_batch_count_js','_wmp_event_batch_complete_js','_wmp_tick_to_seconds_js','_wmp_error_ptr_js','_wmp_error_size_js','_wmp_pointer_bits']"
         "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']"
     )
 

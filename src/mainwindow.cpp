@@ -137,6 +137,21 @@ void wasmidi_visual_key_page_ready(
         wordCount);
 }
 
+extern "C" EMSCRIPTEN_KEEPALIVE
+void wasmidi_remote_key_state_ready(
+    double tick,
+    const uint32_t* words,
+    uint32_t wordCount)
+{
+    if (!g_browserMainWindow)
+        return;
+
+    g_browserMainWindow->receiveRemoteKeyState(
+        tick,
+        words,
+        wordCount);
+}
+
 // Browser MIDI loading is delegated to a cache-busted Worker. The Worker keeps
 // the File outside WebAssembly and lets the parser read bounded windows, so no
 // allocation proportional to the raw MIDI file size occurs on the Qt thread.
@@ -323,12 +338,22 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             setProgress(0, 'Starting MIDI loader');
 
+            // Only one mapped MIDI source may own the player at a time. The
+            // previous Worker holds the old File/Blob and its sparse indexes;
+            // terminate it before opening another file so RAM is released
+            // immediately instead of waiting for GC.
+            const previousMapped = globalThis.__wasmidiMappedMidi;
+            if (previousMapped && previousMapped.worker) {
+                try { previousMapped.worker.terminate(); } catch (_) {}
+            }
+            globalThis.__wasmidiMappedMidi = null;
+
             // Fetch the Worker source explicitly with cache:no-store instead of
             // trusting the browser/Pages HTTP cache for a Worker constructor.
             // This prevents a successful 12.9 deployment from silently running
             // the old 12.7 "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=12.9', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.0', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -339,10 +364,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.9"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.0"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 12.9.');
+                    'Expected bootstrap 13.0.');
             }
 
             const parserBaseUrl =
@@ -366,16 +391,124 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                     const message =
                         event.data || {};
 
+                    // Pass 13 keeps this Worker alive after loading. It is the
+                    // browser equivalent of SharpMIDI's memory-mapped backing
+                    // store and serves bounded renderer/keyboard/audio pages.
+                    if (message.type === 'visual-page') {
+                        const payload = new Uint8Array(
+                            message.data || new ArrayBuffer(0));
+                        const count = Math.floor(payload.byteLength / 12);
+                        let ptr = 0;
+                        try {
+                            if (payload.byteLength) {
+                                ptr = _malloc(payload.byteLength);
+                                if (!ptr) return;
+                                HEAPU8.set(payload, ptr);
+                            }
+                            _wasmidi_visual_page_ready(
+                                message.generation >>> 0,
+                                message.spanTicks >>> 0,
+                                message.pageIndex >>> 0,
+                                ptr,
+                                count >>> 0,
+                                Number(message.sourceCount) >>> 0,
+                                Number(message.difficulty) || 0.0);
+                        } finally {
+                            if (ptr) _free(ptr);
+                        }
+                        return;
+                    }
+
+                    if (message.type === 'key-state') {
+                        const payload = new Uint8Array(
+                            message.data || new ArrayBuffer(0));
+                        const wordCount = Math.floor(payload.byteLength / 4);
+                        let ptr = 0;
+                        try {
+                            if (payload.byteLength) {
+                                ptr = _malloc(payload.byteLength);
+                                if (!ptr) return;
+                                HEAPU8.set(payload, ptr);
+                            }
+                            _wasmidi_remote_key_state_ready(
+                                Number(message.tick) || 0.0,
+                                ptr,
+                                wordCount >>> 0);
+                        } finally {
+                            if (ptr) _free(ptr);
+                        }
+
+                        const mapped = globalThis.__wasmidiMappedMidi;
+                        if (mapped && mapped.worker === worker) {
+                            mapped.keyPending = false;
+                            if (mapped.keyQueuedTick != null) {
+                                const tick = mapped.keyQueuedTick;
+                                mapped.keyQueuedTick = null;
+                                mapped.keyPending = true;
+                                mapped.worker.postMessage({ type: 'key-state', tick });
+                            }
+                        }
+                        return;
+                    }
+
+                    if (message.type === 'synth-batch') {
+                        const bridge = globalThis.WasmidiSnappyBridge;
+                        if (bridge && typeof bridge.schedule === 'function') {
+                            bridge.schedule(
+                                new Uint32Array(message.messages || new ArrayBuffer(0)),
+                                new Float64Array(message.times || new ArrayBuffer(0)),
+                                Number(message.safeUntil) || 0.0);
+                        }
+
+                        if (message.complete) {
+                            const mapped = globalThis.__wasmidiMappedMidi;
+                            if (mapped && mapped.worker === worker) {
+                                mapped.synthPumpPending = false;
+                                if (mapped.synthQueued) {
+                                    const queued = mapped.synthQueued;
+                                    mapped.synthQueued = null;
+                                    mapped.synthPumpPending = true;
+                                    mapped.worker.postMessage(queued);
+                                }
+                            }
+                        }
+                        return;
+                    }
+
+                    if (message.type === 'synth-more') {
+                        const mapped = globalThis.__wasmidiMappedMidi;
+                        if (mapped && mapped.worker === worker) {
+                            mapped.worker.postMessage({
+                                type: 'synth-pump',
+                                endTick: Number(message.endTick) || 0,
+                                safeUntil: Number(message.safeUntil) || 0,
+                                velocityFloor: Number(message.velocityFloor != null
+                                    ? message.velocityFloor
+                                    : mapped.synthVelocityFloor) || 0,
+                                maxBatches: 8
+                            });
+                        }
+                        return;
+                    }
+
+                    if (message.type === 'runtime-error') {
+                        console.error(
+                            '[WASMIDI mapped MIDI worker]',
+                            message.message || 'runtime error');
+                        return;
+                    }
+
                     if (message.type === 'worker-ready') {
                         console.info(
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '12.9' ||
-                            message.pagedSource !== true) {
+                        if (String(message.bootstrap || '') !== '13.0' ||
+                            message.pagedSource !== true ||
+                            message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected paged-source bootstrap 12.9.');
+                                'Expected mapped-source bootstrap 13.0.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -513,6 +646,22 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             parsedInstallSize,
                             namePtr,
                             nameBytes.length);
+
+                        // Metadata is now installed in Qt, but the authoritative
+                        // channel-event/file store deliberately remains in this
+                        // Memory64 Worker. Keeping it alive is what removes the
+                        // 4 GiB Qt-document ceiling for giant MIDIs.
+                        globalThis.__wasmidiMappedMidi = {
+                            worker,
+                            bootstrap: '13.0',
+                            mappedStore: true,
+                            keyPending: false,
+                            keyQueuedTick: null,
+                            synthPumpPending: false,
+                            synthQueued: null,
+                            synthVelocityFloor: 0
+                        };
+                        worker = null;
                     } finally {
                         _free(namePtr);
                         releaseParsedInstall();
@@ -556,6 +705,73 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
      * Worker creation, promises, bridge loading, or file processing.
      */
     input.click();
+});
+
+// Persistent mapped-MIDI Worker controls. These calls are intentionally tiny:
+// the File and compact sparse indexes never cross into Qt's wasm32 heap.
+EM_JS(void, wasmidi_mapped_shutdown, (), {
+    const mapped = globalThis.__wasmidiMappedMidi;
+    if (mapped && mapped.worker) {
+        try { mapped.worker.terminate(); } catch (_) {}
+    }
+    globalThis.__wasmidiMappedMidi = null;
+});
+
+EM_JS(void, wasmidi_mapped_request_key_state, (double tick), {
+    const mapped = globalThis.__wasmidiMappedMidi;
+    if (!mapped || !mapped.worker || !mapped.mappedStore)
+        return;
+    const target = Math.max(0, Number(tick) || 0);
+    if (mapped.keyPending) {
+        // Coalesce UI-frame requests. The keyboard only needs the newest visual
+        // clock position; an obsolete snapshot must never queue behind it.
+        mapped.keyQueuedTick = target;
+        return;
+    }
+    mapped.keyPending = true;
+    mapped.worker.postMessage({ type: 'key-state', tick: target });
+});
+
+EM_JS(void, wasmidi_mapped_synth_reset, (double tick), {
+    const mapped = globalThis.__wasmidiMappedMidi;
+    if (!mapped || !mapped.worker || !mapped.mappedStore)
+        return;
+    mapped.synthPumpPending = false;
+    mapped.synthQueued = null;
+    mapped.worker.postMessage({
+        type: 'synth-reset',
+        tick: Math.max(0, Number(tick) || 0)
+    });
+});
+
+EM_JS(void, wasmidi_mapped_synth_pump,
+      (double endTick, double safeUntil, int velocityFloor), {
+    const mapped = globalThis.__wasmidiMappedMidi;
+    if (!mapped || !mapped.worker || !mapped.mappedStore)
+        return;
+
+    const request = {
+        type: 'synth-pump',
+        endTick: Math.max(0, Number(endTick) || 0),
+        safeUntil: Math.max(0, Number(safeUntil) || 0),
+        velocityFloor: Math.max(0, Math.min(127, velocityFloor | 0)),
+        maxBatches: 8
+    };
+    mapped.synthVelocityFloor = request.velocityFloor;
+
+    if (mapped.synthPumpPending) {
+        // Keep only the furthest requested horizon; this mirrors the visual
+        // page cache and prevents a dense MIDI from building an unbounded JS
+        // message backlog while the Worker is still decoding.
+        if (!mapped.synthQueued ||
+            request.endTick >= Number(mapped.synthQueued.endTick || 0)) {
+            mapped.synthQueued = request;
+        }
+        return;
+    }
+
+    mapped.synthPumpPending = true;
+    mapped.worker.postMessage(request);
 });
 
 
@@ -1180,6 +1396,55 @@ void MainWindow::receiveKeyboardVisualPage(
     keyboardVisualPages_.push_back(std::move(page));
 }
 
+void MainWindow::receiveRemoteKeyState(
+    double tick,
+    const uint32_t* words,
+    uint32_t wordCount)
+{
+    constexpr uint32_t ExpectedWords = 128u * 3u;
+    if (!document_.remoteIndexed || !words || wordCount != ExpectedWords)
+        return;
+
+    const auto oldMask = visualPitchMask_;
+    const auto oldColors = visualPitchColor_;
+
+    visualPitchCount_.fill(0);
+    visualPitchMask_.fill(0);
+    visualPitchColor_.fill(-1);
+    for (auto& counts : visualPitchColorCounts_) counts.fill(0);
+    visualColorVoices_.fill(0);
+    visualActiveVoices_ = 0;
+
+    for (std::size_t pitch = 0; pitch < 128; ++pitch) {
+        const uint32_t count = words[pitch];
+        if (!count) continue;
+        const uint8_t globalColor = static_cast<uint8_t>(words[128 + pitch] & 0x0fu);
+        const uint8_t trackColor = static_cast<uint8_t>(words[256 + pitch] & 0x0fu);
+        const uint8_t color = perTrackColors_ ? trackColor : globalColor;
+
+        visualPitchCount_[pitch] = count;
+        visualPitchMask_[pitch] = 1;
+        visualPitchColor_[pitch] = static_cast<int8_t>(color);
+        visualPitchColorCounts_[pitch][color] = count;
+        visualColorVoices_[color] = static_cast<uint32_t>(
+            std::min<uint64_t>(std::numeric_limits<uint32_t>::max(),
+                uint64_t(visualColorVoices_[color]) + count));
+        visualActiveVoices_ = static_cast<int>(
+            std::min<int64_t>(std::numeric_limits<int>::max(),
+                int64_t(visualActiveVoices_) + count));
+    }
+
+    visualTick_ = tick;
+    visualStateValid_ = true;
+
+    if (oldMask != visualPitchMask_ || oldColors != visualPitchColor_)
+        emit activePitchesChanged();
+    if (activeVoices_ != visualActiveVoices_) {
+        activeVoices_ = visualActiveVoices_;
+        emit activeVoicesChanged();
+    }
+}
+
 void MainWindow::invalidateLiveTrackers()
 {
     liveWindowsValid_ = false;
@@ -1199,6 +1464,10 @@ void MainWindow::invalidateLiveTrackers()
 void MainWindow::clearFile()
 {
     stop();
+
+#ifdef __EMSCRIPTEN__
+    wasmidi_mapped_shutdown();
+#endif
 
     scheduler_.setDocument(nullptr);
     clearKeyboardVisualPageCache();
@@ -1266,11 +1535,10 @@ void MainWindow::publishDocumentMetadata()
         document_.durationSeconds;
 
     noteCount_ =
-        static_cast<int>(
+        static_cast<qint64>(
             std::min<uint64_t>(
                 document_.noteCount,
-                uint64_t(
-                    std::numeric_limits<int>::max())));
+                uint64_t(std::numeric_limits<qint64>::max())));
 
     trackCount_ =
         document_.trackCount;
@@ -1289,11 +1557,10 @@ void MainWindow::publishDocumentMetadata()
                     std::numeric_limits<int>::max())));
 
     controlEventCount_ =
-        static_cast<int>(
+        static_cast<qint64>(
             std::min<uint64_t>(
                 document_.controlEventCount,
-                uint64_t(
-                    std::numeric_limits<int>::max())));
+                uint64_t(std::numeric_limits<qint64>::max())));
 
     uint32_t channelMask = 0;
 
@@ -2470,6 +2737,17 @@ void MainWindow::rebuildVisualStateAt(double targetTick)
 
 void MainWindow::syncVisualState(double targetTick, bool forceRebuild)
 {
+    if (document_.remoteIndexed) {
+#ifdef __EMSCRIPTEN__
+        (void)forceRebuild;
+        wasmidi_mapped_request_key_state(targetTick);
+#else
+        (void)targetTick;
+        (void)forceRebuild;
+#endif
+        return;
+    }
+
     if (document_.visualNotes.empty()) {
         clearVisualState();
         return;
@@ -2569,8 +2847,7 @@ void MainWindow::updateNeuralVisuals()
 
 void MainWindow::updateLiveStats()
 {
-    if (!hasMidi() ||
-        document_.tickGroups.empty()) {
+    if (!hasMidi()) {
         if (nps_ != 0) {
             nps_ = 0;
             emit npsChanged();
@@ -2588,6 +2865,43 @@ void MainWindow::updateLiveStats()
 
         return;
     }
+
+    if (document_.remoteIndexed) {
+        const double time = currentTime_;
+        const double tick = document_.secondsToTick(time);
+        syncVisualState(tick);
+
+        // The mapped loader keeps a half-second density histogram instead of
+        // one NoteOn object per source note. Use that bounded metadata for the
+        // live panel while exact keyboard state arrives asynchronously from
+        // the mapped Worker.
+        int newNps = 0;
+        if (!document_.derivedNpsTimeline.empty()) {
+            const std::size_t bucket = std::min<std::size_t>(
+                document_.derivedNpsTimeline.size() - 1,
+                static_cast<std::size_t>(std::max(0.0, std::floor(time / 0.5))));
+            newNps = static_cast<int>(std::min<uint64_t>(
+                uint64_t(document_.derivedNpsTimeline[bucket]) * 2u,
+                uint64_t(std::numeric_limits<int>::max())));
+        }
+        if (nps_ != newNps) { nps_ = newNps; emit npsChanged(); }
+        if (ccPerSecond_ != 0) { ccPerSecond_ = 0; emit ccPerSecondChanged(); }
+
+        float newBpm = 120.0f;
+        if (!tempoTimes_.empty()) {
+            auto it = std::upper_bound(tempoTimes_.begin(), tempoTimes_.end(), currentTime_);
+            std::size_t index = it == tempoTimes_.begin() ? 0 :
+                static_cast<std::size_t>((it - tempoTimes_.begin()) - 1);
+            index = std::min(index, tempoBpms_.size() - 1);
+            newBpm = tempoBpms_[index];
+        }
+        if (!qFuzzyCompare(bpm_, newBpm)) { bpm_ = newBpm; emit bpmChanged(); }
+        updateNeuralVisuals();
+        return;
+    }
+
+    if (document_.tickGroups.empty())
+        return;
 
     const double time =
         currentTime_;
@@ -2941,6 +3255,23 @@ void MainWindow::resetSynthSchedule(float seconds)
     const uint32_t tick = static_cast<uint32_t>(
         std::max(0.0, std::floor(document_.secondsToTick(time))));
 
+    if (document_.remoteIndexed) {
+        synthGroupCursor_ = 0;
+        synthSysExCursor_ = 0;
+        synthScheduledUntil_ = time;
+        synthMessages_.clear();
+        synthTimes_.clear();
+#ifdef __EMSCRIPTEN__
+        if (soundfontLoaded_) {
+            wasmidi_mapped_synth_reset(double(tick));
+            // Keep SnappySynth's safety horizon pinned to the visual seek point
+            // until the mapped Worker has supplied the first exact event batch.
+            wasmidi_snappy_schedule(nullptr, nullptr, 0, time);
+        }
+#endif
+        return;
+    }
+
     synthGroupCursor_ = document_.lowerBoundGroup(tick);
     synthSysExCursor_ = static_cast<std::size_t>(
         std::lower_bound(
@@ -3069,7 +3400,7 @@ void MainWindow::resetSynthSchedule(float seconds)
 void MainWindow::scheduleSynthAhead()
 {
 #ifdef __EMSCRIPTEN__
-    if (!isPlaying_ || !soundfontLoaded_ || document_.tickGroups.empty())
+    if (!isPlaying_ || !soundfontLoaded_)
         return;
 
     constexpr std::size_t BatchLimit = 65536;
@@ -3087,6 +3418,24 @@ void MainWindow::scheduleSynthAhead()
             duration_,
             double(currentTime_) + requestedAhead + 0.10);
     if (target <= synthScheduledUntil_ + 0.015)
+        return;
+
+    if (document_.remoteIndexed) {
+        const uint32_t targetTick = static_cast<uint32_t>(
+            std::min<double>(document_.maxTick,
+                             std::ceil(document_.secondsToTick(target))));
+        double safeUntil = target;
+        if (target >= double(duration_) - 1e-7) {
+            const double rate = synthSampleRate_ > 0 ? double(synthSampleRate_) : 48000.0;
+            safeUntil += std::max(0.05, (double(synthBufferFrames_) / rate) * 2.0);
+        }
+        wasmidi_mapped_synth_pump(
+            double(targetTick), safeUntil, synthEffectiveVelocityFloor_);
+        synthScheduledUntil_ = target;
+        return;
+    }
+
+    if (document_.tickGroups.empty())
         return;
 
     const uint32_t targetTick = static_cast<uint32_t>(

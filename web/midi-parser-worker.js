@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 12.9: parser is a Memory64 module with a Number-only JS ABI. Chromium 133+ can grow one wasm64
-// memory to 16 GiB; physical pages are committed on demand, so the effective
-// limit below that is whatever the browser/OS can actually provide.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.9";
+// Pass 13.0: SharpMIDI-style mapped-source parser. The browser File remains Chromium 133+ can grow one wasm64
+// outside the WASM heap; only compact indexes/checkpoints remain resident in
+// Memory64, and render/playback data are decoded into bounded pages on demand.
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.0";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 
 self.__wasmidiMidiParserStage = "Loading parser core";
@@ -141,9 +141,6 @@ function getModule() {
             })
         ).then(Module => {
             if (!Module ||
-                typeof Module._wmp_alloc_js !== "function" ||
-                typeof Module._wmp_free_js !== "function" ||
-                typeof Module._wmp_parse_js !== "function" ||
                 typeof Module._wmp_parse_file_js !== "function" ||
                 typeof Module._wmp_pack !== "function" ||
                 typeof Module._wmp_result_ptr_js !== "function" ||
@@ -151,6 +148,18 @@ function getModule() {
                 typeof Module._wmp_release_result !== "function" ||
                 typeof Module._wmp_error_ptr_js !== "function" ||
                 typeof Module._wmp_error_size_js !== "function" ||
+                typeof Module._wmp_build_visual_page_js !== "function" ||
+                typeof Module._wmp_visual_page_ptr_js !== "function" ||
+                typeof Module._wmp_visual_page_count_js !== "function" ||
+                typeof Module._wmp_build_key_snapshot_js !== "function" ||
+                typeof Module._wmp_key_snapshot_ptr_js !== "function" ||
+                typeof Module._wmp_key_snapshot_word_count_js !== "function" ||
+                typeof Module._wmp_reset_event_cursor_js !== "function" ||
+                typeof Module._wmp_build_event_batch_js !== "function" ||
+                typeof Module._wmp_event_batch_ptr_js !== "function" ||
+                typeof Module._wmp_event_batch_count_js !== "function" ||
+                typeof Module._wmp_event_batch_complete_js !== "function" ||
+                typeof Module._wmp_tick_to_seconds_js !== "function" ||
                 typeof Module._wmp_pointer_bits !== "function" ||
                 !Module.HEAPU8) {
                 throw new Error(
@@ -160,19 +169,9 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 12.8 parser was built without Memory64 (pointer width " +
+                    "Pass 13.0 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
-
-            // Probe the public ABI before accepting any user file. The facade
-            // must remain Number-only even though the module itself is wasm64.
-            const abiProbe = Module._wmp_alloc_js(1);
-            if (typeof abiProbe !== "number" ||
-                !Number.isSafeInteger(abiProbe) || abiProbe <= 0) {
-                throw new Error(
-                    "Memory64 parser JS facade did not return a Number address.");
-            }
-            Module._wmp_free_js(abiProbe);
 
             self.__wasmidiMidiParserStage = "Memory64 parser core ready";
             self.__wasmidiMidiParserPercent = 15;
@@ -239,11 +238,205 @@ async function streamPackedResult(Module, file, resultPtr, resultSize) {
 postMessage({
     type: "worker-ready",
     bootstrap: WASMIDI_MIDI_PARSER_BOOTSTRAP,
-    pagedSource: true
+    pagedSource: true,
+    mappedStore: true
 });
+
+
+let mappedFileReady = false;
+let visualPrimeToken = 0;
+
+function copyWasmBytes(Module, address, byteLength) {
+    const base = pointerToNumber(address, "mapped result pointer");
+    const size = sizeToNumber(byteLength, "mapped result size");
+    if (!base || size < 0 || base + size > Module.HEAPU8.length)
+        throw new Error("Mapped result points outside the Memory64 heap.");
+    return Module.HEAPU8.slice(base, base + size);
+}
+
+async function buildVisualPages(message) {
+    const Module = await getModule();
+    if (!mappedFileReady)
+        return;
+
+    const generation = Number(message.generation) >>> 0;
+    const span = Math.max(1, Number(message.spanTicks) >>> 0);
+    const first = Number(message.firstPage) >>> 0;
+    const count = Math.max(0, Math.min(64, Number(message.count) >>> 0));
+    const current = Number(message.currentPage) >>> 0;
+    const token = ++visualPrimeToken;
+
+    const pages = [];
+    for (let i = 0; i < count; ++i)
+        pages.push(first + i);
+    pages.sort((a, b) => {
+        if (a === current) return -1;
+        if (b === current) return 1;
+        return Math.abs(a - current) - Math.abs(b - current);
+    });
+
+    for (const pageIndex of pages) {
+        if (token !== visualPrimeToken)
+            return;
+        const start = pageIndex * span;
+        const end = Math.min(0xffffffff, start + span);
+        if (!Module._wmp_build_visual_page_js(start, end)) {
+            throw new Error(parserErrorText(Module, "Could not build mapped visual page"));
+        }
+        const noteCount = sizeToNumber(Module._wmp_visual_page_count_js(), "visual page count");
+        const bytes = noteCount
+            ? copyWasmBytes(Module, Module._wmp_visual_page_ptr_js(), noteCount * 12)
+            : new Uint8Array(0);
+        postMessage({
+            type: "visual-page",
+            generation,
+            spanTicks: span,
+            pageIndex,
+            sourceCount: noteCount,
+            difficulty: noteCount,
+            data: bytes.buffer
+        }, [bytes.buffer]);
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+}
+
+async function buildKeyState(message) {
+    const Module = await getModule();
+    if (!mappedFileReady)
+        return;
+    const tick = Math.max(0, Math.min(0xffffffff, Number(message.tick) || 0));
+    if (!Module._wmp_build_key_snapshot_js(tick))
+        throw new Error(parserErrorText(Module, "Could not build mapped key state"));
+    const words = sizeToNumber(Module._wmp_key_snapshot_word_count_js(), "key snapshot words");
+    const bytes = words
+        ? copyWasmBytes(Module, Module._wmp_key_snapshot_ptr_js(), words * 4)
+        : new Uint8Array(0);
+    postMessage({
+        type: "key-state",
+        tick,
+        data: bytes.buffer
+    }, [bytes.buffer]);
+}
+
+async function resetSynthCursor(message) {
+    const Module = await getModule();
+    const tick = Math.max(0, Math.min(0xffffffff, Number(message.tick) || 0));
+    Module._wmp_reset_event_cursor_js(tick);
+    postMessage({ type: "synth-cursor-reset", tick });
+}
+
+async function pumpSynthWindow(message) {
+    const Module = await getModule();
+    if (!mappedFileReady)
+        return;
+    const endTick = Math.max(0, Math.min(0xffffffff, Number(message.endTick) || 0));
+    const velocityFloor = Math.max(0, Math.min(127, Number(message.velocityFloor) | 0));
+    const safeUntil = Math.max(0, Number(message.safeUntil) || 0);
+    const maxBatches = Math.max(1, Math.min(64, Number(message.maxBatches) | 0 || 8));
+
+    for (let batchIndex = 0; batchIndex < maxBatches; ++batchIndex) {
+        if (!Module._wmp_build_event_batch_js(endTick, 65536))
+            throw new Error(parserErrorText(Module, "Could not build mapped synth batch"));
+        const count = sizeToNumber(Module._wmp_event_batch_count_js(), "event batch count");
+        const complete = !!Module._wmp_event_batch_complete_js();
+        const ptr = pointerToNumber(Module._wmp_event_batch_ptr_js(), "event batch pointer");
+        const messages = [];
+        const times = [];
+
+        let lastTick = -1;
+        let lastTime = 0;
+        let i = 0;
+        while (i < count) {
+            const byte = ptr + i * 8;
+            const tick = Module.HEAPU32[byte >>> 2] >>> 0;
+            const packed = Module.HEAPU32[(byte >>> 2) + 1] >>> 0;
+            const status = packed & 255;
+            const command = status & 0xf0;
+            const data1 = (packed >>> 8) & 127;
+            const data2 = (packed >>> 16) & 127;
+
+            if (tick !== lastTick) {
+                lastTick = tick;
+                lastTime = Number(Module._wmp_tick_to_seconds_js(tick)) || 0;
+            }
+
+            if (command === 0x90 && data2 !== 0 && data2 < velocityFloor) {
+                ++i;
+                continue;
+            }
+
+            let messageWord = status | (data1 << 8) | (data2 << 16);
+            if (command === 0x90 && data2 !== 0) {
+                // Same compact overlap optimization as the Qt scheduler: pack
+                // up to 256 consecutive identical NoteOns into SnappySynth's
+                // high-byte overlap count without reordering controller data.
+                let run = 1;
+                while (i + run < count && run < 256) {
+                    const nextByte = ptr + (i + run) * 8;
+                    const nextTick = Module.HEAPU32[nextByte >>> 2] >>> 0;
+                    const nextPacked = Module.HEAPU32[(nextByte >>> 2) + 1] >>> 0;
+                    if (nextTick !== tick || (nextPacked & 0x00ffffff) !== (packed & 0x00ffffff))
+                        break;
+                    ++run;
+                }
+                if (run > 1) {
+                    messageWord |= (run - 1) << 24;
+                    i += run - 1;
+                }
+            }
+
+            messages.push(messageWord >>> 0);
+            times.push(lastTime);
+            ++i;
+        }
+
+        const msgArray = Uint32Array.from(messages);
+        const timeArray = Float64Array.from(times);
+        postMessage({
+            type: "synth-batch",
+            messages: msgArray.buffer,
+            times: timeArray.buffer,
+            safeUntil: complete ? safeUntil : 0,
+            complete
+        }, [msgArray.buffer, timeArray.buffer]);
+
+        if (complete)
+            return;
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    // More data remains. Main thread will request another pump without moving
+    // safeUntil, so SnappySynth can never render beyond a partial dense tick.
+    postMessage({ type: "synth-more", endTick, safeUntil, velocityFloor });
+}
 
 self.onmessage = async event => {
     const message = event.data || {};
+    try {
+        if (message.type === "visual-prime") {
+            await buildVisualPages(message);
+            return;
+        }
+        if (message.type === "key-state") {
+            await buildKeyState(message);
+            return;
+        }
+        if (message.type === "synth-reset") {
+            await resetSynthCursor(message);
+            return;
+        }
+        if (message.type === "synth-pump") {
+            await pumpSynthWindow(message);
+            return;
+        }
+    } catch (error) {
+        postMessage({
+            type: "runtime-error",
+            message: error && error.message ? error.message : String(error)
+        });
+        return;
+    }
+
     if (message.type !== "parse" || !message.file)
         return;
 
@@ -278,12 +471,12 @@ self.onmessage = async event => {
                     : parserText);
         }
 
-        // The C++ document is now independent of the File source. Drop all
-        // browser-side source references before allocating the packed result.
-        self.__wasmidiMidiParserFile = null;
-        self.__wasmidiMidiParserFileReader = null;
+        // Pass 13 keeps the File as the browser equivalent of SharpMIDI's
+        // MemoryMappedFile. Only metadata is packed to Qt; render/playback
+        // pages continue to read bounded windows from this File after loading.
+        mappedFileReady = true;
 
-        self.__wasmidiMidiParserStage = "Packing parsed MIDI";
+        self.__wasmidiMidiParserStage = "Packing mapped MIDI metadata";
         const packed = Module._wmp_pack();
         if (!packed) {
             throw new Error(
@@ -291,7 +484,7 @@ self.onmessage = async event => {
         }
         resultOwned = true;
 
-        progress(95, "Streaming parsed MIDI to player");
+        progress(95, "Streaming mapped MIDI metadata to player");
 
         await streamPackedResult(
             Module,
@@ -305,7 +498,7 @@ self.onmessage = async event => {
         Module._wmp_release_result();
         resultOwned = false;
 
-        progress(96, "Installing parsed MIDI");
+        progress(96, "Installing mapped MIDI metadata");
     } catch (error) {
         const failure =
             (lastAbortReason || lastRuntimeError)
@@ -319,8 +512,10 @@ self.onmessage = async event => {
                 : String(failure || "Could not parse MIDI")
         });
     } finally {
-        self.__wasmidiMidiParserFile = null;
-        self.__wasmidiMidiParserFileReader = null;
+        if (!mappedFileReady) {
+            self.__wasmidiMidiParserFile = null;
+            self.__wasmidiMidiParserFileReader = null;
+        }
         self.__wasmidiMidiParserReadAt = null;
         if (resultOwned && Module) {
             try { Module._wmp_release_result(); } catch (_) {}

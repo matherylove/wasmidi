@@ -8,7 +8,7 @@ namespace wasmidi {
 namespace {
 
 constexpr uint32_t WireMagic = 0x444d5357u; // "WSMD" on little-endian wasm
-constexpr uint32_t WireVersion = 3;
+constexpr uint32_t WireVersion = 4;
 
 template <typename T>
 void appendPod(std::vector<uint8_t>& out, const T& value)
@@ -152,6 +152,10 @@ bool serializeMidiDocument(
     appendPod(bytes, document.trackCount);
     appendPod(bytes, document.ticksPerBeat);
     appendPod(bytes, document._pad);
+    const uint8_t remoteIndexed = document.remoteIndexed ? 1u : 0u;
+    appendPod(bytes, remoteIndexed);
+    const uint8_t remotePad[3] = {0, 0, 0};
+    appendBytes(bytes, remotePad, sizeof(remotePad));
     appendPod(bytes, document.maxTick);
     appendPod(bytes, document.durationSeconds);
     appendPod(bytes, document.noteCount);
@@ -236,11 +240,15 @@ bool deserializeMidiDocument(
 
     uint8_t hasPitch = 0;
     uint8_t derivedStatsReady = 0;
+    uint8_t remoteIndexed = 0;
+    uint8_t remotePad[3]{};
 
     if (!reader.pod(document.format) ||
         !reader.pod(document.trackCount) ||
         !reader.pod(document.ticksPerBeat) ||
         !reader.pod(document._pad) ||
+        !reader.pod(remoteIndexed) ||
+        !reader.take(remotePad, sizeof(remotePad)) ||
         !reader.pod(document.maxTick) ||
         !reader.pod(document.durationSeconds) ||
         !reader.pod(document.noteCount) ||
@@ -270,6 +278,7 @@ bool deserializeMidiDocument(
 
     document.hasPitch = hasPitch != 0;
     document.derivedStatsReady = derivedStatsReady != 0;
+    document.remoteIndexed = remoteIndexed != 0;
 
     uint32_t sysexCount = 0;
     if (!reader.pod(sysexCount)) {

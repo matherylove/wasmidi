@@ -224,3 +224,26 @@ ships `build-id.txt`.
 
 The production MIDI path still uses `_wmp_parse_file_js()` with bounded 4 MiB
 random-access windows; it does not allocate `file.size` in the parser heap.
+
+## Pass 13.0 — SharpMIDI-style mapped residency
+
+The large-MIDI path now follows the memory model used by SharpMIDI-raylib instead
+of building a permanent `MidiDocument` proportional to every channel event and
+NoteOn. The browser `File` remains the authoritative backing store in the
+persistent parser Worker. The Memory64 core keeps a 32 MiB LRU source-page cache,
+track/source checkpoints spaced by 65,536 channel events or 4 MiB, tempo/SysEx
+metadata, and 128 fixed visual-state checkpoints. Renderer pages, keyboard state,
+and exact synth event batches are decoded from the mapped source on demand.
+
+Qt receives metadata only (`MidiDocument::remoteIndexed=true`) and never receives
+the full event/note stream. The horizontal renderer requests bounded visual pages,
+the keyboard requests fixed 384-word snapshots, and SnappySynth receives bounded
+exact channel-event batches from a persistent 64-bit cursor. This removes the
+previous `events + visualNotes + keyboard-index + serialized-copy + Qt-copy`
+resident-memory multiplication and removes the Qt wasm32 heap as the storage
+location for the complete MIDI.
+
+The design intentionally mirrors SharpMIDI's important properties: source-backed
+parsing, two-pass indexing, long event counters/offsets, bounded playback buffers,
+and reconstruction of visible notes during a sweep instead of permanent storage
+of one render note per NoteOn.

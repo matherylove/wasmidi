@@ -289,3 +289,17 @@ monolithically. Files whose *parsed resident document* exceeds that address
 space still require the planned segmented player-residency path; Pass 12.8
 removes the raw-input allocation ceiling, not that separate final residency
 ceiling.
+
+## Pass 13.0 — SharpMIDI-style huge-MIDI memory model
+
+For very large files, WASMIDI no longer stores one permanent visual note plus a
+second permanent playback event representation for every note. The selected
+browser `File` stays attached to a persistent Memory64 Worker, which treats it as
+the browser equivalent of SharpMIDI-raylib's `MemoryMappedFile`.
+
+The Worker keeps a bounded 32 MiB source-page cache and sparse source checkpoints.
+The horizontal renderer requests visible note pages, the keyboard requests its
+128-key state, and SnappySynth requests exact bounded event batches. Qt receives
+only MIDI metadata. This makes source size and total note count independent from
+the Qt wasm32 heap and is the intended path for multi-gigabyte / billion-note
+MIDIs, subject to actual browser/OS memory and processing-time limits.

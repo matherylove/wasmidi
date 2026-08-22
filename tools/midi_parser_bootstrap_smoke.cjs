@@ -238,14 +238,23 @@ async function main() {
         throw new Error("Parser aborted during bootstrap: " + abortReason);
 
     for (const name of [
-        "_wmp_alloc_js",
-        "_wmp_free_js",
-        "_wmp_parse_js",
         "_wmp_parse_file_js",
         "_wmp_pack",
         "_wmp_result_ptr_js",
         "_wmp_result_size_js",
         "_wmp_release_result",
+        "_wmp_build_visual_page_js",
+        "_wmp_visual_page_ptr_js",
+        "_wmp_visual_page_count_js",
+        "_wmp_build_key_snapshot_js",
+        "_wmp_key_snapshot_ptr_js",
+        "_wmp_key_snapshot_word_count_js",
+        "_wmp_reset_event_cursor_js",
+        "_wmp_build_event_batch_js",
+        "_wmp_event_batch_ptr_js",
+        "_wmp_event_batch_count_js",
+        "_wmp_event_batch_complete_js",
+        "_wmp_tick_to_seconds_js",
         "_wmp_error_ptr_js",
         "_wmp_error_size_js",
         "_wmp_pointer_bits",
@@ -256,7 +265,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 12.9 parser is not Memory64.");
+        throw new Error("Generated Pass 13.0 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -369,6 +378,29 @@ async function main() {
             "Dense paged-source smoke test did not honor the 4 MiB window cap.");
     }
 
+    // Pass 13's critical invariant: the parsed source remains a mapped store,
+    // not a monolithic event/note document. Exercise every bounded consumer
+    // directly against the same File-backed index before packing metadata.
+    if (!Module._wmp_build_visual_page_js(0, 1) ||
+        sizeNumber(Module._wmp_visual_page_count_js()) === 0) {
+        throw new Error(
+            "Mapped parser could not build a visual page after dense indexing: " +
+            parserErrorText(Module, "unknown visual-page failure"));
+    }
+
+    if (!Module._wmp_build_key_snapshot_js(0) ||
+        sizeNumber(Module._wmp_key_snapshot_word_count_js()) !== 384) {
+        throw new Error(
+            "Mapped parser did not produce the fixed 384-word keyboard state.");
+    }
+
+    Module._wmp_reset_event_cursor_js(0);
+    if (!Module._wmp_build_event_batch_js(0, 65536) ||
+        sizeNumber(Module._wmp_event_batch_count_js()) === 0) {
+        throw new Error(
+            "Mapped parser could not stream a bounded playback batch.");
+    }
+
     if (!Module._wmp_pack()) {
         throw new Error(
             "Parser could not pack dense smoke-test MIDI: " +
@@ -379,10 +411,9 @@ async function main() {
     if (!Module._wmp_result_ptr_js() || denseResultSize === 0)
         throw new Error("Dense parser smoke test produced an empty document.");
 
-    // 600k duplicated crashpoint notes should remain compact enough that the
-    // final wire image is dominated by the authoritative event/visual streams,
-    // not by an accidental one-event-per-note keyboard index.
-    if (denseResultSize > 16 * 1024 * 1024)
+    // Pass 13 sends metadata only. Even 600k source notes must not make the
+    // Qt wire image scale with event/note count.
+    if (denseResultSize > 2 * 1024 * 1024)
         throw new Error(
             "Dense parser smoke-test document unexpectedly expanded to " +
             denseResultSize + " bytes.");
@@ -390,7 +421,7 @@ async function main() {
     Module._wmp_release_result();
 
     console.log(
-        "MIDI parser Memory64 paged-source/no-stale-deploy/progress-ABI/dense parse smoke test OK");
+        "MIDI parser Pass 13 mapped-source/streaming-render-playback smoke test OK");
 }
 
 main().catch(error => {

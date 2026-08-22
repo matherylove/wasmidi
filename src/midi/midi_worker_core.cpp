@@ -1,6 +1,8 @@
 #include "midi_document_codec.hpp"
 #include "midi_parser.hpp"
+#include "midi_mapped_store.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -17,8 +19,12 @@
 
 namespace {
 
-wasmidi::MidiParser g_parser;
+wasmidi::MidiMappedStore g_mappedStore;
 wasmidi::MidiDocument g_document;
+std::vector<wasmidi::VisualNote> g_visualPage;
+std::vector<wasmidi::MidiMappedStore::EventWord> g_eventBatch;
+std::vector<uint32_t> g_keySnapshotWords;
+bool g_eventBatchComplete = false;
 std::vector<uint8_t> g_result;
 std::string g_error;
 
@@ -215,19 +221,6 @@ bool jsExactNonNegativeInteger(double value)
            std::floor(value) == value;
 }
 
-bool jsAddressToPointer(double value, uint8_t*& pointer)
-{
-    if (!jsExactNonNegativeInteger(value) ||
-        value > static_cast<double>(std::numeric_limits<std::uintptr_t>::max())) {
-        pointer = nullptr;
-        return false;
-    }
-
-    pointer = reinterpret_cast<uint8_t*>(
-        static_cast<std::uintptr_t>(value));
-    return true;
-}
-
 bool jsSizeToNative(double value, std::size_t& size)
 {
     if (!jsExactNonNegativeInteger(value) ||
@@ -246,63 +239,28 @@ double pointerToJsAddress(const void* pointer)
         reinterpret_cast<std::uintptr_t>(pointer));
 }
 
-int parseDocument(const uint8_t* data, std::size_t size)
-{
-    try {
-        std::vector<uint8_t>().swap(g_result);
-        g_error.clear();
-        g_document = wasmidi::MidiDocument{};
-
-        if (!g_parser.parse(
-                data,
-                size,
-                g_document,
-                &progressCallback,
-                nullptr)) {
-            g_error = g_parser.error();
-            g_document = wasmidi::MidiDocument{};
-            return 0;
-        }
-
-        // Packing is intentionally a separate call. The Worker frees the raw
-        // MIDI allocation immediately after this function returns, before a
-        // potentially large serialized transfer buffer is allocated.
-        return 1;
-    } catch (const std::bad_alloc&) {
-        std::vector<uint8_t>().swap(g_result);
-        g_document = wasmidi::MidiDocument{};
-        g_error =
-            "MIDI parser could not obtain more memory from the browser/OS while building indexes";
-        return 0;
-    } catch (const std::exception& error) {
-        std::vector<uint8_t>().swap(g_result);
-        g_document = wasmidi::MidiDocument{};
-        g_error = std::string("MIDI parser exception: ") + error.what();
-        return 0;
-    } catch (...) {
-        std::vector<uint8_t>().swap(g_result);
-        g_document = wasmidi::MidiDocument{};
-        g_error = "Unknown MIDI parser exception";
-        return 0;
-    }
-}
-
-
 int parseFileDocument(std::size_t size)
 {
     try {
         std::vector<uint8_t>().swap(g_result);
+        std::vector<wasmidi::VisualNote>().swap(g_visualPage);
+        std::vector<wasmidi::MidiMappedStore::EventWord>().swap(g_eventBatch);
+        std::vector<uint32_t>().swap(g_keySnapshotWords);
         g_error.clear();
         g_document = wasmidi::MidiDocument{};
+        g_mappedStore.clear();
 
-        if (!g_parser.parseReadAt(
+        // Pass 13: browser File/Blob is the memory-mapped backing store. The
+        // worker indexes every track and builds bounded state checkpoints, but
+        // never materializes one CompactEvent/VisualNote per source event.
+        if (!g_mappedStore.index(
                 static_cast<uint64_t>(size),
                 &browserReadAt,
                 nullptr,
                 g_document,
                 &progressCallback,
                 nullptr)) {
-            g_error = g_parser.error();
+            g_error = g_mappedStore.error();
             g_document = wasmidi::MidiDocument{};
             return 0;
         }
@@ -311,18 +269,21 @@ int parseFileDocument(std::size_t size)
     } catch (const std::bad_alloc&) {
         std::vector<uint8_t>().swap(g_result);
         g_document = wasmidi::MidiDocument{};
+        g_mappedStore.clear();
         g_error =
-            "MIDI parser could not obtain more memory from the browser/OS while building indexes";
+            "Mapped MIDI index could not obtain more memory from the browser/OS";
         return 0;
     } catch (const std::exception& error) {
         std::vector<uint8_t>().swap(g_result);
         g_document = wasmidi::MidiDocument{};
-        g_error = std::string("MIDI parser exception: ") + error.what();
+        g_mappedStore.clear();
+        g_error = std::string("Mapped MIDI exception: ") + error.what();
         return 0;
     } catch (...) {
         std::vector<uint8_t>().swap(g_result);
         g_document = wasmidi::MidiDocument{};
-        g_error = "Unknown MIDI parser exception";
+        g_mappedStore.clear();
+        g_error = "Unknown mapped MIDI parser exception";
         return 0;
     }
 }
@@ -386,42 +347,6 @@ extern "C" {
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE
 #endif
-double wmp_alloc_js(double bytes)
-{
-    std::size_t size = 0;
-    if (!jsSizeToNative(bytes, size)) {
-        g_error = "Invalid parser allocation size from JavaScript";
-        return 0.0;
-    }
-
-    if (size == 0)
-        size = 1;
-
-    void* pointer = std::malloc(size);
-    if (!pointer)
-        return 0.0;
-
-    return pointerToJsAddress(pointer);
-}
-
-#ifdef __EMSCRIPTEN__
-EMSCRIPTEN_KEEPALIVE
-#endif
-void wmp_free_js(double address)
-{
-    if (address == 0.0)
-        return;
-
-    uint8_t* pointer = nullptr;
-    if (!jsAddressToPointer(address, pointer))
-        return;
-
-    std::free(pointer);
-}
-
-#ifdef __EMSCRIPTEN__
-EMSCRIPTEN_KEEPALIVE
-#endif
 int wmp_parse_file_js(double byteCount)
 {
     std::size_t size = 0;
@@ -431,24 +356,6 @@ int wmp_parse_file_js(double byteCount)
     }
 
     return parseFileDocument(size);
-}
-
-#ifdef __EMSCRIPTEN__
-EMSCRIPTEN_KEEPALIVE
-#endif
-int wmp_parse_js(double address, double byteCount)
-{
-    uint8_t* data = nullptr;
-    std::size_t size = 0;
-
-    if (!jsAddressToPointer(address, data) ||
-        !jsSizeToNative(byteCount, size) ||
-        (!data && size != 0)) {
-        g_error = "Invalid MIDI pointer/size passed from JavaScript";
-        return 0;
-    }
-
-    return parseDocument(data, size);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -483,6 +390,160 @@ EMSCRIPTEN_KEEPALIVE
 void wmp_release_result()
 {
     std::vector<uint8_t>().swap(g_result);
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_build_visual_page_js(double startTick, double endTick)
+{
+    if (!jsExactNonNegativeInteger(startTick) ||
+        !jsExactNonNegativeInteger(endTick) ||
+        startTick > double(std::numeric_limits<uint32_t>::max()) ||
+        endTick > double(std::numeric_limits<uint32_t>::max())) {
+        g_error = "Invalid mapped visual-page tick range";
+        return 0;
+    }
+    if (!g_mappedStore.buildVisualPage(
+            static_cast<uint32_t>(startTick),
+            static_cast<uint32_t>(endTick),
+            g_visualPage)) {
+        g_error = g_mappedStore.error();
+        if (g_error.empty()) g_error = "Could not build mapped visual page";
+        return 0;
+    }
+    return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_visual_page_ptr_js()
+{
+    return g_visualPage.empty() ? 0.0 : pointerToJsAddress(g_visualPage.data());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_visual_page_count_js()
+{
+    return static_cast<double>(g_visualPage.size());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_build_key_snapshot_js(double tick)
+{
+    if (!jsExactNonNegativeInteger(tick) ||
+        tick > double(std::numeric_limits<uint32_t>::max())) {
+        g_error = "Invalid mapped keyboard tick";
+        return 0;
+    }
+    wasmidi::MidiMappedStore::KeySnapshot snapshot;
+    if (!g_mappedStore.buildKeySnapshot(static_cast<uint32_t>(tick), snapshot)) {
+        g_error = g_mappedStore.error();
+        if (g_error.empty()) g_error = "Could not build mapped keyboard state";
+        return 0;
+    }
+    g_keySnapshotWords.resize(128u * 3u);
+    for (std::size_t p = 0; p < 128; ++p) {
+        g_keySnapshotWords[p] = snapshot.counts[p];
+        g_keySnapshotWords[128u + p] = snapshot.globalColors[p];
+        g_keySnapshotWords[256u + p] = snapshot.trackColors[p];
+    }
+    return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_key_snapshot_ptr_js()
+{
+    return g_keySnapshotWords.empty() ? 0.0 : pointerToJsAddress(g_keySnapshotWords.data());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_key_snapshot_word_count_js()
+{
+    return static_cast<double>(g_keySnapshotWords.size());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_reset_event_cursor_js(double startTick)
+{
+    const uint32_t tick =
+        jsExactNonNegativeInteger(startTick)
+            ? static_cast<uint32_t>(std::min<double>(
+                  startTick, double(std::numeric_limits<uint32_t>::max())))
+            : 0u;
+    g_mappedStore.resetEventCursor(tick);
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_build_event_batch_js(double endTick, double maxEvents)
+{
+    if (!jsExactNonNegativeInteger(endTick) ||
+        !jsExactNonNegativeInteger(maxEvents) ||
+        endTick > double(std::numeric_limits<uint32_t>::max())) {
+        g_error = "Invalid mapped event-batch request";
+        return 0;
+    }
+    const std::size_t limit = static_cast<std::size_t>(
+        std::clamp<double>(maxEvents, 1.0, 262144.0));
+    if (!g_mappedStore.buildEventBatch(
+            static_cast<uint32_t>(endTick),
+            limit,
+            g_eventBatch,
+            g_eventBatchComplete)) {
+        g_error = g_mappedStore.error();
+        if (g_error.empty()) g_error = "Could not build mapped event batch";
+        return 0;
+    }
+    return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_event_batch_ptr_js()
+{
+    return g_eventBatch.empty() ? 0.0 : pointerToJsAddress(g_eventBatch.data());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_event_batch_count_js()
+{
+    return static_cast<double>(g_eventBatch.size());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_event_batch_complete_js()
+{
+    return g_eventBatchComplete ? 1 : 0;
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_tick_to_seconds_js(double tick)
+{
+    if (!g_mappedStore.valid() || !std::isfinite(tick))
+        return 0.0;
+    return g_mappedStore.metadata().tickToSeconds(
+        static_cast<uint32_t>(std::clamp<double>(
+            tick, 0.0, double(g_mappedStore.metadata().maxTick))));
 }
 
 #ifdef __EMSCRIPTEN__

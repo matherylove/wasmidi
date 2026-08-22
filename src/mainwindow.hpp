@@ -26,7 +26,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(float currentTime READ currentTime NOTIFY currentTimeChanged)
     Q_PROPERTY(float duration READ duration NOTIFY durationChanged)
     Q_PROPERTY(QString fileName READ fileName NOTIFY fileNameChanged)
-    Q_PROPERTY(int noteCount READ noteCount NOTIFY noteCountChanged)
+    Q_PROPERTY(qint64 noteCount READ noteCount NOTIFY noteCountChanged)
     Q_PROPERTY(int trackCount READ trackCount NOTIFY trackCountChanged)
     Q_PROPERTY(int activeVoices READ activeVoices NOTIFY activeVoicesChanged)
     Q_PROPERTY(int activeChannelCount READ activeChannelCount NOTIFY activeChannelCountChanged)
@@ -41,7 +41,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(int midiFormat READ midiFormat NOTIFY midiFormatChanged)
     Q_PROPERTY(int ppq READ ppq NOTIFY ppqChanged)
     Q_PROPERTY(int tempoChangeCount READ tempoChangeCount NOTIFY tempoChangeCountChanged)
-    Q_PROPERTY(int controlEventCount READ controlEventCount NOTIFY controlEventCountChanged)
+    Q_PROPERTY(qint64 controlEventCount READ controlEventCount NOTIFY controlEventCountChanged)
     Q_PROPERTY(int peakNps READ peakNps NOTIFY peakNpsChanged)
     Q_PROPERTY(float peakNpsTime READ peakNpsTime NOTIFY timelineChanged)
     Q_PROPERTY(int peakPolyphony READ peakPolyphony NOTIFY peakPolyphonyChanged)
@@ -96,7 +96,7 @@ public:
     float currentTime() const { return currentTime_; }
     float duration() const { return duration_; }
     QString fileName() const { return fileName_; }
-    int noteCount() const { return noteCount_; }
+    qint64 noteCount() const { return noteCount_; }
     int trackCount() const { return trackCount_; }
     int activeVoices() const { return activeVoices_; }
     int activeChannelCount() const { return activeChannelCount_; }
@@ -111,7 +111,7 @@ public:
     int midiFormat() const { return midiFormat_; }
     int ppq() const { return ppq_; }
     int tempoChangeCount() const { return tempoChangeCount_; }
-    int controlEventCount() const { return controlEventCount_; }
+    qint64 controlEventCount() const { return controlEventCount_; }
     int peakNps() const { return peakNps_; }
     float peakNpsTime() const { return peakNpsTime_; }
     int peakPolyphony() const { return peakPolyphony_; }
@@ -178,6 +178,10 @@ public:
         uint32_t generation,
         uint32_t spanTicks,
         uint32_t pageIndex,
+        const uint32_t* words,
+        uint32_t wordCount);
+    void receiveRemoteKeyState(
+        double tick,
         const uint32_t* words,
         uint32_t wordCount);
     Q_INVOKABLE bool loadMidiUrl(const QUrl& url);
@@ -290,7 +294,7 @@ private:
     float currentTime_ = 0.0f;
     float duration_ = 0.0f;
     QString fileName_;
-    int noteCount_ = 0;
+    qint64 noteCount_ = 0;
     int trackCount_ = 0;
     int activeVoices_ = 0;
     int activeChannelCount_ = 0;
@@ -305,7 +309,7 @@ private:
     int midiFormat_ = 0;
     int ppq_ = 480;
     int tempoChangeCount_ = 0;
-    int controlEventCount_ = 0;
+    qint64 controlEventCount_ = 0;
     int peakNps_ = 0;
     float peakNpsTime_ = 0.0f;
     int peakPolyphony_ = 0;
