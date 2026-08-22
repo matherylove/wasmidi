@@ -183,7 +183,12 @@ jobs:
           test -s site/snappysynth_bridge.js
           test -s site/coi-serviceworker.js
           test -s site/build-id.txt
-          grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "12.9"' site/midi-parser-worker.js
+
+          # Pass 13 mapped-store validation. Keep deployment checks in sync with
+          # the actual worker source instead of retaining the old Pass 12.9 pin.
+          cmp -s web/midi-parser-worker.js site/midi-parser-worker.js
+          grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.0"' site/midi-parser-worker.js
+          grep -q 'mappedStore: true' site/midi-parser-worker.js
           grep -q 'wasmidi.js?v=' site/index.html
           grep -q 'coi-serviceworker.js?v=' site/index.html
 
