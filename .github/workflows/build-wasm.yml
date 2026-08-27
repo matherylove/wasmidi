@@ -1,0 +1,243 @@
+name: Build Qt WASM and Deploy Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_VERSION: '6.8.3'
+  EMSCRIPTEN_VERSION: '3.1.56'
+
+jobs:
+  build-wasm:
+    name: Qt 6.8 WebAssembly + SnappySynthV2
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build python3-pip
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+          actions-cache-folder: emsdk-cache
+
+      - name: Install Qt WebAssembly
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: all_os
+          target: wasm
+          arch: wasm_singlethread
+          cache: true
+          aqtversion: '==3.3.*'
+
+      - name: Toolchain diagnostics
+        run: |
+          emcc --version
+          cmake --version
+          echo "QT_ROOT_DIR=${QT_ROOT_DIR}"
+          echo "QT_HOST_PATH=${QT_HOST_PATH}"
+          test -f "${QT_ROOT_DIR}/lib/cmake/Qt6/qt.toolchain.cmake"
+          test -d "${QT_HOST_PATH}"
+
+      - name: Configure
+        run: |
+          cmake \
+            -S . \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${QT_ROOT_DIR}/lib/cmake/Qt6/qt.toolchain.cmake" \
+            -DCMAKE_PREFIX_PATH="${QT_ROOT_DIR}" \
+            -DQT_HOST_PATH="${QT_HOST_PATH}"
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      # Memory64 shipped in Node 24. Use the same 64-bit Wasm memory model in
+      # CI that Chromium uses for the production parser Worker.
+      - name: Setup Node 24 for Memory64 smoke test
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Validate generated MIDI parser runtime
+        run: |
+          node --check build/wasmidi-midi-parser.js
+          node --check web/midi-parser-worker.js
+          node --check web/snappysynth-worker.js
+          node --check web/snappysynth-audio-worklet.js
+          # Realtime PCM must never be stopped at the producer's MIDI
+          # safeUntil watermark. That browser-only gate caused the repeatable
+          # "plays for about one second, then silence" regression.
+          ! grep -q 'blockEnd > safeUntil' web/snappysynth-worker.js
+          ! grep -q 'safeFramesRemaining' web/snappysynth-worker.js
+          python3 -m py_compile tools/patch_emscripten_memory64_growth.py
+          python3 tools/patch_emscripten_memory64_growth.py --check "$(command -v em++)"
+          node tools/midi_parser_bootstrap_smoke.cjs build/wasmidi-midi-parser.js
+
+      - name: Prepare Pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site
+
+          test -s build/wasmidi.html
+          test -s build/wasmidi.js
+          test -s build/wasmidi.wasm
+          test -s build/snappysynth-core.js
+          test -s build/snappysynth-core.wasm
+          test -s build/snappysynth-core.worker.js
+          test -s build/wasmidi-midi-parser.js
+
+          cp build/wasmidi.html site/index.html
+          cp build/wasmidi.js site/
+          cp build/wasmidi.wasm site/
+
+          if [[ -f build/qtloader.js ]]; then cp build/qtloader.js site/; fi
+          if [[ -f build/qtlogo.svg ]]; then cp build/qtlogo.svg site/; fi
+          if [[ -f build/wasmidi.data ]]; then cp build/wasmidi.data site/; fi
+          if [[ -f build/wasmidi.worker.js ]]; then cp build/wasmidi.worker.js site/; fi
+
+          # Large MIDI parsing runs in its own non-pthread Worker WASM module.
+          cp build/wasmidi-midi-parser.js site/
+          cp web/midi-parser-worker.js site/
+          cp web/visual-cache-worker.js site/
+
+          # SnappySynthV2 is a separate modularized WASM module. Emscripten
+          # generates a pthread worker alongside it.
+          cp build/snappysynth-core.js site/
+          cp build/snappysynth-core.wasm site/
+          cp build/snappysynth-core.worker.js site/
+
+          cp web/coi-serviceworker.js site/
+          cp web/snappysynth_bridge.js site/
+          cp web/snappysynth-worker.js site/
+          cp web/snappysynth-audio-worklet.js site/
+
+          # Load the isolation helper and bridge before Qt's generated bootstrap.
+          # Fingerprint executable assets with the commit SHA so a successful
+          # Pages deploy cannot reuse an older Qt/COI bootstrap from HTTP cache.
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ.get("GITHUB_SHA", "dev")[:16]
+          p = Path("site/index.html")
+          html = p.read_text(encoding="utf-8")
+          scripts = f"""
+          <script src="coi-serviceworker.js?v={version}"></script>
+          <script src="snappysynth_bridge.js?v={version}"></script>
+          """
+          if "snappysynth_bridge.js" not in html:
+              if "</head>" in html:
+                  html = html.replace("</head>", scripts + "\n</head>", 1)
+              else:
+                  html = scripts + "\n" + html
+          else:
+              html = re.sub(
+                  r'coi-serviceworker\.js(?:\?[^"\']*)?',
+                  f'coi-serviceworker.js?v={version}',
+                  html)
+              html = re.sub(
+                  r'snappysynth_bridge\.js(?:\?[^"\']*)?',
+                  f'snappysynth_bridge.js?v={version}',
+                  html)
+
+          # Qt's generated script tag is otherwise a stable wasmidi.js URL.
+          html = re.sub(
+              r'wasmidi\.js(?:\?[^"\']*)?',
+              f'wasmidi.js?v={version}',
+              html)
+
+          p.write_text(html, encoding="utf-8")
+          Path("site/build-id.txt").write_text(
+              os.environ.get("GITHUB_SHA", "dev") + "\n",
+              encoding="utf-8")
+          PY
+
+          touch site/.nojekyll
+
+          echo "Deployment files:"
+          find site -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+          test -s site/index.html
+          test -s site/wasmidi.js
+          test -s site/wasmidi.wasm
+          test -s site/wasmidi-midi-parser.js
+          test -s site/midi-parser-worker.js
+          test -s site/visual-cache-worker.js
+          test -s site/snappysynth-core.js
+          test -s site/snappysynth-core.wasm
+          test -s site/snappysynth-core.worker.js
+          test -s site/snappysynth-worker.js
+          test -s site/snappysynth-audio-worklet.js
+          test -s site/snappysynth_bridge.js
+          test -s site/coi-serviceworker.js
+          test -s site/build-id.txt
+
+          # Pass 13 mapped-store validation. Keep deployment checks in sync with
+          # the actual worker source instead of retaining the old Pass 12.9 pin.
+          cmp -s web/midi-parser-worker.js site/midi-parser-worker.js
+          grep -q 'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.7.0"' site/midi-parser-worker.js
+          grep -q 'mappedStore: true' site/midi-parser-worker.js
+          grep -q 'wasmidi.js?v=' site/index.html
+          grep -q 'coi-serviceworker.js?v=' site/index.html
+
+          echo "SnappySynthV2 deployment validation:"
+          grep -q 'coi-serviceworker.js' site/index.html
+          grep -q 'snappysynth_bridge.js' site/index.html
+          test -s site/snappysynth-core.js
+          test -s site/snappysynth-core.wasm
+          test -s site/snappysynth-core.worker.js
+          test -s site/snappysynth-worker.js
+          test -s site/snappysynth-audio-worklet.js
+          test -s site/snappysynth_bridge.js
+          echo "SnappySynthV2 Pages payload OK"
+
+      - name: Upload reproducible WASM build
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasmidi-wasm-${{ github.sha }}
+          path: site
+          if-no-files-found: error
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-pages:
+    name: Deploy GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-wasm
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
