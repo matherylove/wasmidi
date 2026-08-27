@@ -12,6 +12,21 @@ Item {
     property var postValues: [-1, 0.0, 0.1, 0.5, 1.0, 2.0]
     property bool synthAdvancedVisible: false
 
+    // One display-cadence pulse feeds every live chart.  Six independent 16 ms
+    // QML Timers used to wake the JS engine separately even though all graphs
+    // sample the same transport frame.
+    property int graphFrameSerial: 0
+    Timer {
+        // Live values are still computed against the authoritative audio frame
+        // as often as MainWindow receives them. Canvas rasterization is much
+        // more expensive than the counters themselves, so repaint charts at
+        // 30 Hz instead of asking six canvases to repaint at 60+ Hz.
+        interval: 33
+        running: root.visible && root.mainWindow.hasMidi && root.mainWindow.isPlaying
+        repeat: true
+        onTriggered: root.graphFrameSerial = (root.graphFrameSerial + 1) & 0x7fffffff
+    }
+
     component SectionLabel: Text {
         color: "#6f6685"
         font.pixelSize: 9
@@ -195,27 +210,20 @@ Item {
         onRevisionChanged: resetHistory()
         onTransportRevisionChanged: resetHistory()
 
-        // Sample the actual live value on the display cadence. Statistics are
-        // no longer a precomputed MIDI-load product, so each visible frame is
-        // also one graph sample.
-        Timer {
-            interval: 16
-            running: chartBox.visible && root.mainWindow.hasMidi && root.mainWindow.isPlaying
-            repeat: true
-            onTriggered: {
-                var now = Number(root.mainWindow.currentTime)
-                // Actual seek/stop transactions are identified by
-                // transportRevision above. Do not infer a seek from a clock
-                // correction: the AudioWorklet's delivered-PCM clock may move
-                // by more than 250 ms after an underrun/recovery, and clearing
-                // the graph here made it look desynchronized from the music.
-                chartBox.lastTransportTime = now
-                if (chartBox.samples.length !== chartBox.historyLength)
-                    chartBox.resetHistory()
-                chartBox.samples[chartBox.sampleIndex] = Number(chartBox.value)
-                chartBox.sampleIndex = (chartBox.sampleIndex + 1) % chartBox.historyLength
-                spark.requestPaint()
-            }
+        // Sample from the single root display pulse instead of owning one QML
+        // Timer per chart.  Statistics are still captured on every visible
+        // display frame.
+        property int graphFrame: root.graphFrameSerial
+        onGraphFrameChanged: {
+            if (!chartBox.visible || !root.mainWindow.hasMidi || !root.mainWindow.isPlaying)
+                return
+            var now = Number(root.mainWindow.currentTime)
+            chartBox.lastTransportTime = now
+            if (chartBox.samples.length !== chartBox.historyLength)
+                chartBox.resetHistory()
+            chartBox.samples[chartBox.sampleIndex] = Number(chartBox.value)
+            chartBox.sampleIndex = (chartBox.sampleIndex + 1) % chartBox.historyLength
+            spark.requestPaint()
         }
 
         Canvas {
@@ -324,19 +332,17 @@ Item {
         onRevisionChanged: resetHistory()
         onTransportRevisionChanged: resetHistory()
 
-        Timer {
-            interval: 16
-            running: timelineBox.visible && root.mainWindow.hasMidi && root.mainWindow.isPlaying
-            repeat: true
-            onTriggered: {
-                var now = Number(root.mainWindow.currentTime)
-                timelineBox.lastTransportTime = now
-                if (timelineBox.samples.length !== timelineBox.historyLength)
-                    timelineBox.resetHistory()
-                timelineBox.samples[timelineBox.sampleIndex] = Number(root.mainWindow.nps)
-                timelineBox.sampleIndex = (timelineBox.sampleIndex + 1) % timelineBox.historyLength
-                timeline.requestPaint()
-            }
+        property int graphFrame: root.graphFrameSerial
+        onGraphFrameChanged: {
+            if (!timelineBox.visible || !root.mainWindow.hasMidi || !root.mainWindow.isPlaying)
+                return
+            var now = Number(root.mainWindow.currentTime)
+            timelineBox.lastTransportTime = now
+            if (timelineBox.samples.length !== timelineBox.historyLength)
+                timelineBox.resetHistory()
+            timelineBox.samples[timelineBox.sampleIndex] = Number(root.mainWindow.nps)
+            timelineBox.sampleIndex = (timelineBox.sampleIndex + 1) % timelineBox.historyLength
+            timeline.requestPaint()
         }
 
         Canvas {

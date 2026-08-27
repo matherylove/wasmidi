@@ -289,6 +289,7 @@ private:
     uint32_t sharpRemotePreparedHead_ = 1;
     std::vector<VisualNote> sharpRemotePendingAppends_;
     std::vector<uint32_t> sharpRemotePendingCloseWords_;
+    std::size_t sharpRemotePendingCloseOffset_ = 0;
 
 
     std::array<NeuralNode, 95> neuralNodes_{};

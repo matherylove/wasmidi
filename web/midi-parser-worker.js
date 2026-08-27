@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 13.8.0: SharpMIDI-style mapped-source parser. The browser File remains
+// Pass 13.10.0: SharpMIDI-style mapped-source parser. The browser File remains
 // outside the WASM heap; only compact indexes/checkpoints remain resident in
 // Memory64, and render/playback data are decoded into bounded pages on demand.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.8.0";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.10.0";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 const SYNTH_EVENT_BATCH_EVENTS = 262144;
 const FAST_SOURCE_MIN_BYTES = 256 * 1024 * 1024;
@@ -206,7 +206,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 13.8.0 parser was built without Memory64 (pointer width " +
+                    "Pass 13.10.0 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 
@@ -297,6 +297,8 @@ let synthPriorityUntil = 0;
 // pump from touching the newly reset cursor or publishing stale events.
 let synthGeneration = 0;
 let synthHistoricalSelectorMessages = null;
+let synthHistoricalSysExMeta = null;
+let synthHistoricalSysExData = null;
 let synthHistoricalSelectorTime = 0.0;
 
 // SharpMIDI-raylib renderer port. There are no visual pages. The Memory64
@@ -305,8 +307,14 @@ let synthHistoricalSelectorTime = 0.0;
 // Resident Memory64 traversal is much cheaper than the JS/WebGL handoff. Walk
 // a larger source chunk per yield so several future viewports can be ready in
 // advance instead of reaching a dense transition just-in-time.
-const SHARP_RENDER_SOURCE_BUDGET = 524288;
-const SHARP_RENDER_URGENT_SOURCE_BUDGET = 1048576;
+// Renderer preprocessing shares this Worker with the audio event cursor and
+// live keyboard/stat state.  Large resident sweeps are efficient in aggregate
+// but a 500K-event synchronous slice can occupy the Worker for a full display
+// frame on wasm.  Stay finely time-sliced while safely ahead, and only use the
+// larger source window when the prepared frontier falls inside the emergency
+// watermark supplied by the renderer.
+const SHARP_RENDER_SOURCE_BUDGET = 131072;
+const SHARP_RENDER_URGENT_SOURCE_BUDGET = 262144;
 let sharpRenderGeneration = 0;
 let sharpRenderTarget = 0;
 let sharpRenderUrgentThrough = 0;
@@ -497,21 +505,19 @@ async function drainSharpRenderer() {
 
     try {
         const Module = await getModule();
-        let burstStart = performance.now();
         while (mappedFileReady && sharpRenderReady &&
                sharpRenderCompletedTarget < sharpRenderTarget) {
             // Keep SnappySynth responsive without demoting the renderer to the
             // old page-at-the-last-second model. One bounded source sweep is
             // followed by an event-loop yield.
-            if (synthPumpActive) {
+            if (synthPumpActive || performance.now() < synthPriorityUntil) {
                 await new Promise(resolve => setTimeout(resolve, 0));
                 continue;
             }
 
             const generation = sharpRenderGeneration;
             const target = sharpRenderTarget >>> 0;
-            const urgent = sharpRenderSafeThrough < sharpRenderUrgentThrough;
-            const sourceBudget = urgent
+            const sourceBudget = sharpRenderSafeThrough < sharpRenderUrgentThrough
                 ? SHARP_RENDER_URGENT_SOURCE_BUDGET
                 : SHARP_RENDER_SOURCE_BUDGET;
             if (!Module._wmp_build_render_sweep_js(
@@ -582,18 +588,12 @@ async function drainSharpRenderer() {
                     break;
             }
 
-            // When the playhead is approaching the prepared edge, let the
-            // renderer consume a short burst of resident Memory64 events before
-            // yielding.  Cap the burst in wall time so key-state and synth
-            // messages still get frequent service. Far-ahead speculative work
-            // keeps the old one-batch-per-yield behavior.
-            const stillUrgent = complete
-                ? safeThrough < sharpRenderUrgentThrough
-                : (hasNextTick && nextTick <= sharpRenderUrgentThrough);
-            if (!stillUrgent || performance.now() - burstStart >= 6.0) {
-                await new Promise(resolve => setTimeout(resolve, 0));
-                burstStart = performance.now();
-            }
+            // Always return to the event loop after one bounded resident sweep.
+            // Pass 13.8 allowed urgent render bursts to monopolize this shared
+            // mapped Worker for up to ~6 ms at a time; that directly delayed
+            // synth admission and live-state requests.  Prefetch depth is now
+            // maintained by watermarks on the main thread, not by long bursts.
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
     } finally {
         sharpRenderRunning = false;
@@ -675,6 +675,8 @@ async function resetSynthCursor(message) {
     synthGeneration = Number(message.generation) >>> 0;
     Module._wmp_reset_event_cursor_js(tick);
     synthHistoricalSelectorMessages = null;
+    synthHistoricalSysExMeta = null;
+    synthHistoricalSysExData = null;
     synthHistoricalSelectorTime = Math.max(
         0, Number(Module._wmp_tick_to_seconds_js(tick)) || 0);
 
@@ -688,17 +690,11 @@ async function resetSynthCursor(message) {
     const historyBytes = sizeToNumber(
         Module._wmp_sysex_batch_data_size_js(), "historical SysEx bytes");
     if (historyCount > 0 && historyBytes > 0) {
-        const meta = copyWasmBytes(
+        const metaBytes = copyWasmBytes(
             Module, Module._wmp_sysex_batch_event_ptr_js(), historyCount * 12);
-        const data = copyWasmBytes(
+        synthHistoricalSysExMeta = new Uint32Array(metaBytes.buffer);
+        synthHistoricalSysExData = copyWasmBytes(
             Module, Module._wmp_sysex_batch_data_ptr_js(), historyBytes);
-        postMessage({
-            type: "synth-sysex-history",
-            generation: synthGeneration,
-            time: synthHistoricalSelectorTime,
-            meta: meta.buffer,
-            data: data.buffer
-        }, [meta.buffer, data.buffer]);
     }
 
     // Native SnappySynth keeps Bank Select MSB/LSB pending and commits them
@@ -879,18 +875,18 @@ async function pumpSynthWindow(message) {
             timeArray = mergedTimes;
             synthHistoricalSelectorMessages = null;
         }
-        const sysExMeta = sysExCount
+        let sysExMetaBytes = sysExCount
             ? copyWasmBytes(
                 Module, Module._wmp_sysex_batch_event_ptr_js(), sysExCount * 12)
             : new Uint8Array(0);
-        const sysExData = sysExByteCount
+        let sysExData = sysExByteCount
             ? copyWasmBytes(
                 Module, Module._wmp_sysex_batch_data_ptr_js(), sysExByteCount)
             : new Uint8Array(0);
-        const sysExTimes = new Float64Array(sysExCount);
+        let sysExTimes = new Float64Array(sysExCount);
         if (sysExCount) {
             const words = new Uint32Array(
-                sysExMeta.buffer, sysExMeta.byteOffset, sysExCount * 3);
+                sysExMetaBytes.buffer, sysExMetaBytes.byteOffset, sysExCount * 3);
             let lastSysExTick = 0xffffffff;
             let lastSysExTime = 0.0;
             for (let sx = 0; sx < sysExCount; ++sx) {
@@ -902,6 +898,42 @@ async function pumpSynthWindow(message) {
                 }
                 sysExTimes[sx] = lastSysExTime;
             }
+        }
+
+        // Historical reset/tuning SysEx and restored Bank/Program state must
+        // cross into SnappySynth in the same producer transaction.  A separate
+        // history message can be observed by the realtime worker before the
+        // first short-message batch, creating subtle startup/seek ordering
+        // differences on full GM/GS soundfonts.  Merge history into the first
+        // batch and schedule it at the seek sample, before the restored selector
+        // prefix and source events.
+        if (synthHistoricalSysExMeta && synthHistoricalSysExMeta.length > 0 &&
+            synthHistoricalSysExData && synthHistoricalSysExData.length > 0) {
+            const prefixMeta = synthHistoricalSysExMeta;
+            const prefixData = synthHistoricalSysExData;
+            const currentMeta = new Uint32Array(
+                sysExMetaBytes.buffer, sysExMetaBytes.byteOffset, sysExCount * 3);
+            const mergedMeta = new Uint32Array(prefixMeta.length + currentMeta.length);
+            const mergedData = new Uint8Array(prefixData.length + sysExData.length);
+            const prefixCount = Math.floor(prefixMeta.length / 3);
+            const mergedTimes = new Float64Array(prefixCount + sysExTimes.length);
+            mergedData.set(prefixData, 0);
+            mergedData.set(sysExData, prefixData.length);
+            mergedTimes.fill(synthHistoricalSelectorTime, 0, prefixCount);
+            mergedTimes.set(sysExTimes, prefixCount);
+            mergedMeta.set(prefixMeta, 0);
+            for (let sx = 0; sx < sysExCount; ++sx) {
+                const src = sx * 3;
+                const dst = prefixMeta.length + src;
+                mergedMeta[dst] = currentMeta[src] >>> 0;
+                mergedMeta[dst + 1] = (currentMeta[src + 1] + prefixData.length) >>> 0;
+                mergedMeta[dst + 2] = currentMeta[src + 2] >>> 0;
+            }
+            sysExMetaBytes = new Uint8Array(mergedMeta.buffer);
+            sysExData = mergedData;
+            sysExTimes = mergedTimes;
+            synthHistoricalSysExMeta = null;
+            synthHistoricalSysExData = null;
         }
         // Do not hold audio at the seek point until the entire look-ahead
         // horizon is decoded. If another event remains, all events strictly
@@ -932,7 +964,7 @@ async function pumpSynthWindow(message) {
             generation,
             messages: msgArray.buffer,
             times: timeArray.buffer,
-            sysexMeta: sysExMeta.buffer,
+            sysexMeta: sysExMetaBytes.buffer,
             sysexData: sysExData.buffer,
             sysexTimes: sysExTimes.buffer,
             safeUntil: batchSafeUntil,
@@ -940,13 +972,22 @@ async function pumpSynthWindow(message) {
         }, [
             msgArray.buffer,
             timeArray.buffer,
-            sysExMeta.buffer,
+            sysExMetaBytes.buffer,
             sysExData.buffer,
             sysExTimes.buffer
         ]);
 
         if (complete)
             return;
+
+        // The parser/render/live-state consumers share one Memory64 Worker.
+        // Reserve the next short event-loop slice for the continuation of a
+        // dense synth pump so speculative geometry can never reduce audio
+        // coverage/NPS throughput.
+        // One short grace slice is enough to let a continuation request reach the
+        // front of the event loop without locking speculative renderer work out
+        // for multiple milliseconds after every 262K-event batch.
+        synthPriorityUntil = performance.now() + 0.5;
         await new Promise(resolve => setTimeout(resolve, 0));
     }
 

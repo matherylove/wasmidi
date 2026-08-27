@@ -343,6 +343,11 @@ struct TrackIndex {
     // sections cannot suddenly become parser work at playback time.
     std::vector<MidiMappedStore::EventWord> hotEvents;
     std::vector<MidiMappedStore::EventWord> hotSynthStateEvents;
+    // Source-event ordinal for each sparse selector event.  Tick alone is not
+    // sufficient around same-tick GM/GS/XG resets: Program/Bank events before
+    // a reset must not be resurrected by seek restoration, while events after
+    // that reset at the same tick must be retained.
+    std::vector<uint64_t> hotSynthStateOrders;
 };
 
 struct SysExRef {
@@ -985,8 +990,15 @@ struct MidiMappedStore::Impl {
             const bool noteOff = command == 0x80 || (command == 0x90 && d2 == 0);
             const bool control = command == 0xb0 || command == 0xc0 ||
                                  command == 0xd0 || command == 0xe0;
-            const bool synthState = command == 0xb0 || command == 0xc0 ||
-                                    command == 0xe0;
+            // Historical SF2 selector restoration only needs Bank Select
+            // MSB/LSB, Program Change and Pitch Bend.  Pass 13.8 duplicated
+            // every CC into a second resident vector; CC-dense Black MIDIs
+            // could therefore retain hundreds of MiB of redundant state and
+            // compete with renderer/synth caches.  Keep only the selector
+            // messages that are actually required for exact bank/program
+            // reconstruction.
+            const bool synthState = command == 0xc0 || command == 0xe0 ||
+                                    (command == 0xb0 && (d1 == 0 || d1 == 32));
 
             const uint16_t visualKey =
                 uint16_t((uint16_t(channel) << 7) | uint16_t(d1 & 0x7f));
@@ -1068,6 +1080,7 @@ struct MidiMappedStore::Impl {
         TrackIndex& track = tracks[trackIndex];
         track.hotEvents.clear();
         track.hotSynthStateEvents.clear();
+        track.hotSynthStateOrders.clear();
         if (track.channelEvents >
             static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
             return false;
@@ -1077,12 +1090,15 @@ struct MidiMappedStore::Impl {
             return false;
         track.hotSynthStateEvents.reserve(
             static_cast<std::size_t>(track.synthStateEvents));
+        track.hotSynthStateOrders.reserve(
+            static_cast<std::size_t>(track.synthStateEvents));
 
         Cursor cursor(reader, track.offset, track.offset + uint64_t(track.length));
         uint32_t tick = 0;
         uint8_t running = 0;
         bool ok = true;
         std::size_t write = 0;
+        uint64_t sourceOrder = 0;
 
         while (cursor.remaining() && ok) {
             const uint32_t delta = readVar(cursor, ok);
@@ -1105,6 +1121,7 @@ struct MidiMappedStore::Impl {
                 if (!ok || uint64_t(len) > cursor.remaining() || !cursor.skip(len))
                     return false;
                 if (meta == 0x2f) break;
+                ++sourceOrder;
                 continue;
             }
             if (status == 0xf0 || status == 0xf7) {
@@ -1112,12 +1129,14 @@ struct MidiMappedStore::Impl {
                 const uint32_t len = readVar(cursor, ok);
                 if (!ok || uint64_t(len) > cursor.remaining() || !cursor.skip(len))
                     return false;
+                ++sourceOrder;
                 continue;
             }
             if (status >= 0xf0) {
                 if (hasFirstData) return false;
                 if (!cursor.skip(static_cast<uint64_t>(systemBytes(status))))
                     return false;
+                ++sourceOrder;
                 continue;
             }
 
@@ -1147,19 +1166,23 @@ struct MidiMappedStore::Impl {
                     (uint32_t(color) << 24)
             };
 
-            if (command == 0xb0 || command == 0xc0 || command == 0xe0) {
+            if (command == 0xc0 || command == 0xe0 ||
+                (command == 0xb0 && (d1 == 0 || d1 == 32))) {
                 track.hotSynthStateEvents.push_back({
                     tick,
                     uint32_t(status) |
                         (uint32_t(d1) << 8) |
                         (uint32_t(d2) << 16)
                 });
+                track.hotSynthStateOrders.push_back(sourceOrder);
             }
+            ++sourceOrder;
         }
 
         if (!ok || write != track.hotEvents.size() ||
             track.hotSynthStateEvents.size() !=
-                static_cast<std::size_t>(track.synthStateEvents))
+                static_cast<std::size_t>(track.synthStateEvents) ||
+            track.hotSynthStateOrders.size() != track.hotSynthStateEvents.size())
             return false;
         return true;
     }
@@ -2863,8 +2886,65 @@ bool MidiMappedStore::buildHistoricalSelectorState(
         uint8_t appliedLsb = 0;
         uint8_t program = 0;
         uint16_t bend = 8192;
+        bool seenPendingMsb = false;
+        bool seenPendingLsb = false;
+        bool seenProgram = false;
+        bool seenBend = false;
     };
     std::array<ChannelSelector, 16> state{};
+
+    // ssw_reset() starts from GM defaults. Historical SysEx is replayed before
+    // this selector sequence, so a later GM/GS/XG reset must invalidate every
+    // Bank Select/Program/Pitch message that happened before that reset. The
+    // old fold ignored resets and could resurrect an earlier preset after the
+    // reset, which is especially obvious with full-GM SF2s such as Arachno.
+    auto normalizedPayload = [](const std::vector<uint8_t>& bytes,
+                                const uint8_t*& data,
+                                std::size_t& length) {
+        data = bytes.data();
+        length = bytes.size();
+        if (length && data[0] == 0xf0u) { ++data; --length; }
+        if (length && data[length - 1] == 0xf7u) --length;
+    };
+    auto isResetSysEx = [&](const std::vector<uint8_t>& bytes) {
+        const uint8_t* data = nullptr;
+        std::size_t length = 0;
+        normalizedPayload(bytes, data, length);
+        if (!data) return false;
+        // GM / GM2 System On.
+        if (length >= 4u && data[0] == 0x7eu && data[2] == 0x09u &&
+            (data[3] == 0x01u || data[3] == 0x03u))
+            return true;
+        // Roland GS reset: 41 .. 42 12 40 00 7F 00 ...
+        if (length >= 8u && data[0] == 0x41u && data[2] == 0x42u &&
+            data[3] == 0x12u && data[4] == 0x40u && data[5] == 0x00u &&
+            data[6] == 0x7fu && data[7] == 0x00u)
+            return true;
+        // Yamaha XG System On: 43 .. 4C 00 00 7E 00
+        return length >= 7u && data[0] == 0x43u && data[2] == 0x4cu &&
+            data[3] == 0x00u && data[4] == 0x00u && data[5] == 0x7eu &&
+            data[6] == 0x00u;
+    };
+
+    uint32_t selectorHistoryStart = 0;
+    uint32_t selectorHistoryTrack = 0;
+    uint64_t selectorHistoryOrder = 0;
+    bool haveReset = false;
+    for (const SysExRef& sx : impl_->sysex) {
+        if (sx.tick >= startTick)
+            break;
+        if (isResetSysEx(sx.data)) {
+            // SysExRef is globally sorted by (tick, track, sourceOrder), the
+            // same deterministic tie-break used by the mapped event merge.
+            // Keep the complete boundary so selector events earlier than a
+            // same-tick reset are discarded without losing events that follow
+            // it later in that tick.
+            selectorHistoryStart = sx.tick;
+            selectorHistoryTrack = sx.track;
+            selectorHistoryOrder = sx.sourceOrder;
+            haveReset = true;
+        }
+    }
 
     struct CursorNode {
         uint32_t tick = 0;
@@ -2880,10 +2960,34 @@ bool MidiMappedStore::buildHistoricalSelectorState(
     };
 
     std::priority_queue<CursorNode, std::vector<CursorNode>, CursorGreater> heap;
+    auto selectorIsAfterReset = [&](uint32_t trackIndex, std::size_t eventIndex,
+                                    const EventWord& ev) {
+        if (!haveReset)
+            return true;
+        if (ev.tick != selectorHistoryStart)
+            return ev.tick > selectorHistoryStart;
+        if (trackIndex != selectorHistoryTrack)
+            return trackIndex > selectorHistoryTrack;
+        const auto& orders = impl_->tracks[trackIndex].hotSynthStateOrders;
+        return eventIndex < orders.size() &&
+            orders[eventIndex] > selectorHistoryOrder;
+    };
+
     for (uint32_t t = 0; t < impl_->tracks.size(); ++t) {
         const auto& events = impl_->tracks[t].hotSynthStateEvents;
-        if (!events.empty() && events.front().tick < startTick)
-            heap.push({events.front().tick, t, 0});
+        if (events.empty())
+            continue;
+        auto begin = haveReset
+            ? std::lower_bound(
+                  events.begin(), events.end(), selectorHistoryStart,
+                  [](const EventWord& event, uint32_t tick) {
+                      return event.tick < tick;
+                  })
+            : events.begin();
+        if (begin != events.end() && begin->tick < startTick) {
+            heap.push({begin->tick, t,
+                       static_cast<std::size_t>(begin - events.begin())});
+        }
     }
 
     while (!heap.empty()) {
@@ -2896,21 +3000,31 @@ bool MidiMappedStore::buildHistoricalSelectorState(
         if (ev.tick >= startTick)
             continue;
 
+        const bool afterReset = selectorIsAfterReset(node.track, node.index, ev);
         const uint8_t status = static_cast<uint8_t>(ev.packed & 0xffu);
         const uint8_t command = status & 0xf0u;
         const uint8_t ch = status & 0x0fu;
         const uint8_t d1 = static_cast<uint8_t>((ev.packed >> 8) & 0x7fu);
         const uint8_t d2 = static_cast<uint8_t>((ev.packed >> 16) & 0x7fu);
-        ChannelSelector& cs = state[ch];
-        if (command == 0xb0u) {
-            if (d1 == 0) cs.pendingMsb = d2;
-            else if (d1 == 32) cs.pendingLsb = d2;
-        } else if (command == 0xc0u) {
-            cs.program = d1;
-            cs.appliedMsb = cs.pendingMsb;
-            cs.appliedLsb = cs.pendingLsb;
-        } else if (command == 0xe0u) {
-            cs.bend = static_cast<uint16_t>(uint16_t(d1) | (uint16_t(d2) << 7));
+        if (afterReset) {
+            ChannelSelector& cs = state[ch];
+            if (command == 0xb0u) {
+                if (d1 == 0) {
+                    cs.pendingMsb = d2;
+                    cs.seenPendingMsb = true;
+                } else if (d1 == 32) {
+                    cs.pendingLsb = d2;
+                    cs.seenPendingLsb = true;
+                }
+            } else if (command == 0xc0u) {
+                cs.program = d1;
+                cs.appliedMsb = cs.pendingMsb;
+                cs.appliedLsb = cs.pendingLsb;
+                cs.seenProgram = true;
+            } else if (command == 0xe0u) {
+                cs.bend = static_cast<uint16_t>(uint16_t(d1) | (uint16_t(d2) << 7));
+                cs.seenBend = true;
+            }
         }
 
         const std::size_t next = node.index + 1u;
@@ -2927,18 +3041,34 @@ bool MidiMappedStore::buildHistoricalSelectorState(
     };
     for (uint8_t ch = 0; ch < 16; ++ch) {
         const ChannelSelector& cs = state[ch];
-        // Recreate the *applied* bank first and commit it with Program Change.
-        // Then restore Bank Select values that arrived after that Program
-        // Change. They must remain pending for the next Program Change exactly
-        // as in native SnappySynthV2.
-        emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.appliedMsb);
-        emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.appliedLsb);
-        emit3(static_cast<uint8_t>(0xc0u | ch), cs.program, 0);
-        if (cs.pendingMsb != cs.appliedMsb)
-            emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.pendingMsb);
-        if (cs.pendingLsb != cs.appliedLsb)
-            emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.pendingLsb);
-        if (cs.bend != 8192u) {
+        // Recreate only state that actually existed after the latest reset.
+        // The synth reset already provides bank 0 / program 0 / centered bend,
+        // so emitting 48 synthetic defaults on every Play/seek is unnecessary
+        // and can disturb same-tick reset/program ordering.
+        if (cs.seenProgram) {
+            if (cs.appliedMsb != 0)
+                emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.appliedMsb);
+            if (cs.appliedLsb != 0)
+                emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.appliedLsb);
+            emit3(static_cast<uint8_t>(0xc0u | ch), cs.program, 0);
+
+            // Bank Select received after the committed Program Change remains
+            // pending for the next Program Change, including an explicit zero
+            // that clears a non-zero applied bank.
+            if (cs.seenPendingMsb && cs.pendingMsb != cs.appliedMsb)
+                emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.pendingMsb);
+            if (cs.seenPendingLsb && cs.pendingLsb != cs.appliedLsb)
+                emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.pendingLsb);
+        } else {
+            // No Program Change occurred after the reset: Bank Select values
+            // are purely pending and must not be committed accidentally.
+            if (cs.seenPendingMsb)
+                emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.pendingMsb);
+            if (cs.seenPendingLsb)
+                emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.pendingLsb);
+        }
+
+        if (cs.seenBend && cs.bend != 8192u) {
             emit3(static_cast<uint8_t>(0xe0u | ch),
                   static_cast<uint8_t>(cs.bend & 0x7fu),
                   static_cast<uint8_t>((cs.bend >> 7) & 0x7fu));

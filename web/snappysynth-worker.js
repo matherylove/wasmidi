@@ -2,7 +2,7 @@
 
 "use strict";
 
-importScripts("./snappysynth-core.js");
+importScripts("./snappysynth-core.js?v=13.10.0");
 
 let Module = null;
 let coreReady = false;
@@ -437,6 +437,47 @@ function ensureSysexScratch(required) {
     sysexCapacity = capacity;
 }
 
+function admitSysExBatch(meta, bytes, times) {
+    if (!(meta instanceof Uint32Array) ||
+        !(bytes instanceof Uint8Array) ||
+        !(times instanceof Float64Array)) {
+        return;
+    }
+
+    const count = Math.min(times.length, Math.floor(meta.length / 3));
+    for (let i = 0; i < count; ++i) {
+        const offset = meta[i * 3 + 1] >>> 0;
+        const length = meta[i * 3 + 2] >>> 0;
+        if (!length || offset > bytes.length || length > bytes.length - offset)
+            continue;
+        const event = {
+            // subarray retains one transferred arena; no per-SysEx payload
+            // copy is needed on the realtime worker.
+            bytes: bytes.subarray(offset, offset + length),
+            time: Math.max(0.0, Number(times[i]) || 0.0)
+        };
+        let pos = sysexEvents.length;
+        while (pos > 0 && sysexEvents[pos - 1].time > event.time) --pos;
+        sysexEvents.splice(pos, 0, event);
+    }
+}
+
+function admitShortSchedule(messages, times) {
+    if (!messages || !times ||
+        messages.length !== times.length || messages.length <= 0) {
+        return;
+    }
+
+    const count = messages.length | 0;
+    ensureScratch(count);
+    Module.HEAPU32.set(messages, messagePtr >>> 2);
+    Module.HEAPF64.set(times, timePtr >>> 3);
+    if (!Module._ssw_queue_events(messagePtr, timePtr, count)) {
+        throw new Error(
+            "SnappySynthV2 could not queue the MIDI schedule batch.");
+    }
+}
+
 function renderQueuedWithSysex(outPtr, blockStart, frames) {
     const blockEnd = blockStart + frames / sampleRateHz;
     const strideBytes = Math.max(1, synthChannels) * 4;
@@ -797,29 +838,22 @@ onmessage = async event => {
         }
 
         if (data.type === "sysexBatch") {
-            const meta = data.meta;
-            const bytes = data.bytes;
-            const times = data.times;
-            if (meta instanceof Uint32Array &&
-                bytes instanceof Uint8Array &&
-                times instanceof Float64Array) {
-                const count = Math.min(times.length, Math.floor(meta.length / 3));
-                for (let i = 0; i < count; ++i) {
-                    const offset = meta[i * 3 + 1] >>> 0;
-                    const length = meta[i * 3 + 2] >>> 0;
-                    if (!length || offset > bytes.length || length > bytes.length - offset)
-                        continue;
-                    const event = {
-                        // subarray retains one transferred arena; no per-SysEx
-                        // payload copy is needed on the realtime worker.
-                        bytes: bytes.subarray(offset, offset + length),
-                        time: Math.max(0.0, Number(times[i]) || 0.0)
-                    };
-                    let pos = sysexEvents.length;
-                    while (pos > 0 && sysexEvents[pos - 1].time > event.time) --pos;
-                    sysexEvents.splice(pos, 0, event);
-                }
-            }
+            admitSysExBatch(data.meta, data.bytes, data.times);
+            pump();
+            return;
+        }
+
+        if (data.type === "scheduleBatch") {
+            // Admit both streams before pumping.  This preserves sample timing
+            // while preventing a same-batch GM/GS/XG reset from being delivered
+            // after Program Change/Bank Select audio has already rendered.
+            admitSysExBatch(data.meta, data.bytes, data.sysexTimes);
+            admitShortSchedule(data.messages, data.times);
+
+            safeUntil = Math.max(
+                safeUntil,
+                Number(data.safeUntil) || renderSongTime);
+            startupWaitingForSchedule = false;
             pump();
             return;
         }
@@ -831,20 +865,7 @@ onmessage = async event => {
             const times =
                 data.times;
 
-            if (messages &&
-                times &&
-                messages.length === times.length &&
-                messages.length > 0) {
-                const count = messages.length | 0;
-                ensureScratch(count);
-                Module.HEAPU32.set(messages, messagePtr >>> 2);
-                Module.HEAPF64.set(times, timePtr >>> 3);
-                if (!Module._ssw_queue_events(
-                        messagePtr, timePtr, count)) {
-                    throw new Error(
-                        "SnappySynthV2 could not queue the MIDI schedule batch.");
-                }
-            }
+            admitShortSchedule(messages, times);
 
             safeUntil =
                 Math.max(

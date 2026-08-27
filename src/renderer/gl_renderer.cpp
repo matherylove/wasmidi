@@ -141,22 +141,10 @@ EM_JS(void, wasmidi_visual_cache_prime,
        uint32_t missingLo, uint32_t missingHi, uint32_t missingTop), {
     const mapped = globalThis.__wasmidiMappedMidi;
     if (mapped && mapped.worker && mapped.mappedStore) {
-        const request = {
-            type: 'visual-prime',
-            generation: generation >>> 0,
-            spanTicks: spanTicks >>> 0,
-            firstPage: firstPage >>> 0,
-            count: pageCount >>> 0,
-            currentPage: currentPage >>> 0,
-            missingLo: missingLo >>> 0,
-            missingHi: missingHi >>> 0,
-            missingTop: missingTop >>> 0
-        };
-
-        // Use the already-indexed authoritative Worker. buildVisualPages()
-        // yields after every complete screen, so key/synth messages can run in
-        // between pages. This avoids the previous second full-file parse.
-        mapped.worker.postMessage(request);
+        // Remote-indexed playback uses the persistent Sharp ring exclusively.
+        // Never run the legacy visual-page builder in parallel on the same
+        // Memory64 Worker: it duplicates note traversal and competes directly
+        // with synth admission and live keyboard/stat requests.
         return;
     }
 
@@ -2566,9 +2554,13 @@ void GLRenderer::resetSharpRenderer(bool requestRemote)
     sharpRemotePreparedHead_ = 1;
     sharpRemotePendingAppends_.clear();
     sharpRemotePendingCloseWords_.clear();
+    sharpRemotePendingCloseOffset_ = 0;
 
-    if (!ring_.empty())
-        std::fill(ring_.begin(), ring_.end(), VisualNote{});
+    // Head/tail/generation delimit the valid ring contents. Clearing the full
+    // 2^23-note CPU mirror here writes roughly 96 MiB on every seek/reset and
+    // can steal several display/audio quanta for data that will never be read.
+    // Remote/local sweep code overwrites every record before publishing it, so
+    // leave old bytes untouched and invalidate them logically instead.
 
 #ifdef __EMSCRIPTEN__
     if (requestRemote && document_ && document_->remoteIndexed) {
@@ -2636,8 +2628,13 @@ void GLRenderer::calculateSharpView(
         std::max(1.0, notesPerTick * double(windowTicks));
     const double residentBudget =
         double(std::max<std::size_t>(ringCapacity_, std::size_t(1) << 23)) * 0.55;
+    // Keep a healthy multi-screen reserve, but do not let speculative
+    // preprocessing consume the same CPU/Worker budget needed by audio and
+    // live-state updates.  Pass 13.8 raised this to 12..96 screens and then
+    // also forced a 20-second horizon; on dense MIDIs that became continuous
+    // background work and reduced performance everywhere.
     const uint32_t screensAhead = static_cast<uint32_t>(std::clamp<double>(
-        std::floor(residentBudget / estimatedPerScreen), 12.0, 96.0));
+        std::floor(residentBudget / estimatedPerScreen), 4.0, 32.0));
     const uint64_t ahead = uint64_t(windowTicks) * uint64_t(screensAhead);
     sharpLookaheadTicks_ = static_cast<uint32_t>(std::min<uint64_t>(
         ahead, std::numeric_limits<uint32_t>::max()));
@@ -2907,6 +2904,7 @@ void GLRenderer::receiveSharpRenderReset(uint32_t generation)
     sharpRemotePendingBase_ = 1u;
     sharpRemotePendingAppends_.clear();
     sharpRemotePendingCloseWords_.clear();
+    sharpRemotePendingCloseOffset_ = 0;
     sharpModePerTrack_ = sharpRemoteBuildPerTrack_;
 }
 
@@ -2953,18 +2951,17 @@ void GLRenderer::flushRemoteSharpBatches(
     const bool visibleFrameMissing = sharpRemoteSafeThrough_ < requiredThrough;
     const bool prefetchLow = sharpRemoteSafeThrough_ < desiredThrough;
 
-    // Do not wait until the playhead actually reaches the prepared edge before
-    // draining Worker->VBO backlog.  That policy looked smooth while the
-    // background queue was growing, then produced several completely blank
-    // frames once the visible viewport caught it. Spend a larger *bounded*
-    // upload budget while the future reserve is low, and an even larger one if
-    // the current frame is already at risk.
+    // Keep VBO installation bounded per presented frame.  The 13.8 catch-up
+    // budgets could push ~2M note/close operations through glBufferSubData in
+    // one FBO callback, which fixed some blank frames by simply moving the
+    // stall onto the UI/render thread.  A small proactive low-watermark budget
+    // keeps several complete screens installed without stealing whole frames.
     const std::size_t maxBatches = visibleFrameMissing
-        ? 24u
-        : (prefetchLow ? 12u : 6u);
+        ? 4u
+        : (prefetchLow ? 3u : 2u);
     const std::size_t maxWork = visibleFrameMissing
-        ? 2097152u
-        : (prefetchLow ? 1048576u : 524288u);
+        ? 524288u
+        : (prefetchLow ? 393216u : 262144u);
     std::size_t processCount = 0;
     std::size_t processWork = 0;
     while (processCount < sharpRemoteBatches_.size()) {
@@ -3069,24 +3066,32 @@ void GLRenderer::flushRemoteSharpBatches(
         // chronological prefix instead of rescanning/copying the entire pending
         // list after every partial batch (the old path became O(n^2)).
         std::size_t closeWordsConsumed = 0;
-        while (closeWordsConsumed + 1 < sharpRemotePendingCloseWords_.size()) {
+        const std::size_t closeWord = sharpRemotePendingCloseOffset_;
+        while (closeWord + closeWordsConsumed + 1 <
+               sharpRemotePendingCloseWords_.size()) {
             const uint32_t id =
-                sharpRemotePendingCloseWords_[closeWordsConsumed];
+                sharpRemotePendingCloseWords_[closeWord + closeWordsConsumed];
             const uint32_t endTick =
-                sharpRemotePendingCloseWords_[closeWordsConsumed + 1];
+                sharpRemotePendingCloseWords_[closeWord + closeWordsConsumed + 1];
             if (!tickIsSafe(endTick) || id >= sharpHead_)
                 break;
             closeSharpNote(id, endTick, &closeIds);
             closeWordsConsumed += 2;
         }
         if (closeWordsConsumed != 0) {
-            if (closeWordsConsumed == sharpRemotePendingCloseWords_.size()) {
+            sharpRemotePendingCloseOffset_ += closeWordsConsumed;
+            if (sharpRemotePendingCloseOffset_ ==
+                sharpRemotePendingCloseWords_.size()) {
                 sharpRemotePendingCloseWords_.clear();
-            } else {
+                sharpRemotePendingCloseOffset_ = 0;
+            } else if (sharpRemotePendingCloseOffset_ >= 65536u &&
+                       sharpRemotePendingCloseOffset_ * 2u >=
+                           sharpRemotePendingCloseWords_.size()) {
                 sharpRemotePendingCloseWords_.erase(
                     sharpRemotePendingCloseWords_.begin(),
                     sharpRemotePendingCloseWords_.begin() +
-                        static_cast<std::ptrdiff_t>(closeWordsConsumed));
+                        static_cast<std::ptrdiff_t>(sharpRemotePendingCloseOffset_));
+                sharpRemotePendingCloseOffset_ = 0;
             }
         }
 
@@ -3318,20 +3323,10 @@ bool GLRenderer::renderRoll()
             ? document_->maxTick
             : viewEnd + sharpLookaheadTicks_);
 
-    // The screen-count lookahead above protects geometry memory. Also require
-    // a real-time reserve: a tempo change can compress many future seconds into
-    // relatively few screens and otherwise leave the Worker only a handful of
-    // milliseconds ahead of the audible device. Build a much deeper reserve
-    // whenever the source is already resident: the renderer's job is to have
-    // future complete frames ready, not to discover a dense transition when it
-    // becomes visible. The adaptive screen bound above still caps ordinary
-    // geometry growth; ensureRingCapacity handles exceptional dense bursts.
-    const double futureSeconds = std::min<double>(
-        document_->durationSeconds, double(currentTime_) + 20.0);
-    const uint32_t futureTick = static_cast<uint32_t>(std::clamp<double>(
-        std::ceil(document_->secondsToTick(futureSeconds)),
-        0.0, double(document_->maxTick)));
-    sweepEnd = std::max(sweepEnd, futureTick);
+    // Do not force an additional wall-clock horizon here.  The adaptive
+    // screen reserve already grows with noteSpeed and density.  A hard 20 s
+    // target made the mapped Worker permanently busy on dense files, starving
+    // synth event admission and live keyboard/stat snapshots.
     // Quantize horizon growth to one viewport. This avoids posting a Worker
     // extension request every display frame while preserving the same amount
     // of prepared future geometry.
@@ -3342,11 +3337,11 @@ bool GLRenderer::renderRoll()
             rounded, document_->maxTick));
     }
 
-    // Keep at least four complete screens beyond the visible edge in the
+    // Keep at least two complete screens beyond the visible edge in the
     // Worker *and* applied to the VBO. This is the emergency watermark sent to
     // the parser Worker and the proactive drain target for already-completed
     // batches. The normal horizon remains much farther ahead.
-    const uint64_t urgent64 = uint64_t(viewEnd) + uint64_t(windowTicks) * 4u;
+    const uint64_t urgent64 = uint64_t(viewEnd) + uint64_t(windowTicks) * 2u;
     sharpRemoteUrgentThrough_ = static_cast<uint32_t>(std::min<uint64_t>(
         urgent64, document_->maxTick));
 
@@ -3355,7 +3350,7 @@ bool GLRenderer::renderRoll()
     // so already-generated frames are installed first instead of allowing a
     // JS->C++ upload backlog to grow invisibly until the playhead catches it.
     if (document_->remoteIndexed) {
-        const uint64_t desired64 = uint64_t(viewEnd) + uint64_t(windowTicks) * 10u;
+        const uint64_t desired64 = uint64_t(viewEnd) + uint64_t(windowTicks) * 4u;
         const uint32_t desiredThrough = static_cast<uint32_t>(std::min<uint64_t>(
             desired64, sweepEnd));
         flushRemoteSharpBatches(viewEnd, desiredThrough);
@@ -3388,7 +3383,13 @@ bool GLRenderer::renderRoll()
             if (distance <= windowTicks) {
                 needRebuild = false;
                 if (sweepEnd > sharpRemoteBuildTarget_ &&
-                    sweepEnd - sharpRemoteBuildTarget_ >= windowTicks) {
+                    sweepEnd - sharpRemoteBuildTarget_ >= windowTicks &&
+                    sharpRemoteBatches_.size() < 8u) {
+                    // Do not let the Worker run arbitrarily farther ahead while
+                    // completed geometry is already waiting to be installed in
+                    // WebGL.  Backpressure keeps CPU/memory bandwidth available
+                    // for SnappySynth and live-state work without shrinking the
+                    // actual prepared-VBO watermark.
                     sharpRemoteBuildTarget_ = sweepEnd;
                     sharpRemoteRequestedEnd_ = sweepEnd;
                     requestRemoteSharpSweep(sharpRemoteStartTick_, sweepEnd, false);
@@ -3403,6 +3404,7 @@ bool GLRenderer::renderRoll()
             sharpRemoteBatches_.clear();
             sharpRemotePendingAppends_.clear();
             sharpRemotePendingCloseWords_.clear();
+            sharpRemotePendingCloseOffset_ = 0;
             sharpRemotePendingBase_ = 0;
             sharpRemotePreparedHead_ = 1;
 
@@ -3426,7 +3428,8 @@ bool GLRenderer::renderRoll()
             requestRemoteSharpSweep(sharpRemoteStartTick_, sweepEnd, true);
         } else if (!sharpRemoteRebuilding_ &&
                    sweepEnd > sharpRemoteRequestedEnd_ &&
-                   sweepEnd - sharpRemoteRequestedEnd_ >= windowTicks) {
+                   sweepEnd - sharpRemoteRequestedEnd_ >= windowTicks &&
+                   sharpRemoteBatches_.size() < 8u) {
             sharpRemoteRequestedEnd_ = sweepEnd;
             requestRemoteSharpSweep(sharpRemoteStartTick_, sweepEnd, false);
         }

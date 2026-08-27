@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <vector>
 
@@ -345,13 +346,12 @@ private:
     uint64_t liveNpsCount_ = 0;
     uint64_t liveCcCount_ = 0;
 
-    // Mapped-MIDI live state is prepared slightly ahead of the audible
-    // playhead.  The parser Worker may occasionally be busy sweeping a very
-    // dense SharpMIDI transition; applying a snapshot immediately when its
-    // asynchronous reply arrives makes the piano/stats visibly lag behind the
-    // already-prefetched roll.  Keep a tiny ordered queue and present only the
-    // newest snapshot whose tick has actually reached the authoritative audio
-    // clock.  At 60 Hz this is only a few KiB even with a generous lead.
+    // Mapped-MIDI live state is prepared only a couple of display frames ahead
+    // of the authoritative audio clock.  Pass 13.8 used a 250 ms queue and
+    // vector insertion/erasure every frame; under load that made the keyboard
+    // itself another source of main-thread/Worker pressure.  One monotonic
+    // deque hides normal Worker latency without building a second long future
+    // timeline.
     struct RemoteLiveSnapshot {
         double tick = 0.0;
         int activeVoices = 0;
@@ -362,7 +362,7 @@ private:
         std::array<uint8_t, 128> trackColors{};
     };
 
-    std::vector<RemoteLiveSnapshot> remoteLiveSnapshots_;
+    std::deque<RemoteLiveSnapshot> remoteLiveSnapshots_;
     bool remoteLiveBaselinePending_ = false;
 
     // Exact keyboard state from the parser-worker-built compressed start/end

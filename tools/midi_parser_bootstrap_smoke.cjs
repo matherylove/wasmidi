@@ -321,7 +321,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 13.8.0 parser is not Memory64.");
+        throw new Error("Generated Pass 13.10.0 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -538,7 +538,7 @@ async function main() {
     Module._wmp_release_result();
 
     console.log(
-        "MIDI parser Pass 13.8.0 SharpMIDI-ring/streaming-playback smoke test OK");
+        "MIDI parser Pass 13.10.0 SharpMIDI-ring/streaming-playback smoke test OK");
 }
 
 main().catch(error => {

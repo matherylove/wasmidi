@@ -231,7 +231,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                                     'script');
 
                             script.src =
-                                './snappysynth_bridge.js';
+                                './snappysynth_bridge.js?v=13.10.0';
 
                             script.async = false;
                             script.onload = resolve;
@@ -363,7 +363,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             // This prevents a successful earlier deployment from silently running
             // the old monolithic "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=13.8.0', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.10.0', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -374,10 +374,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.8.0"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.10.0"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 13.8.0.');
+                    'Expected bootstrap 13.10.0.');
             }
 
             const parserBaseUrl =
@@ -579,7 +579,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             safeUntil: Math.max(0, Number(message.safeUntil) || 0),
                             velocityFloor: Math.max(0, Math.min(127,
                                 Number(message.velocityFloor) | 0)),
-                            maxBatches: 32
+                            maxBatches: 8
                         };
                         if (!mapped.synthQueued ||
                             deferred.endTick >= Number(mapped.synthQueued.endTick || 0)) {
@@ -630,21 +630,34 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             return;
                         }
                         const bridge = globalThis.WasmidiSnappyBridge;
-                        if (bridge && typeof bridge.schedule === 'function') {
-                            bridge.schedule(
+                        if (bridge && typeof bridge.scheduleBatch === 'function') {
+                            bridge.scheduleBatch(
                                 new Uint32Array(message.messages || new ArrayBuffer(0)),
                                 new Float64Array(message.times || new ArrayBuffer(0)),
-                                Number(message.safeUntil) || 0.0);
-                        }
-                        if (bridge && typeof bridge.scheduleSysExBatch === 'function') {
-                            const meta = new Uint32Array(
-                                message.sysexMeta || new ArrayBuffer(0));
-                            const bytes = new Uint8Array(
-                                message.sysexData || new ArrayBuffer(0));
-                            const times = new Float64Array(
-                                message.sysexTimes || new ArrayBuffer(0));
-                            if (meta.length && bytes.length && times.length)
-                                bridge.scheduleSysExBatch(meta, bytes, times);
+                                Number(message.safeUntil) || 0.0,
+                                new Uint32Array(message.sysexMeta || new ArrayBuffer(0)),
+                                new Uint8Array(message.sysexData || new ArrayBuffer(0)),
+                                new Float64Array(message.sysexTimes || new ArrayBuffer(0)));
+                        } else {
+                            // Compatibility with an older cached bridge.  Queue
+                            // SysEx first so startup cannot render a late GM/GS
+                            // reset after the short-message batch.
+                            if (bridge && typeof bridge.scheduleSysExBatch === 'function') {
+                                const meta = new Uint32Array(
+                                    message.sysexMeta || new ArrayBuffer(0));
+                                const bytes = new Uint8Array(
+                                    message.sysexData || new ArrayBuffer(0));
+                                const times = new Float64Array(
+                                    message.sysexTimes || new ArrayBuffer(0));
+                                if (meta.length && bytes.length && times.length)
+                                    bridge.scheduleSysExBatch(meta, bytes, times);
+                            }
+                            if (bridge && typeof bridge.schedule === 'function') {
+                                bridge.schedule(
+                                    new Uint32Array(message.messages || new ArrayBuffer(0)),
+                                    new Float64Array(message.times || new ArrayBuffer(0)),
+                                    Number(message.safeUntil) || 0.0);
+                            }
                         }
 
                         if (message.complete) {
@@ -674,7 +687,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                                 velocityFloor: Number(message.velocityFloor != null
                                     ? message.velocityFloor
                                     : mapped.synthVelocityFloor) || 0,
-                                maxBatches: 32
+                                maxBatches: 8
                             });
                         }
                         return;
@@ -704,12 +717,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '13.8.0' ||
+                        if (String(message.bootstrap || '') !== '13.10.0' ||
                             message.pagedSource !== true ||
                             message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected mapped-source bootstrap 13.8.0.');
+                                'Expected mapped-source bootstrap 13.10.0.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -871,7 +884,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             visualWorker: null,
                             visualReady: false,
                             visualPrime: null,
-                            bootstrap: '13.8.0',
+                            bootstrap: '13.10.0',
                             mappedStore: true,
                             keyPending: false,
                             keyOwner: null,
@@ -1029,7 +1042,7 @@ EM_JS(void, wasmidi_mapped_synth_pump,
         endTick: Math.max(0, Number(endTick) || 0),
         safeUntil: Math.max(0, Number(safeUntil) || 0),
         velocityFloor: Math.max(0, Math.min(127, velocityFloor | 0)),
-        maxBatches: 32
+        maxBatches: 8
     };
     mapped.synthVelocityFloor = request.velocityFloor;
 
@@ -1816,29 +1829,30 @@ void MainWindow::receiveRemoteKeyState(
             words[HeaderWords + 256u + pitch] & 0x0fu);
     }
 
-    // Replies are intentionally allowed to describe a future frame.  Insert in
-    // tick order and let applyRemoteLiveSnapshot() publish it only when the
-    // audible/renderer clock reaches that tick.  This turns Worker latency into
-    // look-ahead instead of visible keyboard/graph lag.
-    auto pos = std::lower_bound(
-        remoteLiveSnapshots_.begin(), remoteLiveSnapshots_.end(), tick,
-        [](const RemoteLiveSnapshot& item, double value) {
-            return item.tick < value;
-        });
-    if (pos != remoteLiveSnapshots_.end() && std::abs(pos->tick - tick) < 0.000001)
-        *pos = std::move(snapshot);
-    else
-        remoteLiveSnapshots_.insert(pos, std::move(snapshot));
-
-    // Bound the queue even if the UI is paused while the last outstanding
-    // request completes.  48 snapshots is ~75 KiB and comfortably covers the
-    // normal 250 ms prefetch window at 60 Hz.
-    if (remoteLiveSnapshots_.size() > 48u) {
-        remoteLiveSnapshots_.erase(
-            remoteLiveSnapshots_.begin(),
-            remoteLiveSnapshots_.begin() +
-                static_cast<std::ptrdiff_t>(remoteLiveSnapshots_.size() - 48u));
+    // Only one live-state request is in flight, so normal replies are already
+    // monotonic.  Keep the common path O(1); a sorted insertion is retained only
+    // as a defensive fallback for an unexpected reordered reply.
+    if (remoteLiveSnapshots_.empty() ||
+        tick > remoteLiveSnapshots_.back().tick + 0.000001) {
+        remoteLiveSnapshots_.push_back(std::move(snapshot));
+    } else if (std::abs(remoteLiveSnapshots_.back().tick - tick) < 0.000001) {
+        remoteLiveSnapshots_.back() = std::move(snapshot);
+    } else {
+        auto pos = std::lower_bound(
+            remoteLiveSnapshots_.begin(), remoteLiveSnapshots_.end(), tick,
+            [](const RemoteLiveSnapshot& item, double value) {
+                return item.tick < value;
+            });
+        if (pos != remoteLiveSnapshots_.end() &&
+            std::abs(pos->tick - tick) < 0.000001)
+            *pos = std::move(snapshot);
+        else
+            remoteLiveSnapshots_.insert(pos, std::move(snapshot));
     }
+
+    // A two-frame lead only needs a handful of snapshots.
+    while (remoteLiveSnapshots_.size() > 8u)
+        remoteLiveSnapshots_.pop_front();
 
     applyRemoteLiveSnapshot(document_.secondsToTick(currentTime_));
 }
@@ -1849,18 +1863,16 @@ void MainWindow::applyRemoteLiveSnapshot(double targetTick)
         return;
 
     // Select the newest prepared frame at-or-before the authoritative
-    // presentation tick.  Future snapshots remain buffered and stale older
-    // snapshots are discarded in one erase.
-    auto it = std::upper_bound(
-        remoteLiveSnapshots_.begin(), remoteLiveSnapshots_.end(), targetTick,
-        [](double value, const RemoteLiveSnapshot& item) {
-            return value < item.tick;
-        });
-    if (it == remoteLiveSnapshots_.begin())
+    // presentation tick without copying/erasing a vector of ~1.5 KiB snapshots
+    // every display frame.
+    while (remoteLiveSnapshots_.size() > 1u &&
+           remoteLiveSnapshots_[1].tick <= targetTick + 0.000001) {
+        remoteLiveSnapshots_.pop_front();
+    }
+    if (remoteLiveSnapshots_.front().tick > targetTick + 0.000001)
         return;
-    --it;
-    const RemoteLiveSnapshot snapshot = *it;
-    remoteLiveSnapshots_.erase(remoteLiveSnapshots_.begin(), it + 1);
+    RemoteLiveSnapshot snapshot = std::move(remoteLiveSnapshots_.front());
+    remoteLiveSnapshots_.pop_front();
 
     const auto oldMask = visualPitchMask_;
     const auto oldColors = visualPitchColor_;
@@ -1921,7 +1933,6 @@ void MainWindow::applyRemoteLiveSnapshot(double targetTick)
     if (peakChanged)
         emit timelineChanged();
 
-    updateNeuralVisuals();
 }
 
 void MainWindow::invalidateLiveTrackers()
@@ -3042,9 +3053,13 @@ void MainWindow::syncVisualState(double targetTick, bool forceRebuild)
 
         const double targetSeconds = std::clamp(
             document_.tickToSeconds(targetTick), 0.0, double(duration_));
+        // One or two display frames of lead is enough to hide the normal Worker
+        // round trip.  A 250 ms future cursor made live-state reconstruction
+        // compete with renderer prefetch and increased the amount of state that
+        // had to be buffered/published.
         const double requestSeconds = needBaseline
             ? targetSeconds
-            : std::min<double>(duration_, targetSeconds + (isPlaying_ ? 0.25 : 0.0));
+            : std::min<double>(duration_, targetSeconds + (isPlaying_ ? 0.034 : 0.0));
         const double requestTick = document_.secondsToTick(requestSeconds);
         const double npsStartTick = document_.secondsToTick(
             std::max(0.0, requestSeconds - 0.25));

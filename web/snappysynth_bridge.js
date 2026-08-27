@@ -120,7 +120,7 @@
                     context.sampleRate);
 
             await context.audioWorklet.addModule(
-                "./snappysynth-audio-worklet.js");
+                "./snappysynth-audio-worklet.js?v=13.10.0");
 
             node =
                 new AudioWorkletNode(
@@ -137,7 +137,7 @@
 
             worker =
                 new Worker(
-                    "./snappysynth-worker.js");
+                    "./snappysynth-worker.js?v=13.10.0");
 
             workerReadyPromise =
                 new Promise(
@@ -646,6 +646,41 @@
         ]);
     }
 
+    // Atomically publish one mapped-MIDI producer batch.  Posting the short
+    // messages and SysEx as two Worker messages let the "schedule" handler
+    // satisfy AudioWorklet demand before the following SysEx message was even
+    // dispatched.  A GM/GS reset at the same tick could therefore arrive late
+    // and reset channels back to program/bank 0 after the correct Program
+    // Changes had already been queued.  Keep the two streams separate inside
+    // the synth (SysEx is variable length), but cross the Worker boundary once
+    // and allow pumping only after both have been admitted.
+    function scheduleBatch(messages, times, safeUntil, meta, bytes, sysexTimes) {
+        if (!worker || !state.soundfontLoaded ||
+            !(messages instanceof Uint32Array) ||
+            !(times instanceof Float64Array) ||
+            !(meta instanceof Uint32Array) ||
+            !(bytes instanceof Uint8Array) ||
+            !(sysexTimes instanceof Float64Array)) {
+            return;
+        }
+
+        worker.postMessage({
+            type: "scheduleBatch",
+            messages,
+            times,
+            safeUntil: Number(safeUntil) || 0.0,
+            meta,
+            bytes,
+            sysexTimes
+        }, [
+            messages.buffer,
+            times.buffer,
+            meta.buffer,
+            bytes.buffer,
+            sysexTimes.buffer
+        ]);
+    }
+
     function scheduleSysEx(bytes, time) {
         if (!worker || !state.soundfontLoaded || !(bytes instanceof Uint8Array))
             return;
@@ -923,6 +958,7 @@
         seek,
         syncVisualClock,
         schedule,
+        scheduleBatch,
         scheduleSysEx,
         scheduleSysExBatch,
         clearSoundfonts,
