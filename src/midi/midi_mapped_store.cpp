@@ -328,6 +328,7 @@ struct TrackIndex {
     uint64_t offset = 0;
     uint32_t length = 0;
     uint64_t channelEvents = 0;
+    uint64_t synthStateEvents = 0;
     uint32_t maxTick = 0;
     uint16_t firstNoteSeenMask = 0;
     std::array<uint32_t, 16> firstNoteTick{};
@@ -341,6 +342,7 @@ struct TrackIndex {
     // distinction between SharpMIDI and the old on-demand WASMIDI path: dense
     // sections cannot suddenly become parser work at playback time.
     std::vector<MidiMappedStore::EventWord> hotEvents;
+    std::vector<MidiMappedStore::EventWord> hotSynthStateEvents;
 };
 
 struct SysExRef {
@@ -835,6 +837,7 @@ struct MidiMappedStore::Impl {
         TrackIndex& track = tracks[trackIndex];
         track.checkpoints.clear();
         track.channelEvents = 0;
+        track.synthStateEvents = 0;
         track.maxTick = 0;
         track.firstNoteSeenMask = 0;
         track.firstNoteTick.fill(0);
@@ -982,6 +985,8 @@ struct MidiMappedStore::Impl {
             const bool noteOff = command == 0x80 || (command == 0x90 && d2 == 0);
             const bool control = command == 0xb0 || command == 0xc0 ||
                                  command == 0xd0 || command == 0xe0;
+            const bool synthState = command == 0xb0 || command == 0xc0 ||
+                                    command == 0xe0;
 
             const uint16_t visualKey =
                 uint16_t((uint16_t(channel) << 7) | uint16_t(d1 & 0x7f));
@@ -1030,6 +1035,8 @@ struct MidiMappedStore::Impl {
             }
             if (control)
                 ++totalControls;
+            if (synthState)
+                ++track.synthStateEvents;
             (void)noteOff;
         }
 
@@ -1060,10 +1067,16 @@ struct MidiMappedStore::Impl {
     {
         TrackIndex& track = tracks[trackIndex];
         track.hotEvents.clear();
+        track.hotSynthStateEvents.clear();
         if (track.channelEvents >
             static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
             return false;
         track.hotEvents.resize(static_cast<std::size_t>(track.channelEvents));
+        if (track.synthStateEvents >
+            static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
+            return false;
+        track.hotSynthStateEvents.reserve(
+            static_cast<std::size_t>(track.synthStateEvents));
 
         Cursor cursor(reader, track.offset, track.offset + uint64_t(track.length));
         uint32_t tick = 0;
@@ -1133,9 +1146,20 @@ struct MidiMappedStore::Impl {
                     (uint32_t(d2) << 16) |
                     (uint32_t(color) << 24)
             };
+
+            if (command == 0xb0 || command == 0xc0 || command == 0xe0) {
+                track.hotSynthStateEvents.push_back({
+                    tick,
+                    uint32_t(status) |
+                        (uint32_t(d1) << 8) |
+                        (uint32_t(d2) << 16)
+                });
+            }
         }
 
-        if (!ok || write != track.hotEvents.size())
+        if (!ok || write != track.hotEvents.size() ||
+            track.hotSynthStateEvents.size() !=
+                static_cast<std::size_t>(track.synthStateEvents))
             return false;
         return true;
     }
@@ -2820,6 +2844,105 @@ bool MidiMappedStore::buildHistoricalSysEx(
             offset,
             static_cast<uint32_t>(it->data.size())
         });
+    }
+    return true;
+}
+
+bool MidiMappedStore::buildHistoricalSelectorState(
+    uint32_t startTick,
+    std::vector<EventWord>& output)
+{
+    output.clear();
+    if (!valid_)
+        return false;
+
+    struct ChannelSelector {
+        uint8_t pendingMsb = 0;
+        uint8_t pendingLsb = 0;
+        uint8_t appliedMsb = 0;
+        uint8_t appliedLsb = 0;
+        uint8_t program = 0;
+        uint16_t bend = 8192;
+    };
+    std::array<ChannelSelector, 16> state{};
+
+    struct CursorNode {
+        uint32_t tick = 0;
+        uint32_t track = 0;
+        std::size_t index = 0;
+    };
+    struct CursorGreater {
+        bool operator()(const CursorNode& a, const CursorNode& b) const {
+            if (a.tick != b.tick) return a.tick > b.tick;
+            if (a.track != b.track) return a.track > b.track;
+            return a.index > b.index;
+        }
+    };
+
+    std::priority_queue<CursorNode, std::vector<CursorNode>, CursorGreater> heap;
+    for (uint32_t t = 0; t < impl_->tracks.size(); ++t) {
+        const auto& events = impl_->tracks[t].hotSynthStateEvents;
+        if (!events.empty() && events.front().tick < startTick)
+            heap.push({events.front().tick, t, 0});
+    }
+
+    while (!heap.empty()) {
+        const CursorNode node = heap.top();
+        heap.pop();
+        const auto& events = impl_->tracks[node.track].hotSynthStateEvents;
+        if (node.index >= events.size())
+            continue;
+        const EventWord& ev = events[node.index];
+        if (ev.tick >= startTick)
+            continue;
+
+        const uint8_t status = static_cast<uint8_t>(ev.packed & 0xffu);
+        const uint8_t command = status & 0xf0u;
+        const uint8_t ch = status & 0x0fu;
+        const uint8_t d1 = static_cast<uint8_t>((ev.packed >> 8) & 0x7fu);
+        const uint8_t d2 = static_cast<uint8_t>((ev.packed >> 16) & 0x7fu);
+        ChannelSelector& cs = state[ch];
+        if (command == 0xb0u) {
+            if (d1 == 0) cs.pendingMsb = d2;
+            else if (d1 == 32) cs.pendingLsb = d2;
+        } else if (command == 0xc0u) {
+            cs.program = d1;
+            cs.appliedMsb = cs.pendingMsb;
+            cs.appliedLsb = cs.pendingLsb;
+        } else if (command == 0xe0u) {
+            cs.bend = static_cast<uint16_t>(uint16_t(d1) | (uint16_t(d2) << 7));
+        }
+
+        const std::size_t next = node.index + 1u;
+        if (next < events.size() && events[next].tick < startTick)
+            heap.push({events[next].tick, node.track, next});
+    }
+
+    output.reserve(16u * 6u);
+    auto emit3 = [&](uint8_t status, uint8_t d1, uint8_t d2) {
+        output.push_back({
+            startTick,
+            uint32_t(status) | (uint32_t(d1) << 8) | (uint32_t(d2) << 16)
+        });
+    };
+    for (uint8_t ch = 0; ch < 16; ++ch) {
+        const ChannelSelector& cs = state[ch];
+        // Recreate the *applied* bank first and commit it with Program Change.
+        // Then restore Bank Select values that arrived after that Program
+        // Change. They must remain pending for the next Program Change exactly
+        // as in native SnappySynthV2.
+        emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.appliedMsb);
+        emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.appliedLsb);
+        emit3(static_cast<uint8_t>(0xc0u | ch), cs.program, 0);
+        if (cs.pendingMsb != cs.appliedMsb)
+            emit3(static_cast<uint8_t>(0xb0u | ch), 0, cs.pendingMsb);
+        if (cs.pendingLsb != cs.appliedLsb)
+            emit3(static_cast<uint8_t>(0xb0u | ch), 32, cs.pendingLsb);
+        if (cs.bend != 8192u) {
+            emit3(static_cast<uint8_t>(0xe0u | ch),
+                  static_cast<uint8_t>(cs.bend & 0x7fu),
+                  static_cast<uint8_t>((cs.bend >> 7) & 0x7fu));
+        }
     }
     return true;
 }

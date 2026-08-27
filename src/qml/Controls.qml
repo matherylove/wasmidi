@@ -200,15 +200,15 @@ Item {
         // also one graph sample.
         Timer {
             interval: 16
-            running: chartBox.visible && root.mainWindow.hasMidi
+            running: chartBox.visible && root.mainWindow.hasMidi && root.mainWindow.isPlaying
             repeat: true
             onTriggered: {
                 var now = Number(root.mainWindow.currentTime)
-                if (chartBox.lastTransportTime >= 0 &&
-                    (now + 0.0005 < chartBox.lastTransportTime ||
-                     Math.abs(now - chartBox.lastTransportTime) > 0.25)) {
-                    chartBox.resetHistory()
-                }
+                // Actual seek/stop transactions are identified by
+                // transportRevision above. Do not infer a seek from a clock
+                // correction: the AudioWorklet's delivered-PCM clock may move
+                // by more than 250 ms after an underrun/recovery, and clearing
+                // the graph here made it look desynchronized from the music.
                 chartBox.lastTransportTime = now
                 if (chartBox.samples.length !== chartBox.historyLength)
                     chartBox.resetHistory()
@@ -326,15 +326,10 @@ Item {
 
         Timer {
             interval: 16
-            running: timelineBox.visible && root.mainWindow.hasMidi
+            running: timelineBox.visible && root.mainWindow.hasMidi && root.mainWindow.isPlaying
             repeat: true
             onTriggered: {
                 var now = Number(root.mainWindow.currentTime)
-                if (timelineBox.lastTransportTime >= 0 &&
-                    (now + 0.0005 < timelineBox.lastTransportTime ||
-                     Math.abs(now - timelineBox.lastTransportTime) > 0.25)) {
-                    timelineBox.resetHistory()
-                }
                 timelineBox.lastTransportTime = now
                 if (timelineBox.samples.length !== timelineBox.historyLength)
                     timelineBox.resetHistory()

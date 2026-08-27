@@ -24,6 +24,7 @@ public:
     void resize(int width, int height);
 
     void setDocument(const MidiDocument* document);
+    void setTransportRevision(uint64_t revision);
     void setCurrentTime(float seconds);
     void setNoteSpeed(float secondsPerWindow);
     void setPostBuffer(float seconds);
@@ -112,7 +113,8 @@ private:
     void uploadSharpCloseIds(std::vector<uint32_t>& closeIds);
     void requestRemoteSharpSweep(uint32_t startTick, uint32_t endTick,
                                  bool reset);
-    void flushRemoteSharpBatches(uint32_t requiredThrough);
+    void flushRemoteSharpBatches(uint32_t requiredThrough,
+                                 uint32_t desiredThrough);
     void regenerateSharpPalette();
     void drawSharpRing(uint32_t currentTick, uint32_t viewStart,
                        uint32_t viewEnd, uint32_t windowTicks,
@@ -246,6 +248,8 @@ private:
     float sharpStableNoteSpeed_ = -1.0f;
     uint32_t sharpLookaheadTicks_ = 4000;
     bool sharpForceReset_ = true;
+    uint64_t transportRevision_ = 0;
+    bool transportRevisionValid_ = false;
     bool sharpModePerTrack_ = false;
     std::array<uint8_t, 256u * 4u> sharpPaletteData_{};
     bool sharpPaletteUploadPending_ = true;
@@ -266,6 +270,7 @@ private:
     uint32_t sharpRemoteGeneration_ = 1;
     uint32_t sharpRemoteRequestedEnd_ = 0;
     uint32_t sharpRemoteSafeThrough_ = 0;
+    uint32_t sharpRemoteUrgentThrough_ = 0;
     uint32_t sharpRemoteStartTick_ = 0;
     bool sharpRemoteWaitingReset_ = false;
 

@@ -2,10 +2,10 @@
 
 "use strict";
 
-// Pass 13.7.0: SharpMIDI-style mapped-source parser. The browser File remains
+// Pass 13.8.0: SharpMIDI-style mapped-source parser. The browser File remains
 // outside the WASM heap; only compact indexes/checkpoints remain resident in
 // Memory64, and render/playback data are decoded into bounded pages on demand.
-const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.7.0";
+const WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.8.0";
 const RESULT_CHUNK_BYTES = 16 * 1024 * 1024;
 const SYNTH_EVENT_BATCH_EVENTS = 262144;
 const FAST_SOURCE_MIN_BYTES = 256 * 1024 * 1024;
@@ -206,7 +206,7 @@ function getModule() {
             pointerBits = Number(Module._wmp_pointer_bits()) | 0;
             if (pointerBits !== 64) {
                 throw new Error(
-                    "Pass 13.7.0 parser was built without Memory64 (pointer width " +
+                    "Pass 13.8.0 parser was built without Memory64 (pointer width " +
                     pointerBits + ").");
             }
 
@@ -296,6 +296,8 @@ let synthPriorityUntil = 0;
 // the old async pump is still suspended. Generation checks prevent that old
 // pump from touching the newly reset cursor or publishing stale events.
 let synthGeneration = 0;
+let synthHistoricalSelectorMessages = null;
+let synthHistoricalSelectorTime = 0.0;
 
 // SharpMIDI-raylib renderer port. There are no visual pages. The Memory64
 // worker walks the same compact event stream with its own persistent cursor and
@@ -304,8 +306,11 @@ let synthGeneration = 0;
 // a larger source chunk per yield so several future viewports can be ready in
 // advance instead of reaching a dense transition just-in-time.
 const SHARP_RENDER_SOURCE_BUDGET = 524288;
+const SHARP_RENDER_URGENT_SOURCE_BUDGET = 1048576;
 let sharpRenderGeneration = 0;
 let sharpRenderTarget = 0;
+let sharpRenderUrgentThrough = 0;
+let sharpRenderSafeThrough = 0;
 let sharpRenderRunning = false;
 let sharpRenderReady = false;
 let sharpRenderPerTrack = false;
@@ -492,6 +497,7 @@ async function drainSharpRenderer() {
 
     try {
         const Module = await getModule();
+        let burstStart = performance.now();
         while (mappedFileReady && sharpRenderReady &&
                sharpRenderCompletedTarget < sharpRenderTarget) {
             // Keep SnappySynth responsive without demoting the renderer to the
@@ -504,8 +510,12 @@ async function drainSharpRenderer() {
 
             const generation = sharpRenderGeneration;
             const target = sharpRenderTarget >>> 0;
+            const urgent = sharpRenderSafeThrough < sharpRenderUrgentThrough;
+            const sourceBudget = urgent
+                ? SHARP_RENDER_URGENT_SOURCE_BUDGET
+                : SHARP_RENDER_SOURCE_BUDGET;
             if (!Module._wmp_build_render_sweep_js(
-                    target, SHARP_RENDER_SOURCE_BUDGET)) {
+                    target, sourceBudget)) {
                 throw new Error(parserErrorText(
                     Module,
                     "Could not sweep SharpMIDI renderer events"));
@@ -551,6 +561,9 @@ async function drainSharpRenderer() {
             let safeThrough = target;
             if (!complete && hasNextTick)
                 safeThrough = nextTick;
+            sharpRenderSafeThrough = complete
+                ? Math.max(sharpRenderSafeThrough, safeThrough)
+                : Math.max(sharpRenderSafeThrough, safeThrough > 0 ? safeThrough - 1 : 0);
 
             postMessage({
                 type: "sharp-render-delta",
@@ -569,7 +582,18 @@ async function drainSharpRenderer() {
                     break;
             }
 
-            await new Promise(resolve => setTimeout(resolve, 0));
+            // When the playhead is approaching the prepared edge, let the
+            // renderer consume a short burst of resident Memory64 events before
+            // yielding.  Cap the burst in wall time so key-state and synth
+            // messages still get frequent service. Far-ahead speculative work
+            // keeps the old one-batch-per-yield behavior.
+            const stillUrgent = complete
+                ? safeThrough < sharpRenderUrgentThrough
+                : (hasNextTick && nextTick <= sharpRenderUrgentThrough);
+            if (!stillUrgent || performance.now() - burstStart >= 6.0) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+                burstStart = performance.now();
+            }
         }
     } finally {
         sharpRenderRunning = false;
@@ -598,7 +622,11 @@ async function requestSharpRenderer(message) {
         sharpRenderGeneration = generation;
         sharpRenderPerTrack = perTrack;
         sharpRenderTarget = endTick >>> 0;
+        sharpRenderUrgentThrough = Math.min(
+            sharpRenderTarget,
+            Math.max(startTick, Number(message.urgentThrough) || startTick)) >>> 0;
         sharpRenderCompletedTarget = startTick > 0 ? (startTick - 1) >>> 0 : 0;
+        sharpRenderSafeThrough = sharpRenderCompletedTarget;
         sharpRenderReady = true;
         Module._wmp_reset_render_cursor_js(startTick, perTrack ? 1 : 0);
         postMessage({
@@ -609,6 +637,11 @@ async function requestSharpRenderer(message) {
     } else if (endTick > sharpRenderTarget) {
         sharpRenderTarget = endTick >>> 0;
     }
+
+    sharpRenderUrgentThrough = Math.min(
+        sharpRenderTarget,
+        Math.max(sharpRenderUrgentThrough,
+            Math.max(startTick, Number(message.urgentThrough) || startTick))) >>> 0;
 
     void drainSharpRenderer();
 }
@@ -641,6 +674,9 @@ async function resetSynthCursor(message) {
     const tick = Math.max(0, Math.min(0xffffffff, Number(message.tick) || 0));
     synthGeneration = Number(message.generation) >>> 0;
     Module._wmp_reset_event_cursor_js(tick);
+    synthHistoricalSelectorMessages = null;
+    synthHistoricalSelectorTime = Math.max(
+        0, Number(Module._wmp_tick_to_seconds_js(tick)) || 0);
 
     // Restore mapped GM/GS/XG state without copying every SysEx into Qt's
     // wasm32 document. Payloads were retained beside the Memory64 event store
@@ -659,10 +695,36 @@ async function resetSynthCursor(message) {
         postMessage({
             type: "synth-sysex-history",
             generation: synthGeneration,
-            time: Math.max(0, Number(Module._wmp_tick_to_seconds_js(tick)) || 0),
+            time: synthHistoricalSelectorTime,
             meta: meta.buffer,
             data: data.buffer
         }, [meta.buffer, data.buffer]);
+    }
+
+    // Native SnappySynth keeps Bank Select MSB/LSB pending and commits them
+    // only on Program Change.  A mapped seek used to restore SysEx but not this
+    // channel selector state, which made multi-preset/multi-bank SF2 files fall
+    // back to bank/program 0 until the next explicit Program Change.  The C++
+    // mapped store folds only sparse B0/C0/E0 state events from the mandatory
+    // parse pass and emits the minimal sequence that recreates both the applied
+    // bank/program and any still-pending Bank Select values.
+    if (!Module._wmp_build_historical_selector_state_js(tick))
+        throw new Error(parserErrorText(Module, "Could not restore mapped bank/program state"));
+    const selectorCount = sizeToNumber(
+        Module._wmp_historical_selector_state_count_js(),
+        "historical selector-state count");
+    if (selectorCount > 0) {
+        const selectorPtr = pointerToNumber(
+            Module._wmp_historical_selector_state_ptr_js(),
+            "historical selector-state pointer");
+        const restored = new Uint32Array(selectorCount);
+        for (let i = 0; i < selectorCount; ++i) {
+            // EventWord = { uint32 tick, uint32 packed }. Only the packed MIDI
+            // word is needed by SnappySynth; every restore event is scheduled
+            // at the seek point after historical reset SysEx has been applied.
+            restored[i] = Module.HEAPU32[(selectorPtr + i * 8 + 4) >>> 2] >>> 0;
+        }
+        synthHistoricalSelectorMessages = restored;
     }
     postMessage({
         type: "synth-cursor-reset",
@@ -789,14 +851,34 @@ async function pumpSynthWindow(message) {
             ++i;
         }
 
-        const msgArray =
+        let msgArray =
             outCount === count
                 ? messageScratch
                 : messageScratch.slice(0, outCount);
-        const timeArray =
+        let timeArray =
             outCount === count
                 ? timeScratch
                 : timeScratch.slice(0, outCount);
+
+        // Selector restoration belongs to the first real schedule batch of the
+        // reset generation.  Do not publish it as a standalone schedule ACK:
+        // doing so can let the AudioWorklet begin consuming PCM before the
+        // mapped producer has supplied actual MIDI coverage.  Prepending here
+        // preserves startup/seek gating and guarantees historical SysEx arrives
+        // first, then bank/program/pitch state, then source events at/after tick.
+        if (synthHistoricalSelectorMessages &&
+            synthHistoricalSelectorMessages.length > 0) {
+            const prefix = synthHistoricalSelectorMessages;
+            const mergedMessages = new Uint32Array(prefix.length + msgArray.length);
+            const mergedTimes = new Float64Array(prefix.length + timeArray.length);
+            mergedMessages.set(prefix, 0);
+            mergedMessages.set(msgArray, prefix.length);
+            mergedTimes.fill(synthHistoricalSelectorTime, 0, prefix.length);
+            mergedTimes.set(timeArray, prefix.length);
+            msgArray = mergedMessages;
+            timeArray = mergedTimes;
+            synthHistoricalSelectorMessages = null;
+        }
         const sysExMeta = sysExCount
             ? copyWasmBytes(
                 Module, Module._wmp_sysex_batch_event_ptr_js(), sysExCount * 12)

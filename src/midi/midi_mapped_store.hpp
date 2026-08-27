@@ -134,6 +134,14 @@ public:
         std::vector<SysExBatchEvent>& sysExEvents,
         std::vector<uint8_t>& sysExBytes);
 
+    // Compact channel-selector restore for mapped seeks.  SnappySynth latches
+    // CC0/CC32 only when Program Change is processed; emitting both the applied
+    // bank and any later pending Bank Select values recreates that exact latch
+    // without replaying millions of historical NoteOns.
+    bool buildHistoricalSelectorState(
+        uint32_t startTick,
+        std::vector<EventWord>& output);
+
     // Faithful SharpMIDI-raylib visual sweep. This is an independent cursor
     // from SnappySynth playback. It reproduces GLNoteRenderer.ProcessOneEvent:
     // one active counter per channel/key, track/color-owner replacement, open

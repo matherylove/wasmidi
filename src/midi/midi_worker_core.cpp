@@ -23,6 +23,7 @@ wasmidi::MidiMappedStore g_mappedStore;
 wasmidi::MidiDocument g_document;
 std::vector<wasmidi::VisualNote> g_visualPage;
 std::vector<wasmidi::MidiMappedStore::EventWord> g_eventBatch;
+std::vector<wasmidi::MidiMappedStore::EventWord> g_historicalSelectorState;
 std::vector<double> g_eventBatchTimes;
 std::vector<wasmidi::MidiMappedStore::SysExBatchEvent> g_sysExBatchEvents;
 std::vector<uint8_t> g_sysExBatchBytes;
@@ -597,6 +598,45 @@ int wmp_build_historical_sysex_js(double startTick)
         return 0;
     }
     return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_build_historical_selector_state_js(double startTick)
+{
+    if (!jsExactNonNegativeInteger(startTick) ||
+        startTick > double(std::numeric_limits<uint32_t>::max())) {
+        g_error = "Invalid historical selector-state request";
+        return 0;
+    }
+    if (!g_mappedStore.buildHistoricalSelectorState(
+            static_cast<uint32_t>(startTick),
+            g_historicalSelectorState)) {
+        g_error = g_mappedStore.error();
+        if (g_error.empty())
+            g_error = "Could not build historical selector state";
+        return 0;
+    }
+    return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_historical_selector_state_ptr_js()
+{
+    return g_historicalSelectorState.empty()
+        ? 0.0
+        : pointerToJsAddress(g_historicalSelectorState.data());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+double wmp_historical_selector_state_count_js()
+{
+    return static_cast<double>(g_historicalSelectorState.size());
 }
 
 #ifdef __EMSCRIPTEN__

@@ -271,6 +271,7 @@ private:
     void invalidateLiveTrackers();
     void clearVisualState();
     void syncVisualState(double targetTick, bool forceRebuild = false);
+    void applyRemoteLiveSnapshot(double targetTick);
     void rebuildVisualStateAt(double targetTick);
     bool restoreVisualStateFromPage(double targetTick);
     void advanceVisualStateTo(double targetTick);
@@ -343,6 +344,26 @@ private:
     std::size_t liveCcLo_ = 0;
     uint64_t liveNpsCount_ = 0;
     uint64_t liveCcCount_ = 0;
+
+    // Mapped-MIDI live state is prepared slightly ahead of the audible
+    // playhead.  The parser Worker may occasionally be busy sweeping a very
+    // dense SharpMIDI transition; applying a snapshot immediately when its
+    // asynchronous reply arrives makes the piano/stats visibly lag behind the
+    // already-prefetched roll.  Keep a tiny ordered queue and present only the
+    // newest snapshot whose tick has actually reached the authoritative audio
+    // clock.  At 60 Hz this is only a few KiB even with a generous lead.
+    struct RemoteLiveSnapshot {
+        double tick = 0.0;
+        int activeVoices = 0;
+        int nps = 0;
+        int ccPerSecond = 0;
+        std::array<uint32_t, 128> counts{};
+        std::array<uint8_t, 128> globalColors{};
+        std::array<uint8_t, 128> trackColors{};
+    };
+
+    std::vector<RemoteLiveSnapshot> remoteLiveSnapshots_;
+    bool remoteLiveBaselinePending_ = false;
 
     // Exact keyboard state from the parser-worker-built compressed start/end
     // timeline. Dense identical notes advance as counted deltas instead of one

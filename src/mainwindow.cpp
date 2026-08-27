@@ -363,7 +363,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             // This prevents a successful earlier deployment from silently running
             // the old monolithic "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=13.7.0', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.8.0', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -374,10 +374,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.7.0"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.8.0"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 13.7.0.');
+                    'Expected bootstrap 13.8.0.');
             }
 
             const parserBaseUrl =
@@ -491,6 +491,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
                 mapped.keyPending = false;
                 mapped.keyOwner = null;
+                mapped.keyInFlightRequestId = 0;
                 if (!mapped.keyQueued)
                     return;
 
@@ -501,6 +502,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                     return;
                 mapped.keyPending = true;
                 mapped.keyOwner = target;
+                mapped.keyInFlightRequestId = Number(request.requestId) >>> 0;
                 target.postMessage(request);
             };
 
@@ -532,7 +534,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         const mapped = globalThis.__wasmidiMappedMidi;
                         if (mapped && mapped.worker === parserWorker &&
                             (Number(message.requestId) >>> 0) ===
-                                (Number(mapped.keyRequestId) >>> 0) &&
+                                (Number(mapped.keyInFlightRequestId) >>> 0) &&
                             (Number(message.generation) >>> 0) ===
                                 (Number(mapped.keyGeneration) >>> 0)) {
                             deliverKeyState(message);
@@ -702,12 +704,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '13.7.0' ||
+                        if (String(message.bootstrap || '') !== '13.8.0' ||
                             message.pagedSource !== true ||
                             message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected mapped-source bootstrap 13.7.0.');
+                                'Expected mapped-source bootstrap 13.8.0.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -869,12 +871,13 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             visualWorker: null,
                             visualReady: false,
                             visualPrime: null,
-                            bootstrap: '13.7.0',
+                            bootstrap: '13.8.0',
                             mappedStore: true,
                             keyPending: false,
                             keyOwner: null,
                             keyQueued: null,
                             keyRequestId: 0,
+                            keyInFlightRequestId: 0,
                             keyGeneration: 1,
                             synthResetPending: false,
                             synthPumpPending: false,
@@ -989,6 +992,7 @@ EM_JS(void, wasmidi_mapped_request_key_state,
     }
     mapped.keyPending = true;
     mapped.keyOwner = mapped.worker;
+    mapped.keyInFlightRequestId = request.requestId >>> 0;
     mapped.worker.postMessage(request);
 });
 
@@ -1072,6 +1076,14 @@ EM_JS(int, wasmidi_snappy_sample_rate, (), {
     return b && b.state ? (Number(b.state.sampleRate) | 0) : 0;
 });
 
+EM_JS(double, wasmidi_snappy_audio_clock, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (!b || typeof b.getAudioClock !== 'function')
+        return -1.0;
+    const value = Number(b.getAudioClock());
+    return Number.isFinite(value) ? value : -1.0;
+});
+
 EM_JS(int, wasmidi_snappy_active_voices, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? (Number(b.state.activeVoices) | 0) : 0;
@@ -1105,11 +1117,6 @@ EM_JS(int, wasmidi_snappy_worker_count, (), {
 EM_JS(int, wasmidi_snappy_underruns, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? (Number(b.state.underruns) | 0) : 0;
-});
-
-EM_JS(double, wasmidi_snappy_audio_clock, (), {
-    const b = globalThis.WasmidiSnappyBridge;
-    return b && b.getAudioClock ? Number(b.getAudioClock()) : -1.0;
 });
 
 EM_JS(int, wasmidi_snappy_starved, (), {
@@ -1791,12 +1798,69 @@ void MainWindow::receiveRemoteKeyState(
     if (!document_.remoteIndexed || !words || wordCount != ExpectedWords)
         return;
 
-    const int newActiveVoices = static_cast<int>(std::min<uint32_t>(
+    remoteLiveBaselinePending_ = false;
+
+    RemoteLiveSnapshot snapshot;
+    snapshot.tick = tick;
+    snapshot.activeVoices = static_cast<int>(std::min<uint32_t>(
         words[0], static_cast<uint32_t>(std::numeric_limits<int>::max())));
-    const int newNps = static_cast<int>(std::min<uint32_t>(
+    snapshot.nps = static_cast<int>(std::min<uint32_t>(
         words[1], static_cast<uint32_t>(std::numeric_limits<int>::max())));
-    const int newCc = static_cast<int>(std::min<uint32_t>(
+    snapshot.ccPerSecond = static_cast<int>(std::min<uint32_t>(
         words[2], static_cast<uint32_t>(std::numeric_limits<int>::max())));
+    for (std::size_t pitch = 0; pitch < 128; ++pitch) {
+        snapshot.counts[pitch] = words[HeaderWords + pitch];
+        snapshot.globalColors[pitch] = static_cast<uint8_t>(
+            words[HeaderWords + 128u + pitch] & 0x0fu);
+        snapshot.trackColors[pitch] = static_cast<uint8_t>(
+            words[HeaderWords + 256u + pitch] & 0x0fu);
+    }
+
+    // Replies are intentionally allowed to describe a future frame.  Insert in
+    // tick order and let applyRemoteLiveSnapshot() publish it only when the
+    // audible/renderer clock reaches that tick.  This turns Worker latency into
+    // look-ahead instead of visible keyboard/graph lag.
+    auto pos = std::lower_bound(
+        remoteLiveSnapshots_.begin(), remoteLiveSnapshots_.end(), tick,
+        [](const RemoteLiveSnapshot& item, double value) {
+            return item.tick < value;
+        });
+    if (pos != remoteLiveSnapshots_.end() && std::abs(pos->tick - tick) < 0.000001)
+        *pos = std::move(snapshot);
+    else
+        remoteLiveSnapshots_.insert(pos, std::move(snapshot));
+
+    // Bound the queue even if the UI is paused while the last outstanding
+    // request completes.  48 snapshots is ~75 KiB and comfortably covers the
+    // normal 250 ms prefetch window at 60 Hz.
+    if (remoteLiveSnapshots_.size() > 48u) {
+        remoteLiveSnapshots_.erase(
+            remoteLiveSnapshots_.begin(),
+            remoteLiveSnapshots_.begin() +
+                static_cast<std::ptrdiff_t>(remoteLiveSnapshots_.size() - 48u));
+    }
+
+    applyRemoteLiveSnapshot(document_.secondsToTick(currentTime_));
+}
+
+void MainWindow::applyRemoteLiveSnapshot(double targetTick)
+{
+    if (!document_.remoteIndexed || remoteLiveSnapshots_.empty())
+        return;
+
+    // Select the newest prepared frame at-or-before the authoritative
+    // presentation tick.  Future snapshots remain buffered and stale older
+    // snapshots are discarded in one erase.
+    auto it = std::upper_bound(
+        remoteLiveSnapshots_.begin(), remoteLiveSnapshots_.end(), targetTick,
+        [](double value, const RemoteLiveSnapshot& item) {
+            return value < item.tick;
+        });
+    if (it == remoteLiveSnapshots_.begin())
+        return;
+    --it;
+    const RemoteLiveSnapshot snapshot = *it;
+    remoteLiveSnapshots_.erase(remoteLiveSnapshots_.begin(), it + 1);
 
     const auto oldMask = visualPitchMask_;
     const auto oldColors = visualPitchColor_;
@@ -1806,16 +1870,14 @@ void MainWindow::receiveRemoteKeyState(
     visualPitchColor_.fill(-1);
     for (auto& counts : visualPitchColorCounts_) counts.fill(0);
     visualColorVoices_.fill(0);
-    visualActiveVoices_ = newActiveVoices;
+    visualActiveVoices_ = snapshot.activeVoices;
 
     for (std::size_t pitch = 0; pitch < 128; ++pitch) {
-        const uint32_t count = words[HeaderWords + pitch];
+        const uint32_t count = snapshot.counts[pitch];
         if (!count) continue;
-        const uint8_t globalColor = static_cast<uint8_t>(
-            words[HeaderWords + 128u + pitch] & 0x0fu);
-        const uint8_t trackColor = static_cast<uint8_t>(
-            words[HeaderWords + 256u + pitch] & 0x0fu);
-        const uint8_t color = perTrackColors_ ? trackColor : globalColor;
+        const uint8_t color = perTrackColors_
+            ? snapshot.trackColors[pitch]
+            : snapshot.globalColors[pitch];
 
         visualPitchCount_[pitch] = count;
         visualPitchMask_[pitch] = 1;
@@ -1826,33 +1888,33 @@ void MainWindow::receiveRemoteKeyState(
                 uint64_t(visualColorVoices_[color]) + count));
     }
 
-    visualTick_ = tick;
+    visualTick_ = snapshot.tick;
     visualStateValid_ = true;
 
     if (oldMask != visualPitchMask_ || oldColors != visualPitchColor_)
         emit activePitchesChanged();
-    if (activeVoices_ != newActiveVoices) {
-        activeVoices_ = newActiveVoices;
+    if (activeVoices_ != snapshot.activeVoices) {
+        activeVoices_ = snapshot.activeVoices;
         emit activeVoicesChanged();
     }
-    if (nps_ != newNps) {
-        nps_ = newNps;
+    if (nps_ != snapshot.nps) {
+        nps_ = snapshot.nps;
         emit npsChanged();
     }
-    if (ccPerSecond_ != newCc) {
-        ccPerSecond_ = newCc;
+    if (ccPerSecond_ != snapshot.ccPerSecond) {
+        ccPerSecond_ = snapshot.ccPerSecond;
         emit ccPerSecondChanged();
     }
 
     bool peakChanged = false;
-    if (newNps > peakNps_) {
-        peakNps_ = newNps;
-        peakNpsTime_ = static_cast<float>(document_.tickToSeconds(tick));
+    if (snapshot.nps > peakNps_) {
+        peakNps_ = snapshot.nps;
+        peakNpsTime_ = static_cast<float>(document_.tickToSeconds(snapshot.tick));
         emit peakNpsChanged();
         peakChanged = true;
     }
-    if (newActiveVoices > peakPolyphony_) {
-        peakPolyphony_ = newActiveVoices;
+    if (snapshot.activeVoices > peakPolyphony_) {
+        peakPolyphony_ = snapshot.activeVoices;
         emit peakPolyphonyChanged();
         peakChanged = true;
     }
@@ -1876,6 +1938,8 @@ void MainWindow::invalidateLiveTrackers()
     neuralFutureLo_ = 0;
     neuralFutureHi_ = 0;
     neuralFutureColors_.fill(0);
+    remoteLiveSnapshots_.clear();
+    remoteLiveBaselinePending_ = false;
 }
 
 void MainWindow::clearFile()
@@ -2966,13 +3030,32 @@ void MainWindow::syncVisualState(double targetTick, bool forceRebuild)
 {
     if (document_.remoteIndexed) {
 #ifdef __EMSCRIPTEN__
-        forceRebuild = forceRebuild || !visualStateValid_;
+        const bool needBaseline = forceRebuild || !visualStateValid_;
+        if (forceRebuild)
+            remoteLiveSnapshots_.clear();
+
+        // Present a snapshot that was prepared ahead of time before asking the
+        // Worker for another one.  Piano/stats therefore advance on the exact
+        // same clock sample as the roll instead of on arbitrary Worker reply
+        // latency.
+        applyRemoteLiveSnapshot(targetTick);
+
+        const double targetSeconds = std::clamp(
+            document_.tickToSeconds(targetTick), 0.0, double(duration_));
+        const double requestSeconds = needBaseline
+            ? targetSeconds
+            : std::min<double>(duration_, targetSeconds + (isPlaying_ ? 0.25 : 0.0));
+        const double requestTick = document_.secondsToTick(requestSeconds);
         const double npsStartTick = document_.secondsToTick(
-            std::max(0.0, double(currentTime_) - 0.25));
+            std::max(0.0, requestSeconds - 0.25));
         const double ccStartTick = document_.secondsToTick(
-            std::max(0.0, double(currentTime_) - 1.0));
-        wasmidi_mapped_request_key_state(
-            targetTick, npsStartTick, ccStartTick, forceRebuild ? 1 : 0);
+            std::max(0.0, requestSeconds - 1.0));
+        if (!needBaseline || !remoteLiveBaselinePending_) {
+            wasmidi_mapped_request_key_state(
+                requestTick, npsStartTick, ccStartTick, needBaseline ? 1 : 0);
+            if (needBaseline)
+                remoteLiveBaselinePending_ = true;
+        }
 #else
         (void)targetTick;
         (void)forceRebuild;
@@ -3333,12 +3416,30 @@ void MainWindow::updateCurrentTime()
 
     playbackLastElapsedMs_ = elapsedMs;
 
-    currentTime_ =
+    float nextTime =
         std::clamp(
             playbackAnchorSeconds_ +
                 static_cast<float>(elapsedMs) / 1000.0f,
             0.0f,
             duration_);
+
+#ifdef __EMSCRIPTEN__
+    // Once SnappySynth owns the audible transport, use the AudioWorklet's
+    // delivered-PCM clock as the single presentation clock for music, roll,
+    // piano and live graphs.  QElapsedTimer keeps the UI moving only when no
+    // synth is loaded.  This removes the intermittent drift after device
+    // underruns/queue stalls where wall time advanced while the audible device
+    // clock did not.
+    if (soundfontLoaded_ && synthReady_) {
+        const double audioClock = wasmidi_snappy_audio_clock();
+        if (std::isfinite(audioClock) && audioClock >= 0.0) {
+            nextTime = static_cast<float>(std::clamp<double>(
+                audioClock, 0.0, double(duration_)));
+        }
+    }
+#endif
+
+    currentTime_ = nextTime;
 
     if (currentTime_ >= duration_) {
         stop();

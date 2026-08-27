@@ -197,7 +197,7 @@ void wasmidi_visual_page_ready(
 
 EM_JS(void, wasmidi_sharp_render_request,
       (uint32_t generation, uint32_t startTick, uint32_t endTick,
-       int perTrack, int reset), {
+       uint32_t urgentThrough, int perTrack, int reset), {
     const mapped = globalThis.__wasmidiMappedMidi;
     if (!mapped || !mapped.worker || !mapped.mappedStore)
         return;
@@ -206,6 +206,7 @@ EM_JS(void, wasmidi_sharp_render_request,
         generation: generation >>> 0,
         startTick: startTick >>> 0,
         endTick: endTick >>> 0,
+        urgentThrough: urgentThrough >>> 0,
         perTrack: !!perTrack,
         reset: !!reset
     });
@@ -1124,20 +1125,29 @@ void GLRenderer::setDocument(const MidiDocument* document)
 #endif
 }
 
+void GLRenderer::setTransportRevision(uint64_t revision)
+{
+    if (!transportRevisionValid_) {
+        transportRevision_ = revision;
+        transportRevisionValid_ = true;
+        return;
+    }
+    if (transportRevision_ == revision)
+        return;
+
+    transportRevision_ = revision;
+    forceCacheReset_ = true;
+    sharpForceReset_ = true;
+}
+
 void GLRenderer::setCurrentTime(float seconds)
 {
     const float value = std::max(0.0f, seconds);
-    const float delta = value - currentTime_;
-
-    // Reverse seeks and large forward jumps must rebuild both the start-ordered
-    // ring and the historical carry set. Incrementally walking every skipped
-    // note on a seek is both slower and a common source of stale visual state.
-    if (delta < -0.0005f ||
-        std::abs(delta) > std::max(0.25f, noteSpeed_ * 0.50f)) {
-        forceCacheReset_ = true;
-        sharpForceReset_ = true;
-    }
-
+    // Do not infer a seek from clock correction. The AudioWorklet clock may
+    // legitimately jump by a fraction of a second after an underrun/report
+    // correction; treating that as a seek destroys the prefetched ring and is
+    // what caused several blank frames before it rebuilt. MainWindow exposes an
+    // explicit transport revision for actual seek/stop operations.
     currentTime_ = value;
 }
 
@@ -2544,6 +2554,7 @@ void GLRenderer::resetSharpRenderer(bool requestRemote)
     sharpActiveId_.fill(0);
     sharpRemoteRequestedEnd_ = 0;
     sharpRemoteSafeThrough_ = 0;
+    sharpRemoteUrgentThrough_ = 0;
     sharpRemoteStartTick_ = 0;
     sharpRemoteWaitingReset_ = false;
     sharpRemoteBatches_.clear();
@@ -2626,7 +2637,7 @@ void GLRenderer::calculateSharpView(
     const double residentBudget =
         double(std::max<std::size_t>(ringCapacity_, std::size_t(1) << 23)) * 0.55;
     const uint32_t screensAhead = static_cast<uint32_t>(std::clamp<double>(
-        std::floor(residentBudget / estimatedPerScreen), 4.0, 32.0));
+        std::floor(residentBudget / estimatedPerScreen), 12.0, 96.0));
     const uint64_t ahead = uint64_t(windowTicks) * uint64_t(screensAhead);
     sharpLookaheadTicks_ = static_cast<uint32_t>(std::min<uint64_t>(
         ahead, std::numeric_limits<uint32_t>::max()));
@@ -2872,6 +2883,7 @@ void GLRenderer::requestRemoteSharpSweep(
         sharpRemoteRebuilding_ ? sharpRemoteBuildPerTrack_ : sharpModePerTrack_;
     wasmidi_sharp_render_request(
         sharpRemoteGeneration_, startTick, endTick,
+        sharpRemoteUrgentThrough_,
         requestPerTrack ? 1 : 0, reset ? 1 : 0);
 #else
     (void)startTick;
@@ -2926,7 +2938,9 @@ void GLRenderer::receiveSharpRenderDelta(
     sharpRemoteBatches_.push_back(std::move(batch));
 }
 
-void GLRenderer::flushRemoteSharpBatches(uint32_t requiredThrough)
+void GLRenderer::flushRemoteSharpBatches(
+    uint32_t requiredThrough,
+    uint32_t desiredThrough)
 {
     if (sharpRemoteBatches_.empty())
         return;
@@ -2937,8 +2951,20 @@ void GLRenderer::flushRemoteSharpBatches(uint32_t requiredThrough)
     // chunks between two rAF/FBO callbacks; draining the whole backlog here
     // simply converts asynchronous preprocessing into a single visible stall.
     const bool visibleFrameMissing = sharpRemoteSafeThrough_ < requiredThrough;
-    const std::size_t maxBatches = visibleFrameMissing ? 8u : 4u;
-    const std::size_t maxWork = visibleFrameMissing ? 1048576u : 393216u;
+    const bool prefetchLow = sharpRemoteSafeThrough_ < desiredThrough;
+
+    // Do not wait until the playhead actually reaches the prepared edge before
+    // draining Worker->VBO backlog.  That policy looked smooth while the
+    // background queue was growing, then produced several completely blank
+    // frames once the visible viewport caught it. Spend a larger *bounded*
+    // upload budget while the future reserve is low, and an even larger one if
+    // the current frame is already at risk.
+    const std::size_t maxBatches = visibleFrameMissing
+        ? 24u
+        : (prefetchLow ? 12u : 6u);
+    const std::size_t maxWork = visibleFrameMissing
+        ? 2097152u
+        : (prefetchLow ? 1048576u : 524288u);
     std::size_t processCount = 0;
     std::size_t processWork = 0;
     while (processCount < sharpRemoteBatches_.size()) {
@@ -3286,18 +3312,26 @@ bool GLRenderer::renderRoll()
     uint32_t windowTicks = 1;
     calculateSharpView(currentTick, viewStart, viewEnd, windowTicks);
 
-    // Drain completed background work after the exact visible endpoint is
-    // known. If preprocessing ever falls behind, temporarily spend a larger
-    // bounded upload budget to catch the playhead; normally the large
-    // lookahead keeps this on the cheap path.
-    if (document_->remoteIndexed)
-        flushRemoteSharpBatches(viewEnd);
-
     uint32_t sweepEnd = std::min<uint32_t>(
         document_->maxTick,
         viewEnd > std::numeric_limits<uint32_t>::max() - sharpLookaheadTicks_
             ? document_->maxTick
             : viewEnd + sharpLookaheadTicks_);
+
+    // The screen-count lookahead above protects geometry memory. Also require
+    // a real-time reserve: a tempo change can compress many future seconds into
+    // relatively few screens and otherwise leave the Worker only a handful of
+    // milliseconds ahead of the audible device. Build a much deeper reserve
+    // whenever the source is already resident: the renderer's job is to have
+    // future complete frames ready, not to discover a dense transition when it
+    // becomes visible. The adaptive screen bound above still caps ordinary
+    // geometry growth; ensureRingCapacity handles exceptional dense bursts.
+    const double futureSeconds = std::min<double>(
+        document_->durationSeconds, double(currentTime_) + 20.0);
+    const uint32_t futureTick = static_cast<uint32_t>(std::clamp<double>(
+        std::ceil(document_->secondsToTick(futureSeconds)),
+        0.0, double(document_->maxTick)));
+    sweepEnd = std::max(sweepEnd, futureTick);
     // Quantize horizon growth to one viewport. This avoids posting a Worker
     // extension request every display frame while preserving the same amount
     // of prepared future geometry.
@@ -3308,6 +3342,25 @@ bool GLRenderer::renderRoll()
             rounded, document_->maxTick));
     }
 
+    // Keep at least four complete screens beyond the visible edge in the
+    // Worker *and* applied to the VBO. This is the emergency watermark sent to
+    // the parser Worker and the proactive drain target for already-completed
+    // batches. The normal horizon remains much farther ahead.
+    const uint64_t urgent64 = uint64_t(viewEnd) + uint64_t(windowTicks) * 4u;
+    sharpRemoteUrgentThrough_ = static_cast<uint32_t>(std::min<uint64_t>(
+        urgent64, document_->maxTick));
+
+    // Drain completed background work after both the visible and future
+    // endpoints are known. Do this *before* issuing another extension request
+    // so already-generated frames are installed first instead of allowing a
+    // JS->C++ upload backlog to grow invisibly until the playhead catches it.
+    if (document_->remoteIndexed) {
+        const uint64_t desired64 = uint64_t(viewEnd) + uint64_t(windowTicks) * 10u;
+        const uint32_t desiredThrough = static_cast<uint32_t>(std::min<uint64_t>(
+            desired64, sweepEnd));
+        flushRemoteSharpBatches(viewEnd, desiredThrough);
+    }
+
     const bool activeCompatible =
         !sharpForceReset_ &&
         sharpLastSweepEnd_ >= 0 &&
@@ -3315,8 +3368,7 @@ bool GLRenderer::renderRoll()
         sharpModePerTrack_ == perTrackColors_;
     const bool forwardIncremental =
         activeCompatible &&
-        sweepEnd >= static_cast<uint32_t>(sharpLastSweepEnd_) &&
-        sweepEnd - static_cast<uint32_t>(sharpLastSweepEnd_) <= windowTicks;
+        sweepEnd >= static_cast<uint32_t>(sharpLastSweepEnd_);
 
     if (document_->remoteIndexed) {
         const bool buildCompatible =

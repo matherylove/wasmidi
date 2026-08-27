@@ -127,6 +127,11 @@ function makeSysexSeekMidi() {
     const track = Uint8Array.from([
         // GM System On at tick 0.
         0x00, 0xf0, 0x05, 0x7e, 0x7f, 0x09, 0x01, 0xf7,
+        // Multi-bank selector state at tick 0: bank MSB 1, LSB 2, program 5.
+        // Native SnappySynth commits Bank Select only on Program Change.
+        0x00, 0xb0, 0x00, 0x01,
+        0x00, 0xb0, 0x20, 0x02,
+        0x00, 0xc0, 0x05,
         0x00, 0x90, 0x3c, 0x64,
         0x83, 0x60, 0x80, 0x3c, 0x00,
         0x00, 0xff, 0x2f, 0x00
@@ -288,6 +293,9 @@ async function main() {
         "_wmp_event_batch_next_tick_js",
         "_wmp_event_batch_has_next_tick_js",
         "_wmp_build_historical_sysex_js",
+        "_wmp_build_historical_selector_state_js",
+        "_wmp_historical_selector_state_ptr_js",
+        "_wmp_historical_selector_state_count_js",
         "_wmp_sysex_batch_event_ptr_js",
         "_wmp_sysex_batch_event_count_js",
         "_wmp_sysex_batch_data_ptr_js",
@@ -313,7 +321,7 @@ async function main() {
 
     parserPointerBits = Number(Module._wmp_pointer_bits()) | 0;
     if (parserPointerBits !== 64)
-        throw new Error("Generated Pass 13.7.0 parser is not Memory64.");
+        throw new Error("Generated Pass 13.8.0 parser is not Memory64.");
 
     // Valid format-0 MIDI: header + one track containing only EndOfTrack.
     const midi = Uint8Array.from([
@@ -393,6 +401,24 @@ async function main() {
         sizeNumber(Module._wmp_sysex_batch_data_size_js()) !== 6) {
         throw new Error("Mapped seek history lost GM SysEx state.");
     }
+    if (!Module._wmp_build_historical_selector_state_js(1))
+        throw new Error("Mapped seek could not rebuild bank/program selector state.");
+    const selectorCount = sizeNumber(
+        Module._wmp_historical_selector_state_count_js());
+    const selectorPtr = Number(Module._wmp_historical_selector_state_ptr_js());
+    if (!selectorPtr || selectorCount < 3)
+        throw new Error("Mapped seek returned no historical bank/program state.");
+    let sawMsb = false;
+    let sawLsb = false;
+    let sawProgram = false;
+    for (let i = 0; i < selectorCount; ++i) {
+        const packed = Module.HEAPU32[(selectorPtr + i * 8 + 4) >>> 2] >>> 0;
+        if ((packed & 0x00ffffff) === 0x000100b0) sawMsb = true;
+        if ((packed & 0x00ffffff) === 0x000220b0) sawLsb = true;
+        if ((packed & 0x0000ffff) === 0x000005c0) sawProgram = true;
+    }
+    if (!sawMsb || !sawLsb || !sawProgram)
+        throw new Error("Mapped seek did not preserve SF2 bank/program latch state.");
 
     // Regression for the browser failure that motivated Pass 12.8/12.9: the old
     // Worker tried to grow a 64 MiB heap directly to ~500 MiB just to hold the
@@ -512,7 +538,7 @@ async function main() {
     Module._wmp_release_result();
 
     console.log(
-        "MIDI parser Pass 13.7.0 SharpMIDI-ring/streaming-playback smoke test OK");
+        "MIDI parser Pass 13.8.0 SharpMIDI-ring/streaming-playback smoke test OK");
 }
 
 main().catch(error => {

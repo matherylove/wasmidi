@@ -106,6 +106,9 @@ public:
         syncedTimeSeconds_ =
             controller->currentTime();
 
+        renderer_.setTransportRevision(
+            static_cast<uint64_t>(controller->transportRevision()));
+
         if (revision_ !=
             controller->
                 documentRevision()) {
