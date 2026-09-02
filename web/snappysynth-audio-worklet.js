@@ -10,6 +10,11 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         this.lastClockReportFrame = 0;
         this.underruns = 0;
         this.starved = false;
+        this.transportEpoch = 1;
+        this.clockState = null;
+        this.CLOCK_EPOCH = 0;
+        this.CLOCK_FRAMES = 1;
+        this.CLOCK_STARVED = 2;
         // On a fresh play/seek, request realtime PCM immediately but do not
         // count silence or advance the device clock until the producer has
         // delivered the first complete source block. This is startup priming,
@@ -62,13 +67,22 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
                 return;
             }
 
+            if (data.type === "clockState" && data.buffer instanceof SharedArrayBuffer) {
+                this.clockState = new Int32Array(data.buffer);
+                this.transportEpoch = (Number(data.epoch) >>> 0) || 1;
+                this.publishSharedClock();
+                return;
+            }
+
             if (data.type === "play") {
                 if (data.resetClock) {
+                    this.transportEpoch = (Number(data.epoch) >>> 0) || this.transportEpoch || 1;
                     this.flushRing();
                     this.baseSongTime = Number(data.time) || 0.0;
                     this.playedFrames = 0;
                     this.lastClockReportFrame = 0;
                     this.primed = false;
+                    this.publishSharedClock();
                 }
                 this.playing = true;
                 this.requestAudioIfNeeded();
@@ -81,12 +95,15 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
             }
 
             if (data.type === "flush") {
+                if (Number.isFinite(data.epoch))
+                    this.transportEpoch = (Number(data.epoch) >>> 0) || this.transportEpoch || 1;
                 this.flushRing();
                 if (Number.isFinite(data.time)) {
                     this.baseSongTime = Number(data.time);
                     this.playedFrames = 0;
                     this.lastClockReportFrame = 0;
                 }
+                this.publishSharedClock();
                 return;
             }
 
@@ -202,6 +219,16 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         this.primed = false;
     }
 
+    publishSharedClock() {
+        if (!this.clockState)
+            return;
+        const sharedEpoch = Atomics.load(this.clockState, this.CLOCK_EPOCH) >>> 0;
+        if (sharedEpoch !== (this.transportEpoch >>> 0))
+            return;
+        Atomics.store(this.clockState, this.CLOCK_FRAMES, this.playedFrames | 0);
+        Atomics.store(this.clockState, this.CLOCK_STARVED, this.starved ? 1 : 0);
+    }
+
     onWorkerMessage(data) {
         if (data.type === "sharedRing") {
             this.bindSharedRing(data);
@@ -265,6 +292,7 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
 
         this.workerPort.postMessage({
             type: "clock",
+            epoch: this.transportEpoch >>> 0,
             songTime:
                 this.baseSongTime +
                 this.playedFrames / sampleRate,
@@ -446,6 +474,7 @@ class SnappySynthOutputProcessor extends AudioWorkletProcessor {
         const starvationChanged =
             starvedNow !== this.starved;
         this.starved = starvedNow;
+        this.publishSharedClock();
 
         this.reportClockIfNeeded(starvationChanged);
 

@@ -328,6 +328,7 @@ struct TrackIndex {
     uint64_t offset = 0;
     uint32_t length = 0;
     uint64_t channelEvents = 0;
+    uint64_t renderEvents = 0;
     uint64_t synthStateEvents = 0;
     uint32_t maxTick = 0;
     uint16_t firstNoteSeenMask = 0;
@@ -342,6 +343,11 @@ struct TrackIndex {
     // distinction between SharpMIDI and the old on-demand WASMIDI path: dense
     // sections cannot suddenly become parser work at playback time.
     std::vector<MidiMappedStore::EventWord> hotEvents;
+    // Renderer-only resident stream.  It contains only NoteOn/NoteOff events,
+    // preserving per-track ordering while skipping every CC/program/pitch
+    // event before realtime rendering begins.  This is built during the same
+    // mandatory parse pass, not as an additional load-time analysis pass.
+    std::vector<MidiMappedStore::EventWord> hotRenderEvents;
     std::vector<MidiMappedStore::EventWord> hotSynthStateEvents;
     // Source-event ordinal for each sparse selector event.  Tick alone is not
     // sufficient around same-tick GM/GS/XG resets: Program/Bank events before
@@ -725,17 +731,26 @@ struct MidiMappedStore::Impl {
         std::vector<HotTrackCursor> cursors;
         std::priority_queue<HeapNode, std::vector<HeapNode>, HeapGreater> heap;
         bool ok = true;
+        bool renderOnly = false;
 
-        void reset(Impl* o, uint32_t start, uint32_t end)
+        const std::vector<MidiMappedStore::EventWord>& eventsFor(uint32_t track) const
+        {
+            return renderOnly
+                ? owner->tracks[track].hotRenderEvents
+                : owner->tracks[track].hotEvents;
+        }
+
+        void reset(Impl* o, uint32_t start, uint32_t end, bool render = false)
         {
             owner = o;
             endTick = end;
             ok = true;
+            renderOnly = render;
             heap = {};
             cursors.assign(owner->tracks.size(), {});
 
             for (uint32_t t = 0; t < owner->tracks.size(); ++t) {
-                const auto& events = owner->tracks[t].hotEvents;
+                const auto& events = eventsFor(t);
                 auto it = std::lower_bound(
                     events.begin(), events.end(), start,
                     [](const EventWord& event, uint32_t tick) {
@@ -753,7 +768,7 @@ struct MidiMappedStore::Impl {
             if (!owner || heap.empty())
                 return false;
             const HeapNode n = heap.top();
-            const auto& events = owner->tracks[n.track].hotEvents;
+            const auto& events = eventsFor(n.track);
             const std::size_t index = cursors[n.track].index;
             if (index >= events.size())
                 return false;
@@ -771,7 +786,7 @@ struct MidiMappedStore::Impl {
             const HeapNode n = heap.top();
             heap.pop();
             auto& cursor = cursors[n.track];
-            const auto& events = owner->tracks[n.track].hotEvents;
+            const auto& events = eventsFor(n.track);
             if (cursor.index >= events.size()) {
                 ok = false;
                 return false;
@@ -842,6 +857,7 @@ struct MidiMappedStore::Impl {
         TrackIndex& track = tracks[trackIndex];
         track.checkpoints.clear();
         track.channelEvents = 0;
+        track.renderEvents = 0;
         track.synthStateEvents = 0;
         track.maxTick = 0;
         track.firstNoteSeenMask = 0;
@@ -1024,6 +1040,8 @@ struct MidiMappedStore::Impl {
             ++channelEventIndex;
             ++sourceOrder;
             ++track.channelEvents;
+            if (noteOn || noteOff)
+                ++track.renderEvents;
             ++totalEvents;
             metadata.activeChannelMasks[trackIndex] |= (1u << channel);
             if (noteOn) {
@@ -1079,12 +1097,17 @@ struct MidiMappedStore::Impl {
     {
         TrackIndex& track = tracks[trackIndex];
         track.hotEvents.clear();
+        track.hotRenderEvents.clear();
         track.hotSynthStateEvents.clear();
         track.hotSynthStateOrders.clear();
         if (track.channelEvents >
             static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
             return false;
         track.hotEvents.resize(static_cast<std::size_t>(track.channelEvents));
+        if (track.renderEvents >
+            static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
+            return false;
+        track.hotRenderEvents.reserve(static_cast<std::size_t>(track.renderEvents));
         if (track.synthStateEvents >
             static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
             return false;
@@ -1166,6 +1189,10 @@ struct MidiMappedStore::Impl {
                     (uint32_t(color) << 24)
             };
 
+            if (command == 0x90 || command == 0x80) {
+                track.hotRenderEvents.push_back(track.hotEvents[write - 1]);
+            }
+
             if (command == 0xc0 || command == 0xe0 ||
                 (command == 0xb0 && (d1 == 0 || d1 == 32))) {
                 track.hotSynthStateEvents.push_back({
@@ -1180,6 +1207,8 @@ struct MidiMappedStore::Impl {
         }
 
         if (!ok || write != track.hotEvents.size() ||
+            track.hotRenderEvents.size() !=
+                static_cast<std::size_t>(track.renderEvents) ||
             track.hotSynthStateEvents.size() !=
                 static_cast<std::size_t>(track.synthStateEvents) ||
             track.hotSynthStateOrders.size() != track.hotSynthStateEvents.size())
@@ -3095,7 +3124,8 @@ void MidiMappedStore::resetRenderCursor(
     impl_->renderCursor.reset(
         impl_,
         std::min(startTick, metadata_.maxTick),
-        metadata_.maxTick);
+        metadata_.maxTick,
+        true);
     impl_->renderCursorValid = !impl_->renderCursor.failed();
 }
 

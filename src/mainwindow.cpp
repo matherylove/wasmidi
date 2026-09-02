@@ -231,7 +231,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                                     'script');
 
                             script.src =
-                                './snappysynth_bridge.js?v=13.10.0';
+                                './snappysynth_bridge.js?v=13.11.0';
 
                             script.async = false;
                             script.onload = resolve;
@@ -363,7 +363,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
             // This prevents a successful earlier deployment from silently running
             // the old monolithic "allocate file.size" loader.
             const parserWorkerUrl =
-                new URL('./midi-parser-worker.js?v=13.10.0', window.location.href);
+                new URL('./midi-parser-worker.js?v=13.11.0', window.location.href);
             const parserWorkerResponse =
                 await fetch(parserWorkerUrl.href, { cache: 'no-store' });
             if (!parserWorkerResponse.ok) {
@@ -374,10 +374,10 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
 
             const parserWorkerSource = await parserWorkerResponse.text();
             if (!parserWorkerSource.includes(
-                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.10.0"')) {
+                    'WASMIDI_MIDI_PARSER_BOOTSTRAP = "13.11.0"')) {
                 throw new Error(
                     'GitHub Pages returned a stale MIDI parser Worker. ' +
-                    'Expected bootstrap 13.10.0.');
+                    'Expected bootstrap 13.11.0.');
             }
 
             const parserBaseUrl =
@@ -717,12 +717,12 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             '[WASMIDI MIDI parser] worker bootstrap',
                             String(message.bootstrap || '?'),
                             message.pagedSource === true ? 'paged-source' : 'legacy-source');
-                        if (String(message.bootstrap || '') !== '13.10.0' ||
+                        if (String(message.bootstrap || '') !== '13.11.0' ||
                             message.pagedSource !== true ||
                             message.mappedStore !== true) {
                             failLoading(
                                 'Stale or incompatible MIDI parser Worker loaded. ' +
-                                'Expected mapped-source bootstrap 13.10.0.');
+                                'Expected mapped-source bootstrap 13.11.0.');
                             if (worker) worker.terminate();
                             worker = null;
                             cleanup();
@@ -884,7 +884,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                             visualWorker: null,
                             visualReady: false,
                             visualPrime: null,
-                            bootstrap: '13.10.0',
+                            bootstrap: '13.11.0',
                             mappedStore: true,
                             keyPending: false,
                             keyOwner: null,
@@ -2282,6 +2282,27 @@ void MainWindow::seek(float seconds)
     scheduler_.seek(clamped);
     invalidateLiveTrackers();
     visualStateValid_ = false;
+
+    if (document_.remoteIndexed) {
+        // A seek starts a new visual transaction. Never leave the keyboard and
+        // graphs displaying a frame from the old transport position while the
+        // exact mapped baseline is being rebuilt. The baseline request below
+        // repopulates all four values atomically from the new tick.
+        clearVisualState();
+        if (activeVoices_ != 0) {
+            activeVoices_ = 0;
+            emit activeVoicesChanged();
+        }
+        if (nps_ != 0) {
+            nps_ = 0;
+            emit npsChanged();
+        }
+        if (ccPerSecond_ != 0) {
+            ccPerSecond_ = 0;
+            emit ccPerSecondChanged();
+        }
+        emit activePitchesChanged();
+    }
 
 #ifdef __EMSCRIPTEN__
     if (soundfontLoaded_) {

@@ -2,7 +2,7 @@
 
 "use strict";
 
-importScripts("./snappysynth-core.js?v=13.10.0");
+importScripts("./snappysynth-core.js?v=13.11.0");
 
 let Module = null;
 let coreReady = false;
@@ -728,6 +728,8 @@ function onAudioPortMessage(data) {
 
     if (data.type === "clock") {
         postState("clock", {
+            epoch:
+                Number(data.epoch) >>> 0,
             songTime:
                 Number(data.songTime) || 0.0,
             underruns:

@@ -20,6 +20,8 @@
         starved: false,
         audioClock: 0.0,
         audioClockPerf: 0.0,
+        audioClockBase: 0.0,
+        transportEpoch: 1,
 
         // SnappySynth.cfg / source-exposed settings.
         maxVoices: 16384,
@@ -60,6 +62,42 @@
     let workerReadyReject = null;
     let input = null;
 
+    // The AudioWorklet writes the *actually delivered* PCM frame count here
+    // once per render quantum.  Reading this shared counter on the UI thread
+    // avoids ~46 ms clock-report quantization, interpolation drift, and—most
+    // importantly—stale pre-seek clock messages arriving after a transport
+    // reset.  Slot 0 is the transport epoch, slot 1 the delivered frame count,
+    // and slot 2 the current starvation flag.
+    const CLOCK_EPOCH = 0;
+    const CLOCK_FRAMES = 1;
+    const CLOCK_STARVED = 2;
+    const CLOCK_WORDS = 4;
+    let sharedClockBuffer = null;
+    let sharedClock = null;
+
+    function nextTransportEpoch() {
+        state.transportEpoch = ((Number(state.transportEpoch) >>> 0) + 1) >>> 0;
+        if (state.transportEpoch === 0)
+            state.transportEpoch = 1;
+        return state.transportEpoch >>> 0;
+    }
+
+    function resetSharedClock(baseTime, advanceEpoch = true) {
+        const epoch = advanceEpoch
+            ? nextTransportEpoch()
+            : (Number(state.transportEpoch) >>> 0) || 1;
+        state.audioClockBase = Math.max(0.0, Number(baseTime) || 0.0);
+        state.audioClock = state.audioClockBase;
+        state.audioClockPerf = performance.now();
+        state.starved = false;
+        if (sharedClock) {
+            Atomics.store(sharedClock, CLOCK_EPOCH, epoch | 0);
+            Atomics.store(sharedClock, CLOCK_FRAMES, 0);
+            Atomics.store(sharedClock, CLOCK_STARVED, 0);
+        }
+        return epoch;
+    }
+
     function updateStatus(text) {
         state.status = String(text || "");
     }
@@ -67,6 +105,18 @@
     function getAudioClock() {
         if (!state.soundfontLoaded)
             return -1.0;
+
+        if (sharedClock && state.sampleRate > 0) {
+            const epoch = Atomics.load(sharedClock, CLOCK_EPOCH) >>> 0;
+            if (epoch === (Number(state.transportEpoch) >>> 0)) {
+                const frames = Atomics.load(sharedClock, CLOCK_FRAMES) >>> 0;
+                state.starved = Atomics.load(sharedClock, CLOCK_STARVED) !== 0;
+                const value = state.audioClockBase + frames / state.sampleRate;
+                state.audioClock = value;
+                state.audioClockPerf = performance.now();
+                return value;
+            }
+        }
 
         let value = state.audioClock;
 
@@ -120,7 +170,7 @@
                     context.sampleRate);
 
             await context.audioWorklet.addModule(
-                "./snappysynth-audio-worklet.js?v=13.10.0");
+                "./snappysynth-audio-worklet.js?v=13.11.0");
 
             node =
                 new AudioWorkletNode(
@@ -135,9 +185,24 @@
             node.connect(
                 context.destination);
 
+            if (typeof SharedArrayBuffer === "function") {
+                sharedClockBuffer = new SharedArrayBuffer(
+                    Int32Array.BYTES_PER_ELEMENT * CLOCK_WORDS);
+                sharedClock = new Int32Array(sharedClockBuffer);
+                Atomics.store(sharedClock, CLOCK_EPOCH,
+                    (Number(state.transportEpoch) >>> 0) | 0);
+                Atomics.store(sharedClock, CLOCK_FRAMES, 0);
+                Atomics.store(sharedClock, CLOCK_STARVED, 0);
+                node.port.postMessage({
+                    type: "clockState",
+                    buffer: sharedClockBuffer,
+                    epoch: Number(state.transportEpoch) >>> 0
+                });
+            }
+
             worker =
                 new Worker(
-                    "./snappysynth-worker.js?v=13.10.0");
+                    "./snappysynth-worker.js?v=13.11.0");
 
             workerReadyPromise =
                 new Promise(
@@ -242,6 +307,16 @@
                     break;
 
                 case "clock":
+                    if (Number.isFinite(data.epoch) &&
+                        (Number(data.epoch) >>> 0) !==
+                            (Number(state.transportEpoch) >>> 0)) {
+                        // Different MessageChannels are used for transport
+                        // control and periodic clock reports. A report queued
+                        // before a seek can therefore arrive after the seek.
+                        // Never let that obsolete clock move the UI transport
+                        // back to the previous position.
+                        break;
+                    }
                     state.audioClock =
                         Math.max(
                             0.0,
@@ -518,10 +593,9 @@
         state.playing = true;
         state.starved = false;
 
+        let epoch = Number(state.transportEpoch) >>> 0;
         if (reset) {
-            state.audioClock = value;
-            state.audioClockPerf =
-                performance.now();
+            epoch = resetSharedClock(value, true);
         }
 
         // A loaded SoundFont means the backend already exists. Post the reset
@@ -531,7 +605,8 @@
             worker.postMessage({
                 type: "play",
                 time: value,
-                reset: !!reset
+                reset: !!reset,
+                epoch
             });
         }
 
@@ -539,7 +614,8 @@
             node.port.postMessage({
                 type: "play",
                 time: value,
-                resetClock: !!reset
+                resetClock: !!reset,
+                epoch
             });
         }
 
@@ -579,35 +655,32 @@
                 Number(time) ||
                 0.0);
 
-        state.audioClock = value;
-        state.audioClockPerf =
-            performance.now();
-        state.starved = false;
+        const epoch = resetSharedClock(value, true);
 
         if (worker)
             worker.postMessage({
                 type: "seek",
-                time: value
+                time: value,
+                epoch
             });
 
         if (node) {
             node.port.postMessage({
                 type: "flush",
-                time: value
+                time: value,
+                epoch
             });
         }
     }
 
     function stop() {
         state.playing = false;
-        state.starved = false;
-        state.audioClock = 0.0;
-        state.audioClockPerf =
-            performance.now();
+        const epoch = resetSharedClock(0.0, true);
 
         if (worker)
             worker.postMessage({
-                type: "stop"
+                type: "stop",
+                epoch
             });
 
         if (node) {
@@ -617,7 +690,8 @@
 
             node.port.postMessage({
                 type: "flush",
-                time: 0.0
+                time: 0.0,
+                epoch
             });
         }
     }
@@ -707,6 +781,7 @@
     }
 
     function clearSoundfonts() {
+        const epoch = resetSharedClock(0.0, true);
         state.soundfontLoaded = false;
         state.soundfontName = "";
         state.layers = 0;
@@ -715,7 +790,7 @@
         if (worker) worker.postMessage({ type: "clearSoundfonts" });
         if (node) {
             node.port.postMessage({ type: "pause" });
-            node.port.postMessage({ type: "flush", time: 0.0 });
+            node.port.postMessage({ type: "flush", time: 0.0, epoch });
         }
     }
 
@@ -880,14 +955,16 @@
                 options.softClip;
 
         if (node) {
+            const flushTime = Math.max(0.0, Number(getAudioClock()) || state.audioClock || 0.0);
+            const epoch = resetSharedClock(flushTime, true);
             node.port.postMessage({
                 type: "pause"
             });
 
             node.port.postMessage({
                 type: "flush",
-                time:
-                    state.audioClock
+                time: flushTime,
+                epoch
             });
 
             node.port.postMessage({

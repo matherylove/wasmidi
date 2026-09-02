@@ -931,6 +931,17 @@ bool GLRenderer::initialize()
         GL_ARRAY_BUFFER,
         neuralLineVbo_);
 
+    // Allocate the maximum neural overlay storage once. Re-specifying these
+    // buffers with glBufferData() every frame can force WebGL buffer orphaning
+    // and browser/GPU synchronization even when the MIDI itself is sparse.
+    // The visible result is identical; only the upload path changes.
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(
+            95u * 94u * sizeof(NeuralLineVertex)),
+        nullptr,
+        GL_STREAM_DRAW);
+
     glEnableVertexAttribArray(0);
 
     glVertexAttribPointer(
@@ -967,6 +978,13 @@ bool GLRenderer::initialize()
     glBindBuffer(
         GL_ARRAY_BUFFER,
         neuralPointVbo_);
+
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(
+            95u * sizeof(NeuralPointVertex)),
+        nullptr,
+        GL_STREAM_DRAW);
 
     glEnableVertexAttribArray(0);
 
@@ -1494,14 +1512,14 @@ void GLRenderer::renderBackground()
             GL_ARRAY_BUFFER,
             neuralLineVbo_);
 
-        glBufferData(
+        glBufferSubData(
             GL_ARRAY_BUFFER,
+            0,
             static_cast<GLsizeiptr>(
                 neuralLines_.size() *
                 sizeof(
                     NeuralLineVertex)),
-            neuralLines_.data(),
-            GL_STREAM_DRAW);
+            neuralLines_.data());
 
         glUniform1i(
             neuralPointModeUniform_,
@@ -1522,14 +1540,14 @@ void GLRenderer::renderBackground()
             GL_ARRAY_BUFFER,
             neuralPointVbo_);
 
-        glBufferData(
+        glBufferSubData(
             GL_ARRAY_BUFFER,
+            0,
             static_cast<GLsizeiptr>(
                 neuralPoints_.size() *
                 sizeof(
                     NeuralPointVertex)),
-            neuralPoints_.data(),
-            GL_STREAM_DRAW);
+            neuralPoints_.data());
 
         glUniform1i(
             neuralPointModeUniform_,
