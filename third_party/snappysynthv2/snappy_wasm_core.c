@@ -665,6 +665,58 @@ int ssw_render_into(uintptr_t out_ptr,
         frames);
 }
 
+/*
+ * A native KDMAPI stream does not pay a browser pthread/futex round trip for
+ * every controller byte.  In the browser, however, splitting a 512-frame
+ * source block at every dense CC/pitch sample used to turn one render into
+ * hundreds of tiny voice_render_float() calls.  Besides rebuilding the render
+ * queue each time, every call wakes and joins the complete voice worker set.
+ *
+ * Quantize only continuous automation to a small (about 1.45 ms at 44.1 kHz)
+ * scheduling cell.  Discrete state transitions stay sample-exact: bank/RPN,
+ * sustain, resets, all-notes/sound-off, mono/poly and program changes.  Notes
+ * retain their original sample timestamps.  This bounds continuous-controller
+ * render barriers to at most eight per normal 512-frame block while keeping
+ * the native engine's event ordering and controller coalescing intact.
+ */
+#define SSW_CONTINUOUS_STATE_QUANTUM 64
+
+static int ssw_is_continuous_cc(uint32_t cc) {
+    switch (cc & 0x7fu) {
+        case 1:  /* modulation */
+        case 2:  /* breath */
+        case 4:  /* foot */
+        case 5:  /* portamento time */
+        case 7:  /* volume */
+        case 10: /* pan */
+        case 11: /* expression */
+        case 71: /* resonance */
+        case 72: /* release */
+        case 73: /* attack */
+        case 74: /* cutoff */
+        case 91: /* reverb send */
+        case 93: /* chorus send */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int ssw_state_render_frame(uint32_t message, int frame) {
+    const uint32_t status = message & 0xffu;
+    const uint32_t command = status & 0xf0u;
+    int continuous = command == 0xe0u;
+
+    if (command == 0xb0u)
+        continuous = ssw_is_continuous_cc((message >> 8) & 0x7fu);
+
+    if (continuous && frame > 0) {
+        return (frame / SSW_CONTINUOUS_STATE_QUANTUM) *
+               SSW_CONTINUOUS_STATE_QUANTUM;
+    }
+    return frame;
+}
+
 int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
     if (!g_ready || !out_ptr || frames <= 0) return 0;
 
@@ -702,13 +754,21 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
             const uint32_t command = status & 0xf0u;
             const int is_state_event =
                 command == 0xb0u || command == 0xc0u || command == 0xe0u;
-            if (is_state_event && frame > segment_start) {
-                const int segment_frames = (int)frame - segment_start;
+            int state_render_frame = (int)frame;
+            if (is_state_event)
+                state_render_frame = ssw_state_render_frame(
+                    event->message, (int)frame);
+            if (state_render_frame < segment_start)
+                state_render_frame = segment_start;
+
+            if (is_state_event && state_render_frame > segment_start) {
+                const int segment_frames =
+                    state_render_frame - segment_start;
                 voice_render_float(
                     ((float*)out_ptr) + (size_t)segment_start * (size_t)channels,
                     segment_frames);
                 g_render_cursor += segment_frames;
-                segment_start = (int)frame;
+                segment_start = state_render_frame;
                 voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
             }
 

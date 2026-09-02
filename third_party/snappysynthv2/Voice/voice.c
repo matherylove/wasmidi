@@ -5767,6 +5767,22 @@ if (requested > 0) desired = requested;
 else {
 desired = 1;
 }
+#elif defined(__EMSCRIPTEN__)
+else if (max_voices <= STEAL_SHARED_POOL_VOICES) {
+desired = 1;
+}
+else {
+/*
+ * Native Win32 event objects scale well to every logical CPU. Browser pthread
+ * events are futex/Worker messages, so waking 16+ workers for a few thousand
+ * voices costs more than those workers save. Scale gradually with the voice
+ * cap and stop at eight by default. Explicit SS_WORKERS remains authoritative.
+ */
+int wasm_voice_workers = (max_voices + 1023) / 1024;
+if (wasm_voice_workers < 2) wasm_voice_workers = 2;
+if (wasm_voice_workers > 8) wasm_voice_workers = 8;
+if (desired > wasm_voice_workers) desired = wasm_voice_workers;
+}
 #else
 else if (max_voices <= STEAL_SHARED_POOL_VOICES) {
 desired = 1;
@@ -6261,9 +6277,14 @@ if (g_render_producers_ready) ResetEvent(g_render_producers_ready);
                                                                                                                                                                                                                                                                 SetEvent(g_start_events[w]);
                                                                                                                                                                                                                                                                 }
 
-                                                                                                                                                                                                                                                                // Use a timeout instead of INFINITE — if any worker gets stuck (corrupt key
-                                                                                                                                                                                                                                                                // queue cycle, exception, etc.) we must not hang the audio thread forever.
-                                                                                                                                                                                                                                                                // 500ms is an eternity in audio time; if we hit it something is seriously wrong.
+                                                                                                                                                                                                                                                               // Use a timeout instead of INFINITE — if any worker gets stuck (corrupt key
+                                                                                                                                                                                                                                                               // queue cycle, exception, etc.) we must not hang the audio thread forever.
+                                                                                                                                                                                                                                                               // 500ms is an eternity in audio time; if we hit it something is seriously wrong.
+// The WASM CPU path does not consume the producer queue on this thread. Its
+// final generation wait already covers producer and render completion, so a
+// second main-thread futex wait here only doubles the fixed cost of tiny CC
+// segments. GPU mixing still needs the producer barrier before dispatch.
+#if !defined(__EMSCRIPTEN__) || defined(GPUMIX)
     if (WaitForSingleObject(g_render_producers_ready, 500) == WAIT_TIMEOUT) {
                                                                                                                                                                                                                                                                 // Emergency: signal the event ourselves so workers unblock, zero the output,
                                                                                                                                                                                                                                                                 // and return. The next render call will try again normally.
@@ -6284,8 +6305,9 @@ if (g_render_producers_ready) ResetEvent(g_render_producers_ready);
 #endif
         return;
     }
+#endif
 
-                                                                                                                                                                                                                                                                #ifdef GPUMIX
+                                                                                                                                                                                                                                                               #ifdef GPUMIX
                                                                                                                                                                                                                                                                 const GpuVoiceUpdate *gpu_updates = NULL;
                                                                                                                                                                                                                                                                 int gpu_processed = 0;
     if (load_relaxed_long(&g_gpu_cycle_active)) {

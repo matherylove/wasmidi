@@ -170,7 +170,7 @@
                     context.sampleRate);
 
             await context.audioWorklet.addModule(
-                "./snappysynth-audio-worklet.js?v=13.11.0");
+                "./snappysynth-audio-worklet.js?v=13.12.0");
 
             node =
                 new AudioWorkletNode(
@@ -202,7 +202,7 @@
 
             worker =
                 new Worker(
-                    "./snappysynth-worker.js?v=13.11.0");
+                    "./snappysynth-worker.js?v=13.12.0");
 
             workerReadyPromise =
                 new Promise(

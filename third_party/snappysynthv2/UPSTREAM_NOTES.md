@@ -18,8 +18,11 @@ The following upstream components are intentionally not integrated:
 
 Browser-specific compatibility changes are limited to:
 - portable include paths
-- a fixed two-thread Emscripten pthread pool
-- no x86-only intrinsics on wasm32
+- an Emscripten pthread pool with a bounded, voice-count-aware default worker set
+- WASM SIMD128 equivalents for the eligible native AVX2 sustain paths
+- a generation-safe aggregate pthread completion barrier
+- bounded 64-frame scheduling cells for continuous CC/pitch automation, while
+  discrete controllers and program changes remain sample-exact
 - a scalar VOR helper needed when AVX2 is unavailable
 - minimal Windows compatibility types/stubs
 - `snappy_wasm_core.c`, which exposes only init/SF2/render/reset/settings.

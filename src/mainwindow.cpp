@@ -231,7 +231,7 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                                     'script');
 
                             script.src =
-                                './snappysynth_bridge.js?v=13.11.0';
+                                './snappysynth_bridge.js?v=13.12.0';
 
                             script.async = false;
                             script.onload = resolve;

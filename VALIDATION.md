@@ -243,3 +243,26 @@ GitHub Actions because this container does not provide the project Qt WASM SDK.
 ## Pass 13.2.2 Memory64 growth regression
 
 CMake configure now applies an idempotent patch to Emscripten 3.1.56 `src/library.js` before linking and fails the configure if the expected buggy/fixed runtime pattern cannot be recognized. GitHub Actions runs the patcher again with `--check` before the generated-module smoke test. The smoke test still verifies a real heap expansion beyond the 64 MiB initial Memory64 heap while constructing a dense visual page, and the resulting heap must remain 64 KiB page aligned. Together these checks cover both the original fractional-page-to-BigInt failure and the 13.2.1 `--post-js` factory-scope failure.
+
+## Pass 13.12 — SnappySynth browser hot-path regression
+
+- Compared the embedded `Voice/voice.c` against the supplied native
+  `snappysynthv2-main-LATESTGM-FIX` source while ignoring formatting. The
+  browser tree retains the native allocation, stealing, event and mixing logic;
+  its material differences are WASM SIMD and synchronization adaptations.
+- Continuous CC and pitch automation now share 64-frame scheduling cells. A
+  normal 512-frame source block therefore performs at most eight automation
+  render barriers instead of one barrier per distinct controller sample.
+- Bank select, RPN/NRPN/data entry, sustain and channel-mode switches, reset/all
+  notes/all sound controllers, and program changes retain exact event-sample
+  splits. Note-on and note-off timestamps are not quantized.
+- Automatic browser worker selection remains one worker through 2048 configured
+  voices, then scales by roughly one worker per 1024 voices with a default cap
+  of eight. An explicit `SS_WORKERS`/UI worker count still overrides this policy.
+- Native `gcc -fsyntax-only` checks passed for `snappy_wasm_core.c` and
+  `Voice/voice.c`, including the `__EMSCRIPTEN__` branches with declaration-only
+  test headers. A focused C assertion test verified continuous-controller cell
+  boundaries plus exact sustain/program boundaries; `node --check` passed for
+  the SnappySynth Worker, bridge and AudioWorklet. The authoritative
+  pthread/SIMD WebAssembly build and audible 512/2048/8192-voice tests still run
+  in GitHub Actions and the target browser.

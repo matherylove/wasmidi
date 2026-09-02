@@ -2,7 +2,7 @@
 
 "use strict";
 
-importScripts("./snappysynth-core.js?v=13.11.0");
+importScripts("./snappysynth-core.js?v=13.12.0");
 
 let Module = null;
 let coreReady = false;
