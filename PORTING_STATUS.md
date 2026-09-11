@@ -364,3 +364,67 @@ before the futex park in `ss_wait_event()`. Build with
 `-DSS_EVENT_SPIN_ITERATIONS=0` to restore the previous park-immediately
 behaviour; this is the intended rollback switch if spinning ever costs more than
 it saves on a given machine.
+
+## Worker count and the voice pool
+
+`WORKER_FREELIST_REFILL` is 512: `refill_worker_freelist()` moves 512 voices at a
+time from the global pool into a worker's local free stack, and a worker may only
+steal voices it owns. Requesting more workers than the pool can seed leaves the
+surplus workers with no voices at all. They can neither allocate nor steal, so
+every note `g_note_worker_map` routes to them is lost. At a 1024-voice cap with
+24 requested workers, two workers take the whole pool and the other 22 are dead.
+
+The audible result is melodic notes vanishing on completely sparse material,
+with the stats panel showing the pool pinned at capacity (e.g. ACTIVE 1020 /
+FREE 4) and a huge steal count. It looks like a stealer bug and is not one.
+
+The automatic policy already avoided this through `STEAL_SHARED_POOL_VOICES`
+(1 worker at 2048 voices or fewer, matching native), but an explicit `SS_WORKERS`
+request bypasses that branch and the browser UI exposes exactly that control.
+`voice.c` now clamps the browser worker count to `max_voices /
+WORKER_FREELIST_REFILL`. Native builds are untouched. The browser automatic
+ceiling also went from 8 to 16, which changes nothing at 8192 voices or below.
+
+Resulting worker counts on a 24-thread CPU:
+
+| Voices | Workers = 0 (auto) | Workers = 24 (manual) |
+|--------|--------------------|-----------------------|
+| 1024   | 1                  | 2                     |
+| 2048   | 1                  | 4                     |
+| 4096   | 4                  | 8                     |
+| 8192   | 8                  | 16                    |
+| 16384  | 16                 | 24                    |
+
+A very low voice cap is not a way to reduce CPU load here. Render cost scales
+with ACTIVE voices, not with the cap, so the cap only decides how much memory is
+reserved and when stealing starts. Lowering it saturates the pool, forces
+constant stealing, and costs melodic notes. Raise it and let the load governor in
+`ssw_render_queued_into()` handle the render cost instead.
+
+### Voices per worker
+
+Because of the above, the browser UI sizes the pool from the thread count rather
+than splitting a fixed pool among threads:
+
+- `Workers = 0`: unchanged. The engine owns the policy and the Voices field is
+  the total pool.
+- `Workers = N`: N is the thread count, and the Voices field means voices PER
+  WORKER. The pool becomes `N * voicesPerWorker`.
+
+This makes the broken configuration unexpressible rather than merely guarded
+against. Use 512 or more per worker, since that is `WORKER_FREELIST_REFILL` and
+a worker that never receives one batch can neither allocate nor steal.
+
+The derivation lives in `resolveVoicePool()` in `web/snappysynth-worker.js`. It
+is reported to the bridge as `totalVoices`, never as `maxVoices`: the bridge
+feeds `configured.maxVoices` straight back into the stored setting, so
+publishing the product there would multiply it again on every reconfigure. The
+QML `POOL` readout derives the same value from existing properties, so no new
+C++ property was needed, and `ACTIVE + FREE` cross-checks it against the engine.
+
+Policy check, no toolchain required:
+
+    node tools/voice_pool_policy_check.mjs
+
+It pairs the JS sizing rule against the C worker-count policy and asserts that
+every worker can be seeded and that an explicit thread count is honoured.

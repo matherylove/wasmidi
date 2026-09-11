@@ -360,9 +360,58 @@ function applyCoreSettings() {
     Module._ssw_set_vor_mode(vorMode);
 }
 
+// WORKER_FREELIST_REFILL in voice.c: a worker takes this many voices at a time
+// from the global pool, and it can only steal voices it owns. A worker that
+// never gets one batch is dead weight, so this is the smallest per-worker value
+// that actually does anything.
+const VOICES_PER_WORKER_MIN = 512;
+// Matches the Voices field's own maxValue, so the UI and the worker agree on
+// the derived pool size and this clamp effectively never binds.
+const VOICE_POOL_CEILING = 5000000;
+
+/*
+ * Voice pool sizing.
+ *
+ * With Workers = 0 the engine owns the policy and `maxVoices` is the total pool,
+ * exactly as before.
+ *
+ * With an explicit Workers count, `maxVoices` means voices PER WORKER and the
+ * pool is sized from it. Sizing the pool this way removes a configuration that
+ * could not work: the voice pool is shared and handed out in 512-voice batches,
+ * so asking for more workers than the pool can seed leaves the surplus workers
+ * with nothing to allocate or steal, and the notes routed to them are lost. It
+ * also matches how the cost actually behaves -- render time scales with ACTIVE
+ * voices, not with the cap, so a pool sized for the thread count costs nothing
+ * until the music genuinely uses it.
+ */
+function resolveVoicePool() {
+    if (requestedWorkers <= 0) {
+        return {
+            total: maxVoices,
+            perWorker: 0,
+            workers: 0
+        };
+    }
+
+    const perWorker = Math.max(1, maxVoices);
+    const total = Math.min(
+        VOICE_POOL_CEILING,
+        perWorker * requestedWorkers);
+
+    return {
+        total,
+        perWorker,
+        workers: requestedWorkers
+    };
+}
+
+let voicePool = { total: 16384, perWorker: 0, workers: 0 };
+
 function initCore() {
     if (!Module)
         return;
+
+    voicePool = resolveVoicePool();
 
     Module._ssw_init_ex(
         sampleRateHz,
@@ -371,7 +420,7 @@ function initCore() {
         blockFrames,
         numBuffers,
         realtimePriority,
-        maxVoices,
+        voicePool.total,
         minVoices,
         requestedWorkers,
         noteSharding,
@@ -402,6 +451,12 @@ function reinitializeCore() {
 
     postState("configured", {
         maxVoices,
+        // Derived pool size. Reported under its own key: the bridge feeds
+        // `maxVoices` straight back into the stored setting, so publishing the
+        // product there would multiply it again on every reconfigure.
+        totalVoices: voicePool.total,
+        voicesPerWorker: voicePool.perWorker,
+        voicesPerWorkerMin: VOICES_PER_WORKER_MIN,
         minVoices,
         blockFrames,
         numBuffers,
@@ -1168,6 +1223,9 @@ SnappySynthCore({
     postState("ready", {
         ready: true,
         maxVoices,
+        totalVoices: voicePool.total,
+        voicesPerWorker: voicePool.perWorker,
+        voicesPerWorkerMin: VOICES_PER_WORKER_MIN,
         minVoices,
         blockFrames,
         numBuffers,

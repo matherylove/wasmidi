@@ -5780,7 +5780,7 @@ else {
  */
 int wasm_voice_workers = (max_voices + 1023) / 1024;
 if (wasm_voice_workers < 2) wasm_voice_workers = 2;
-if (wasm_voice_workers > 8) wasm_voice_workers = 8;
+if (wasm_voice_workers > 16) wasm_voice_workers = 16;
 if (desired > wasm_voice_workers) desired = wasm_voice_workers;
 }
 #else
@@ -5789,6 +5789,30 @@ desired = 1;
 }
 #endif
 }
+#ifdef __EMSCRIPTEN__
+/*
+ * Browser-only seeding guard.
+ *
+ * refill_worker_freelist() moves WORKER_FREELIST_REFILL (512) voices at a time
+ * from the global pool into a worker's local free stack, and a worker may only
+ * steal voices it owns. Asking for more workers than the pool can seed leaves
+ * the surplus workers with zero voices: they can neither allocate nor steal, so
+ * every note that g_note_worker_map routes to them is dropped or forces a steal
+ * elsewhere. At a 1024-voice cap with 24 requested workers, two workers take the
+ * whole pool and the other 22 are dead, which sounds like the stealer eating the
+ * melody on completely sparse material.
+ *
+ * The automatic policy avoids this through STEAL_SHARED_POOL_VOICES, but an
+ * explicit SS_WORKERS request bypasses that branch and the browser UI exposes
+ * exactly that control. Clamp so every worker can be seeded at least once.
+ * Native builds are untouched.
+ */
+{
+    int seedable = max_voices / WORKER_FREELIST_REFILL;
+    if (seedable < 1) seedable = 1;
+    if (desired > seedable) desired = seedable;
+}
+#endif
 if (desired < 1) desired = 1; if (desired > cores) desired = cores;
 setup_workers(desired);
 

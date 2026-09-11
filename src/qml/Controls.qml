@@ -712,7 +712,13 @@ Item {
                     Layout.fillWidth: true
                     spacing: 4
 
-                    Text { text: "Voices"; color: "#6c627d"; font.pixelSize: 8 }
+                    Text {
+                        // With an explicit worker count the field means voices
+                        // PER WORKER and the pool is sized from it.
+                        text: root.mainWindow.synthWorkers > 0 ? "Voices/wkr" : "Voices"
+                        color: "#6c627d"
+                        font.pixelSize: 8
+                    }
                     ConfigField {
                         id: maxVoicesField
                         Layout.preferredWidth: 72
@@ -726,6 +732,10 @@ Item {
                                 root.mainWindow.synthMaxVoices = n
                             text = String(root.mainWindow.synthMaxVoices)
                         }
+                        ToolTip.visible: hovered
+                        ToolTip.text: root.mainWindow.synthWorkers > 0
+                            ? "Voices per worker. The pool is this value times the worker count. Use 512 or more: the engine hands voices to workers in 512-voice batches, and a worker that never receives one can neither allocate nor steal."
+                            : "Total voice pool. Render cost scales with ACTIVE voices, not with this cap, so raising it costs nothing until the music uses it. Lowering it to save CPU backfires: the pool saturates and melodic notes get stolen."
                     }
 
                     Text { text: "Block"; color: "#6c627d"; font.pixelSize: 8 }
@@ -890,6 +900,19 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Derived the same way the synth worker derives it, so
+                        // the two always agree. ACTIVE + FREE cross-checks it.
+                        text: "POOL " + root.formatInteger(
+                                  root.mainWindow.synthWorkers > 0
+                                      ? Math.min(5000000,
+                                            root.mainWindow.synthMaxVoices *
+                                            Math.max(1, root.mainWindow.synthWorkerCount))
+                                      : root.mainWindow.synthMaxVoices)
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         text: "REGIONS " + root.formatInteger(root.mainWindow.synthRegions)
                         color: "#70667e"
                         font.pixelSize: 7
@@ -995,7 +1018,7 @@ Item {
                                 text = String(root.mainWindow.synthWorkers)
                             }
                             ToolTip.visible: hovered
-                            ToolTip.text: "0 = original auto policy / all eligible logical cores."
+                            ToolTip.text: "0 = original auto policy: the engine sizes the worker count from the total voice cap, forcing 1 worker at 2048 voices or fewer so the pool stays shared. Any other value sets the thread count directly, and the Voices field then means voices PER WORKER, so the pool grows with the threads instead of being split among them."
                         }
 
                         Item { Layout.fillWidth: true }
