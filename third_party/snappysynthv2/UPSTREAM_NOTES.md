@@ -29,9 +29,11 @@ Browser-specific compatibility changes are limited to:
   build may therefore render controller automation on a finer grid than the
   block when there is CPU headroom, but collapses to exactly one
   `voice_render_float()` per block under load, which is the native behaviour.
-  Selector-only events (bank select, RPN/NRPN select, program change) never open
-  a boundary, because the channel event queue is drained in submission order and
-  a later note-on already observes the correct state
+  Selector events (bank select, RPN/NRPN select, data entry, program change)
+  always open an exact boundary when a note has been admitted on that channel
+  since the last boundary, because voice.c routes note events by key hash and
+  channel events by channel, so with more than one worker they are in different
+  queues and only a render boundary orders them
 - a scalar VOR helper needed when AVX2 is unavailable
 - minimal Windows compatibility types/stubs
 - `snappy_wasm_core.c`, which exposes only init/SF2/render/reset/settings.
@@ -49,3 +51,16 @@ Known-bad approaches for this subset, do not reintroduce:
 - Any boundary policy that is not hard-capped. The cap must hold regardless of
   event density, and it must be driven by measured load rather than by event
   count.
+- Removing the render boundary for bank select / RPN select / program change on
+  the grounds that "the event queue is drained in submission order". It is not,
+  across event classes: `enqueue_event()` picks the worker with
+  `g_note_worker_map[ch][key]` for notes and `g_channel_worker_map[ch]` for
+  channel events, and `note_map_by_channel` is only true for very small voice
+  caps (`max_voices <= g_worker_count * STEAL_CHANNEL_MAP_VOICES_PER_WORKER`).
+  Above that, a note-on and a program change on the same channel sit in
+  different worker queues and are consumed concurrently inside one render cycle.
+  Without the boundary, note-ons resolve against the wrong bank/program, the
+  region selector matches nothing, and the note is dropped with no sound and no
+  error. The audible symptom is melodic notes disappearing on material that is
+  not dense at all, which looks like a voice-stealer bug and is not one.
+  `SSW_FORCE_SELECTOR_BOUNDARIES=1` restores unconditional boundaries.

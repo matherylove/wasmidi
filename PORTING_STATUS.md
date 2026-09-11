@@ -320,13 +320,21 @@ Current policy, matching that behaviour under load and exceeding it when idle:
 
 1. Boundaries land only on a fixed grid, a multiple of 8 frames, never on an
    arbitrary event sample.
-2. Only events that change already-sounding voices may open a boundary. Bank
-   select, RPN/NRPN select and program change do not, since the channel event
-   queue is drained in submission order.
-3. The number of renders per block is hard-capped and governed by measured load,
+2. Selector events (bank select, RPN/NRPN select, data entry, program change)
+   take an exact boundary whenever a note has been admitted on that channel
+   since the last boundary. This is a correctness requirement, not an
+   optimization: `enqueue_event()` routes notes by key hash and channel events
+   by channel, so above small voice caps the two are in different worker queues
+   and are consumed concurrently within one render cycle. Only a boundary orders
+   them. The note gate keeps it cheap, since a selector with nothing queued
+   against it needs no boundary.
+3. Events that only change already-sounding voices (continuous CC, pitch bend)
+   are quantized onto the grid.
+4. The number of renders per block is hard-capped and governed by measured load,
    halving on overload and doubling when idle. A budget of 1 is exactly the
-   native behaviour.
-4. All-sound-off style controllers (CC 120/121/123-127) get exact boundaries
+   native behaviour. The cap governs rule 3 only; correctness boundaries from
+   rules 2 and 5 are never skipped.
+5. All-sound-off style controllers (CC 120/121/123-127) get exact boundaries
    from a small separate reserve.
 
 Host-side regression test, no Emscripten toolchain required:
@@ -340,10 +348,16 @@ budget, grid alignment, SIMD segment alignment, event ordering, the panic
 reserve, governor convergence in both directions, and block sizes from 64 to
 2048 frames.
 
-Do not reintroduce sample-exact boundaries per state event. Dense bank/RPN or
-program-change material turned one 512-frame block into roughly 100
-`voice_render_float()` calls, which stalled playback at a few hundred voices in
-passages that were not dense.
+Do not reintroduce sample-exact boundaries for *continuous* controllers. Dense
+automation turned one 512-frame block into many `voice_render_float()` calls,
+which stalled playback at a few hundred voices in passages that were not dense.
+
+Do not remove the boundary for *selector* events either. That was tried and it
+silently dropped melodic notes: without the boundary, note-ons resolve against
+the wrong bank/program, the region selector matches nothing, and the voice is
+never allocated. It presents as aggressive voice stealing on sparse material and
+is not a stealer bug. `SSW_FORCE_SELECTOR_BOUNDARIES=1` restores unconditional
+selector boundaries if the note gate is ever suspected.
 
 `SS_EVENT_SPIN_ITERATIONS` in `compat/win_compat.h` controls the bounded spin
 before the futex park in `ss_wait_event()`. Build with

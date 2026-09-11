@@ -708,12 +708,30 @@ int ssw_render_into(uintptr_t out_ptr,
  *   1. Boundaries may only land on a fixed grid, never on an arbitrary event
  *      sample.  The grid is a multiple of 8 frames so the SIMD sustain paths
  *      stay eligible.
- *   2. Only events that change the output of ALREADY SOUNDING voices can open
- *      a boundary.  Bank select, RPN/NRPN selects and program changes affect
- *      future note-ons only, and the event queue is drained in order, so those
- *      need no boundary at all.
- *   3. The number of voice_render_float() calls per block is hard-capped and
- *      driven by measured load, with fast backoff and gradual recovery.
+ *   2. Selector events -- bank select, RPN/NRPN select, data entry and program
+ *      change -- get an EXACT boundary whenever a note has been admitted on
+ *      that channel since the last boundary.  This is not optional.  voice.c
+ *      routes note events by key hash (g_note_worker_map) and channel events by
+ *      channel (g_channel_worker_map), so once there is more than one worker a
+ *      note-on and a program change sit in DIFFERENT worker queues and are
+ *      consumed concurrently within one render cycle.  Only a render boundary
+ *      orders them.  Without it, note-ons resolve against the wrong
+ *      bank/program, the region selector matches nothing, and the note is
+ *      silently dropped.
+ *      The note gate is what makes this affordable: when no note has been
+ *      admitted since the last boundary, no queue holds anything for that
+ *      channel to be reordered against, so the selector can be applied
+ *      immediately.  Material that spams bank/RPN/program without notes in
+ *      between therefore costs nothing, while musical material keeps exact
+ *      ordering.
+ *   3. Events that only change ALREADY SOUNDING voices (continuous CC, pitch
+ *      bend) are quantized onto the grid.  These need to be heard at the right
+ *      time, not ordered against note admission.
+ *   4. The number of voice_render_float() calls per block is hard-capped and
+ *      driven by measured load, with fast backoff and gradual recovery.  The
+ *      cap governs rule 3 only; correctness boundaries are never skipped.
+ *   5. All-sound-off style controllers (CC 120/121/123-127) get exact
+ *      boundaries from a small separate reserve.
  *
  * Notes keep their original sample timestamps in every case; the engine's own
  * event ordering, coalescing and VOR identity are untouched.
@@ -758,11 +776,50 @@ static int ssw_is_panic_cc(uint32_t cc) {
 }
 
 /*
- * Does this event change what already-sounding voices produce? Anything that
- * only selects state for future note-ons (bank select, RPN/NRPN select,
- * program change) is excluded: the per-channel event queue is consumed in
- * submission order, so a later note-on still observes the correct state
- * without a render boundary.
+ * Set to 1 to make every selector event open a boundary unconditionally, i.e.
+ * exactly the pre-governor behaviour. Rollback switch if the note gate below is
+ * ever suspected of dropping notes again.
+ */
+#ifndef SSW_FORCE_SELECTOR_BOUNDARIES
+#define SSW_FORCE_SELECTOR_BOUNDARIES 0
+#endif
+
+/*
+ * Selector events choose the state a FUTURE note-on resolves against: bank
+ * select, RPN/NRPN select, data entry and program change. They must be ordered
+ * exactly against note events on the same channel, because voice.c shards note
+ * events by key and channel events by channel, so with more than one worker the
+ * two live in different queues and are consumed concurrently. Data entry is
+ * included because RPN 0 is pitch-bend range, which changes sounding voices as
+ * well; exact is the safe side for it.
+ */
+static int ssw_is_selector_event(uint32_t message) {
+    const uint32_t command = message & 0xf0u;
+
+    if (command == 0xc0u)
+        return 1;                       /* program change */
+    if (command != 0xb0u)
+        return 0;
+
+    switch ((message >> 8) & 0x7fu) {
+        case 0:                         /* bank select MSB */
+        case 6:                         /* data entry MSB  */
+        case 32:                        /* bank select LSB */
+        case 38:                        /* data entry LSB  */
+        case 98:                        /* NRPN LSB */
+        case 99:                        /* NRPN MSB */
+        case 100:                       /* RPN LSB  */
+        case 101:                       /* RPN MSB  */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Does this event change what already-sounding voices produce? These only need
+ * to be heard at the right time, not ordered against note admission, so they
+ * are the ones the load governor may quantize onto the grid.
  */
 static int ssw_affects_sounding_voices(uint32_t message) {
     const uint32_t command = message & 0xf0u;
@@ -770,18 +827,16 @@ static int ssw_affects_sounding_voices(uint32_t message) {
     if (command == 0xe0u)
         return 1;                       /* pitch bend */
     if (command != 0xb0u)
-        return 0;                       /* program change: new notes only */
+        return 0;
 
     switch ((message >> 8) & 0x7fu) {
         case 1:                         /* modulation */
         case 2:                         /* breath */
         case 4:                         /* foot */
         case 5:                         /* portamento time */
-        case 6:                         /* data entry MSB (bend range) */
         case 7:                         /* volume */
         case 10:                        /* pan */
         case 11:                        /* expression */
-        case 38:                        /* data entry LSB */
         case 64:                        /* sustain */
         case 65:                        /* portamento on/off */
         case 71:                        /* resonance */
@@ -853,7 +908,11 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
     int segment_start = 0;
     int splits_used = 0;
     int panic_splits_used = 0;
+    /* Per-channel: has a note been admitted since the last boundary? Selector
+     * events only have to force a boundary when the answer is yes. */
+    unsigned char note_pending[16];
 
+    memset(note_pending, 0, sizeof(note_pending));
     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
 
     while (g_event_head) {
@@ -868,14 +927,26 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 
             {
                 const uint32_t command = event->message & 0xf0u;
+                const int ch = (int)(event->message & 0x0fu);
                 const int panic =
                     command == 0xb0u &&
                     ssw_is_panic_cc((event->message >> 8) & 0x7fu);
+                /* Correctness boundary: never subject to the load budget. */
+                const int ordering =
+                    !panic &&
+                    ssw_is_selector_event(event->message) &&
+#if SSW_FORCE_SELECTOR_BOUNDARIES
+                    1;
+#else
+                    note_pending[ch];
+#endif
                 int boundary = segment_start;
 
                 if (panic) {
                     if (panic_splits_used < SSW_PANIC_RENDER_RESERVE)
                         boundary = (int)frame;
+                } else if (ordering) {
+                    boundary = (int)frame;
                 } else if (ssw_affects_sounding_voices(event->message) &&
                            splits_used < budget - 1) {
                     boundary = ((int)frame / quantum) * quantum;
@@ -890,14 +961,21 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                     g_render_cursor += segment_frames;
                     segment_start = boundary;
                     if (panic) ++panic_splits_used;
-                    else ++splits_used;
+                    else if (!ordering) ++splits_used;
+                    /* Everything queued before this boundary has been consumed,
+                     * so nothing is left for a selector to be reordered
+                     * against. */
+                    memset(note_pending, 0, sizeof(note_pending));
                     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
                 }
-            }
 
-            dispatch_short_at_qpc(
-                event->message,
-                g_render_cursor + (frame - segment_start));
+                dispatch_short_at_qpc(
+                    event->message,
+                    g_render_cursor + (frame - segment_start));
+
+                if (command == 0x90u || command == 0x80u)
+                    note_pending[ch] = 1u;
+            }
             ++block->index;
         }
 

@@ -43,6 +43,12 @@ static double ssw_now_ms(void) { return t_fake_now; }
 
 static void voice_set_render_timing(int64_t cursor, int rate) { (void)cursor; (void)rate; }
 
+/* interleaved trace: RENDER markers and dispatched messages, in order */
+#define TR_RENDER 0xFFFFFFFFu
+static uint32_t t_trace[16384];
+static int t_ntrace;
+static void trace(uint32_t v){ if(t_ntrace<16384) t_trace[t_ntrace]=v; ++t_ntrace; }
+
 static void voice_render_float(float* out, int frames) {
     ++t_render_calls;
     t_frames_rendered += frames;
@@ -55,12 +61,14 @@ static void voice_render_float(float* out, int frames) {
     }
     /* the SIMD sustain batch path needs frames % 8 == 0 */
     if (frames % 8) ++t_misaligned_segments;
+    trace(TR_RENDER);
     memset(out, 0, sizeof(float) * (size_t)frames * (size_t)g_cfg.num_channels);
 }
 
 static void dispatch_short_at_qpc(uint32_t msg, int64_t ts) {
     if (t_ndispatch < 8192) { t_dispatch_order[t_ndispatch] = msg; t_dispatch_ts[t_ndispatch] = ts; }
     ++t_ndispatch;
+    trace(msg);
 }
 
 #define SSW_HARNESS_NO_NOW 1
@@ -76,7 +84,7 @@ static void queue(const ssw_scheduled_event* evs, int n) {
 }
 static void reset_counters(void) {
     t_render_calls = 0; t_frames_rendered = 0; t_nboundaries = 0;
-    t_bad_ptr = 0; t_misaligned_segments = 0; t_ndispatch = 0;
+    t_bad_ptr = 0; t_misaligned_segments = 0; t_ndispatch = 0; t_ntrace = 0;
 }
 static void clear_events(void) {
     while (g_event_head) { ssw_event_block* n = g_event_head->next; free(g_event_head); g_event_head = n; }
@@ -269,6 +277,79 @@ int main(void) {
         CHECK(t_render_calls <= 8, "frames=%d used %d renders", f, t_render_calls);
         CHECK(t_misaligned_segments == 0, "frames=%d produced misaligned segments", f);
     }
+
+    /* ---------- 11. selector ordering: THE note-eating regression ---------- */
+    printf("11. selector events are ordered against note admission\n");
+    /* A note-on followed by a bank/program change on the same channel must have
+     * a render between them. voice.c shards notes by key and channel events by
+     * channel, so without that render the two sit in different worker queues,
+     * are consumed concurrently, and the note resolves against the wrong
+     * program -> no region -> silently dropped note. */
+    clear_events();
+    { ssw_scheduled_event e[8]; int n=0;
+      e[n].sample_frame=g_song_frame+ 10; e[n++].message = noteon(5,60,100);
+      e[n].sample_frame=g_song_frame+ 20; e[n++].message = cc(5,0,1);    /* bank MSB */
+      e[n].sample_frame=g_song_frame+ 21; e[n++].message = pc(5,42);     /* program  */
+      e[n].sample_frame=g_song_frame+ 30; e[n++].message = noteon(5,64,100);
+      queue(e, n); }
+    g_render_budget = 8;
+    run_block(F);
+    { int seen_note = 0, ok = 1;
+      for (int i = 0; i < t_ntrace; ++i) {
+        if (t_trace[i] == TR_RENDER) { seen_note = 0; continue; }
+        if ((t_trace[i] & 0xf0u) == 0x90u) { seen_note = 1; continue; }
+        if (ssw_is_selector_event(t_trace[i]) && seen_note) ok = 0;
+      }
+      CHECK(ok, "a selector was admitted after a note-on with no render between");
+      CHECK(t_render_calls >= 2, "expected an ordering boundary, got %d renders", t_render_calls); }
+
+    /* selector with NO note admitted since the last boundary: no split needed */
+    printf("12. selector with no pending notes costs nothing\n");
+    clear_events();
+    { ssw_scheduled_event e[400]; int n=0;
+      for (int i = 0; i < 100; ++i) {
+        int64_t f = g_song_frame + i*5;
+        e[n].sample_frame=f; e[n++].message = cc(0,0,i&0x7f);
+        e[n].sample_frame=f; e[n++].message = cc(0,32,i&0x7f);
+        e[n].sample_frame=f; e[n++].message = cc(0,101,0);
+        e[n].sample_frame=f; e[n++].message = pc(0,i&0x7f);
+      }
+      queue(e, n); }
+    g_render_budget = 8;
+    run_block(F);
+    CHECK(t_render_calls == 1, "selector spam without notes used %d renders", t_render_calls);
+
+    /* selector on a DIFFERENT channel than the pending note: no boundary */
+    printf("13. cross-channel selector does not force a boundary\n");
+    clear_events();
+    { ssw_scheduled_event e[8]; int n=0;
+      e[n].sample_frame=g_song_frame+ 10; e[n++].message = noteon(2,60,100);
+      e[n].sample_frame=g_song_frame+ 20; e[n++].message = pc(9,42);
+      e[n].sample_frame=g_song_frame+ 30; e[n++].message = pc(11,7);
+      queue(e, n); }
+    g_render_budget = 8;
+    run_block(F);
+    CHECK(t_render_calls == 1, "cross-channel selectors used %d renders", t_render_calls);
+
+    /* ordering boundaries must survive a starved budget */
+    printf("14. ordering boundaries ignore the load budget\n");
+    clear_events();
+    { ssw_scheduled_event e[16]; int n=0;
+      for (int i = 0; i < 6; ++i) {
+        e[n].sample_frame=g_song_frame+ i*80;    e[n++].message = noteon(1,60+i,100);
+        e[n].sample_frame=g_song_frame+ i*80+10; e[n++].message = pc(1,i);
+      }
+      queue(e, n); }
+    g_render_budget = 1;              /* fully loaded */
+    run_block(F);
+    { int seen_note = 0, ok = 1;
+      for (int i = 0; i < t_ntrace; ++i) {
+        if (t_trace[i] == TR_RENDER) { seen_note = 0; continue; }
+        if ((t_trace[i] & 0xf0u) == 0x90u) { seen_note = 1; continue; }
+        if (ssw_is_selector_event(t_trace[i]) && seen_note) ok = 0;
+      }
+      CHECK(ok, "budget=1 dropped a required ordering boundary"); }
+    CHECK(t_frames_rendered == F, "budget=1 ordering path rendered %d frames", t_frames_rendered);
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL CHECKS PASSED", fails);
     return fails ? 1 : 0;
