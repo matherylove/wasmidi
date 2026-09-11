@@ -15,6 +15,10 @@ static AudioConfig g_cfg = {44100, 2, 32, 512, 16, 1};
 static float* g_out = NULL;
 static int g_out_capacity_frames = 0;
 static int64_t g_render_cursor = 1;
+/* Adaptive per-block voice_render_float() budget; see ssw_render_queued_into().
+ * 1 == exactly the native engine's behaviour (state applied at block start). */
+static int    g_render_budget = 1;
+static double g_render_load_ema = -1.0;
 static int g_ready = 0;
 static int g_max_voices = 16384;
 static int g_min_voices = 0;
@@ -491,6 +495,8 @@ int ssw_init_ex(int sample_rate,
     g_render_cursor = 1;
     g_song_time_seconds = 0.0;
     g_song_frame = 0;
+    g_render_budget = 1;
+    g_render_load_ema = -1.0;
     ssw_clear_events();
     g_ready = 1;
     return 1;
@@ -591,6 +597,8 @@ void ssw_reset(void) {
     g_render_cursor = 1;
     g_song_time_seconds = 0.0;
     g_song_frame = 0;
+    g_render_budget = 1;
+    g_render_load_ema = -1.0;
     ssw_clear_events();
 }
 
@@ -667,54 +675,170 @@ int ssw_render_into(uintptr_t out_ptr,
 
 /*
  * A native KDMAPI stream does not pay a browser pthread/futex round trip for
- * every controller byte.  In the browser, however, splitting a 512-frame
- * source block at every dense CC/pitch sample used to turn one render into
- * hundreds of tiny voice_render_float() calls.  Besides rebuilding the render
- * queue each time, every call wakes and joins the complete voice worker set.
+ * every controller byte.  The native realtime backend never splits a render
+ * on an event at all: src/Audio/winmm_output.c chooses its chunk size purely
+ * from elapsed device time, and voice.c applies CC/program/pitch-bend state
+ * when the worker drains its channel queue at the START of that chunk.  Only
+ * note-on/note-off carry a sample offset (qpc_to_sample_offset_clamped).
  *
- * Quantize only continuous automation to a small (about 1.45 ms at 44.1 kHz)
- * scheduling cell.  Discrete state transitions stay sample-exact: bank/RPN,
- * sustain, resets, all-notes/sound-off, mono/poly and program changes.  Notes
- * retain their original sample timestamps.  This bounds continuous-controller
- * render barriers to at most eight per normal 512-frame block while keeping
- * the native engine's event ordering and controller coalescing intact.
+ * The previous browser build split the block at every state event, and at the
+ * exact sample for discrete CCs and program changes.  That is far finer than
+ * the engine it is porting, and it is very expensive here, because the cost of
+ * voice_render_float() is dominated by per-call fixed work rather than by the
+ * frame count:
+ *
+ *   - two full worker barriers, each an emscripten futex park/unpark;
+ *   - an InterlockedAdd + memcpy rebuild of the global render queue;
+ *   - the per-voice setup chain (voice struct, region, gains, branch cascade),
+ *     paid in full for every active voice on every call;
+ *   - loss of the SIMD sustain paths, which require frames to be a multiple
+ *     of 8 (fast stereo batch) or 4 (no-interp paths).
+ *
+ * So a CC-dense passage multiplied the render cost by the number of state
+ * events, not by anything musical.  This is what produced stalls at only a few
+ * hundred voices in passages that were not dense.
+ *
+ * The replacement keeps controller timing finer than the native engine when
+ * there is CPU headroom, and collapses to exactly the native behaviour (one
+ * voice_render_float() per block, state applied at block start) when there is
+ * not.  That is also what the native build does implicitly: its WinMM render
+ * thread emits tiny chunks while it is idle and whole buffers while it is
+ * busy.  Three rules:
+ *
+ *   1. Boundaries may only land on a fixed grid, never on an arbitrary event
+ *      sample.  The grid is a multiple of 8 frames so the SIMD sustain paths
+ *      stay eligible.
+ *   2. Only events that change the output of ALREADY SOUNDING voices can open
+ *      a boundary.  Bank select, RPN/NRPN selects and program changes affect
+ *      future note-ons only, and the event queue is drained in order, so those
+ *      need no boundary at all.
+ *   3. The number of voice_render_float() calls per block is hard-capped and
+ *      driven by measured load, with fast backoff and gradual recovery.
+ *
+ * Notes keep their original sample timestamps in every case; the engine's own
+ * event ordering, coalescing and VOR identity are untouched.
  */
-#define SSW_CONTINUOUS_STATE_QUANTUM 64
 
-static int ssw_is_continuous_cc(uint32_t cc) {
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+static inline double ssw_now_ms(void) { return emscripten_get_now(); }
+#else
+#include <time.h>
+static inline double ssw_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+#endif
+
+/* Finest scheduling cell, about 1.45 ms at 44.1 kHz. Multiple of 8. */
+#define SSW_STATE_QUANTUM_MIN 64
+/* Absolute ceiling on voice_render_float() calls per block. */
+#define SSW_MAX_BLOCK_RENDERS 8
+/* Extra boundaries reserved for all-notes/all-sound-off style controllers,
+ * which do change currently sounding voices and are rare in normal material. */
+#define SSW_PANIC_RENDER_RESERVE 2
+/* Load thresholds, as a fraction of the block's own realtime budget. */
+#define SSW_LOAD_BACKOFF 0.45
+#define SSW_LOAD_RECOVER 0.20
+
+/*
+ * All-notes-off / all-sound-off / reset-controllers / mono-poly. These do
+ * affect sounding voices and are normally sparse, so they are allowed an exact
+ * boundary from a small separate reserve even when the load budget is 1.
+ */
+static int ssw_is_panic_cc(uint32_t cc) {
     switch (cc & 0x7fu) {
-        case 1:  /* modulation */
-        case 2:  /* breath */
-        case 4:  /* foot */
-        case 5:  /* portamento time */
-        case 7:  /* volume */
-        case 10: /* pan */
-        case 11: /* expression */
-        case 71: /* resonance */
-        case 72: /* release */
-        case 73: /* attack */
-        case 74: /* cutoff */
-        case 91: /* reverb send */
-        case 93: /* chorus send */
+        case 120: case 121: case 123:
+        case 124: case 125: case 126: case 127:
             return 1;
         default:
             return 0;
     }
 }
 
-static int ssw_state_render_frame(uint32_t message, int frame) {
-    const uint32_t status = message & 0xffu;
-    const uint32_t command = status & 0xf0u;
-    int continuous = command == 0xe0u;
+/*
+ * Does this event change what already-sounding voices produce? Anything that
+ * only selects state for future note-ons (bank select, RPN/NRPN select,
+ * program change) is excluded: the per-channel event queue is consumed in
+ * submission order, so a later note-on still observes the correct state
+ * without a render boundary.
+ */
+static int ssw_affects_sounding_voices(uint32_t message) {
+    const uint32_t command = message & 0xf0u;
 
-    if (command == 0xb0u)
-        continuous = ssw_is_continuous_cc((message >> 8) & 0x7fu);
+    if (command == 0xe0u)
+        return 1;                       /* pitch bend */
+    if (command != 0xb0u)
+        return 0;                       /* program change: new notes only */
 
-    if (continuous && frame > 0) {
-        return (frame / SSW_CONTINUOUS_STATE_QUANTUM) *
-               SSW_CONTINUOUS_STATE_QUANTUM;
+    switch ((message >> 8) & 0x7fu) {
+        case 1:                         /* modulation */
+        case 2:                         /* breath */
+        case 4:                         /* foot */
+        case 5:                         /* portamento time */
+        case 6:                         /* data entry MSB (bend range) */
+        case 7:                         /* volume */
+        case 10:                        /* pan */
+        case 11:                        /* expression */
+        case 38:                        /* data entry LSB */
+        case 64:                        /* sustain */
+        case 65:                        /* portamento on/off */
+        case 71:                        /* resonance */
+        case 72:                        /* release */
+        case 73:                        /* attack */
+        case 74:                        /* cutoff */
+        case 91:                        /* reverb send */
+        case 93:                        /* chorus send */
+            return 1;
+        default:
+            return 0;
     }
-    return frame;
+}
+
+/* Grid size for this block, given how many renders we may spend on it. */
+static int ssw_state_quantum(int frames, int budget) {
+    int quantum;
+    if (budget <= 1 || frames <= SSW_STATE_QUANTUM_MIN)
+        return frames;
+    quantum = (frames + budget - 1) / budget;
+    if (quantum < SSW_STATE_QUANTUM_MIN)
+        quantum = SSW_STATE_QUANTUM_MIN;
+    quantum = (quantum + 7) & ~7;      /* keep the SIMD sustain paths eligible */
+    if (quantum > frames)
+        quantum = frames;
+    return quantum;
+}
+
+/*
+ * Fast backoff, gradual recovery. Halving on overload reaches the native
+ * single-render behaviour within three blocks; doubling on idle takes three
+ * blocks to return to the finest grid, which prevents the budget from
+ * oscillating around a threshold.
+ */
+static void ssw_update_render_budget(double used_ms, int frames) {
+    const int rate = g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100;
+    const double realtime_ms = (double)frames * 1000.0 / (double)rate;
+    double load;
+
+    if (realtime_ms <= 0.0)
+        return;
+
+    load = used_ms / realtime_ms;
+    if (!isfinite(load) || load < 0.0)
+        load = 0.0;
+
+    if (g_render_load_ema < 0.0) g_render_load_ema = load;
+    else g_render_load_ema += 0.25 * (load - g_render_load_ema);
+
+    if (g_render_load_ema > SSW_LOAD_BACKOFF) {
+        g_render_budget /= 2;
+        if (g_render_budget < 1) g_render_budget = 1;
+    } else if (g_render_load_ema < SSW_LOAD_RECOVER) {
+        g_render_budget *= 2;
+        if (g_render_budget > SSW_MAX_BLOCK_RENDERS)
+            g_render_budget = SSW_MAX_BLOCK_RENDERS;
+    }
 }
 
 int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
@@ -723,7 +847,12 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
     const int64_t block_start_frame = g_song_frame;
     const int64_t block_end_frame = block_start_frame + (int64_t)frames;
     const int channels = g_cfg.num_channels > 0 ? g_cfg.num_channels : 2;
+    const int budget = g_render_budget;
+    const int quantum = ssw_state_quantum(frames, budget);
+    const double started_ms = ssw_now_ms();
     int segment_start = 0;
+    int splits_used = 0;
+    int panic_splits_used = 0;
 
     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
 
@@ -737,39 +866,33 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
             if (frame < 0) frame = 0;
             if (frame >= frames) frame = frames - 1;
 
-            /*
-             * Native realtime SnappySynth receives controller changes as the
-             * device timeline advances. WASMIDI used to enqueue every CC,
-             * program and pitch event for an entire 512-frame block before a
-             * single voice_render_float(). voice.c intentionally coalesces
-             * adjacent state events, so dense automation was collapsing to
-             * the last value in the block and audibly arriving too early.
-             *
-             * Render up to each distinct state-event sample before admitting
-             * that event. Note-only Black MIDI keeps the original single-call
-             * fast path, while controller-heavy files retain exact source
-             * ordering and sample timing.
-             */
-            const uint32_t status = event->message & 0xffu;
-            const uint32_t command = status & 0xf0u;
-            const int is_state_event =
-                command == 0xb0u || command == 0xc0u || command == 0xe0u;
-            int state_render_frame = (int)frame;
-            if (is_state_event)
-                state_render_frame = ssw_state_render_frame(
-                    event->message, (int)frame);
-            if (state_render_frame < segment_start)
-                state_render_frame = segment_start;
+            {
+                const uint32_t command = event->message & 0xf0u;
+                const int panic =
+                    command == 0xb0u &&
+                    ssw_is_panic_cc((event->message >> 8) & 0x7fu);
+                int boundary = segment_start;
 
-            if (is_state_event && state_render_frame > segment_start) {
-                const int segment_frames =
-                    state_render_frame - segment_start;
-                voice_render_float(
-                    ((float*)out_ptr) + (size_t)segment_start * (size_t)channels,
-                    segment_frames);
-                g_render_cursor += segment_frames;
-                segment_start = state_render_frame;
-                voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
+                if (panic) {
+                    if (panic_splits_used < SSW_PANIC_RENDER_RESERVE)
+                        boundary = (int)frame;
+                } else if (ssw_affects_sounding_voices(event->message) &&
+                           splits_used < budget - 1) {
+                    boundary = ((int)frame / quantum) * quantum;
+                }
+
+                if (boundary > segment_start) {
+                    const int segment_frames = boundary - segment_start;
+                    voice_render_float(
+                        ((float*)out_ptr) +
+                            (size_t)segment_start * (size_t)channels,
+                        segment_frames);
+                    g_render_cursor += segment_frames;
+                    segment_start = boundary;
+                    if (panic) ++panic_splits_used;
+                    else ++splits_used;
+                    voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
+                }
             }
 
             dispatch_short_at_qpc(
@@ -795,6 +918,8 @@ events_done:
     g_song_time_seconds =
         (double)g_song_frame /
         (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
+
+    ssw_update_render_budget(ssw_now_ms() - started_ms, frames);
     return 1;
 }
 

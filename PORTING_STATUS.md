@@ -297,3 +297,56 @@ instead of frame-based and recovery is faster than escalation.
 ## Pass 13.2.2 - Emscripten 3.1.56 Memory64 growth hotfix
 
 The generated Memory64 parser could fail on its first heap expansion because Emscripten 3.1.56 converted a fractional page count (for example 10.999984741210938) to BigInt. The first 13.2.1 workaround used `--post-js`, but `MODULARIZE=1` keeps `wasmMemory` and `growMemory` private to the module factory, so that shim could not safely reach them. Pass 13.2.2 instead patches the Emscripten 3.1.56 `src/library.js` template during CMake configure, before any project link step. The generated helper now truncates the rounded-up page count to an integer with `| 0`, matching the later upstream implementation, and then the normal Memory64 legalization can convert that integer to BigInt. The adaptive 64 MiB initial / 16 GiB maximum policy is unchanged. CI verifies the installed runtime patch and still requires the dense visual-page smoke test to grow beyond 64 MiB.
+
+## Browser render-block scheduling (performance)
+
+`ssw_render_queued_into()` in `third_party/snappysynthv2/snappy_wasm_core.c`
+decides how many `voice_render_float()` calls one device block costs. That count
+is the dominant term in browser render cost, because the call is dominated by
+fixed per-call work rather than by its frame count:
+
+- two worker barriers, each an Emscripten futex park/unpark;
+- an `InterlockedAdd` + `memcpy` rebuild of the global render queue;
+- the per-voice setup chain, paid in full for every active voice;
+- loss of the SIMD sustain paths, which need frames to be a multiple of 8
+  (fast stereo batch) or 4 (no-interpolation paths).
+
+The native engine never splits a render on an event. `src/Audio/winmm_output.c`
+sizes its chunk from elapsed device time, and `voice.c` applies CC, program and
+pitch-bend state when the worker drains its channel queue at the start of that
+chunk. Only note-on/note-off carry a sample offset.
+
+Current policy, matching that behaviour under load and exceeding it when idle:
+
+1. Boundaries land only on a fixed grid, a multiple of 8 frames, never on an
+   arbitrary event sample.
+2. Only events that change already-sounding voices may open a boundary. Bank
+   select, RPN/NRPN select and program change do not, since the channel event
+   queue is drained in submission order.
+3. The number of renders per block is hard-capped and governed by measured load,
+   halving on overload and doubling when idle. A budget of 1 is exactly the
+   native behaviour.
+4. All-sound-off style controllers (CC 120/121/123-127) get exact boundaries
+   from a small separate reserve.
+
+Host-side regression test, no Emscripten toolchain required:
+
+    python3 tools/extract_ssw_schedule_logic.py
+    cc -O1 -Wall -Wextra -o /tmp/ssw_harness tools/ssw_schedule_harness.c -lm
+    /tmp/ssw_harness
+
+It checks frame accounting, render-cursor advance, render-call bounds at every
+budget, grid alignment, SIMD segment alignment, event ordering, the panic
+reserve, governor convergence in both directions, and block sizes from 64 to
+2048 frames.
+
+Do not reintroduce sample-exact boundaries per state event. Dense bank/RPN or
+program-change material turned one 512-frame block into roughly 100
+`voice_render_float()` calls, which stalled playback at a few hundred voices in
+passages that were not dense.
+
+`SS_EVENT_SPIN_ITERATIONS` in `compat/win_compat.h` controls the bounded spin
+before the futex park in `ss_wait_event()`. Build with
+`-DSS_EVENT_SPIN_ITERATIONS=0` to restore the previous park-immediately
+behaviour; this is the intended rollback switch if spinning ever costs more than
+it saves on a given machine.

@@ -237,12 +237,42 @@ static inline int ss_event_try_acquire(HANDLE h) {
 }
 #endif
 
+/*
+ * Bounded spin before parking.
+ *
+ * emscripten_futex_wait() compiles to Atomics.wait(), a real park/unpark of the
+ * owning Worker. On a hot render barrier that costs tens of microseconds each
+ * way, where the native Win32 auto-reset event it is standing in for resolves
+ * in one or two. voice_render_float() performs roughly (workers * 2 + 2) of
+ * these per call, so the fixed cost of a render block was dominated by futex
+ * traffic rather than by DSP.
+ *
+ * The producer/consumer handoff inside one render cycle normally completes in
+ * well under a microsecond, so a short spin resolves the overwhelming majority
+ * of waits without ever entering the runtime. The spin is bounded and falls
+ * through to the identical futex path, so blocking semantics, timeouts and the
+ * emergency escape waits in voice.c are unchanged.
+ */
+#ifndef SS_EVENT_SPIN_ITERATIONS
+#define SS_EVENT_SPIN_ITERATIONS 384
+#endif
+
 static inline DWORD ss_wait_event(HANDLE h, DWORD ms) {
 #ifdef __EMSCRIPTEN__
     if (ss_event_try_acquire(h))
         return WAIT_OBJECT_0;
     if (ms == 0)
         return WAIT_TIMEOUT;
+
+    for (int spin = 0; spin < SS_EVENT_SPIN_ITERATIONS; ++spin) {
+        // Relaxed probe first: only attempt the acquiring CAS once the
+        // publishing store is actually visible, so spinning cannot generate
+        // cache-line traffic against the signalling thread.
+        if (__atomic_load_n(&h->u.event.signaled, __ATOMIC_RELAXED) != 0u &&
+            ss_event_try_acquire(h)) {
+            return WAIT_OBJECT_0;
+        }
+    }
 
     const double deadline =
         ms == INFINITE
