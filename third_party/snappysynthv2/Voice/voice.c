@@ -6619,6 +6619,19 @@ ss_game_mix_float(out_buffer, num_frames, channels, g_audio.sample_rate);
                                                                                                                                                                                                                                                                 g_voice_stats.steals = steals;
                                                                                                                                                                                                                                                                 return g_voice_stats;
                                                                                                                                                                                                                                                                 }
+/*
+ * Diagnostics for the worker pool. When the requested count is not honoured,
+ * these say whether the engine clamped to the reported core count or whether
+ * thread creation itself failed, which are different problems with different
+ * fixes and cannot be told apart from the worker count alone.
+ */
+int voice_get_worker_thread_failures(void) { return g_worker_thread_failures; }
+int voice_get_detected_cores(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+}
+
 int voice_get_worker_count(void) {
     return g_worker_count;
 }

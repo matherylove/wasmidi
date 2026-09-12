@@ -1015,6 +1015,8 @@ int ssw_sample_rate(void) { return g_cfg.sample_rate; }
 int ssw_bits_per_sample(void) { return g_cfg.bits_per_sample; }
 int ssw_num_buffers(void) { return g_cfg.num_buffers; }
 int ssw_worker_count(void) { return voice_get_worker_count(); }
+int ssw_worker_thread_failures(void) { return voice_get_worker_thread_failures(); }
+int ssw_detected_cores(void) { return voice_get_detected_cores(); }
 
 void ssw_shutdown(void) {
     if (g_ready) voice_shutdown();

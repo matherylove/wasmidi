@@ -189,6 +189,29 @@ let stealRateHasBaseline = false;
 let lastStealCount = 0;
 let lastStealSampleMs = 0;
 
+/*
+ * A worker count below what was asked for has two unrelated causes and the
+ * count alone cannot tell them apart:
+ *   - the engine clamped to the reported core count, so the browser is not
+ *     reporting the machine's threads (hardwareConcurrency is capped by some
+ *     browsers, and is not the host CPU inside a Worker on every platform);
+ *   - thread creation failed, so PTHREAD_POOL_SIZE is still too small.
+ * Print both numbers rather than guessing.
+ */
+function reportWorkerPool() {
+    if (!coreReady || !Module)
+        return;
+    const running = Module._ssw_worker_count();
+    const cores = Module._ssw_detected_cores();
+    const failures = Module._ssw_worker_thread_failures();
+    if (requestedWorkers > 0 && running < requestedWorkers) {
+        console.warn(
+            "[snappysynth] pediste " + requestedWorkers + " workers, corren " +
+            running + ". navigator.hardwareConcurrency visto por el modulo: " +
+            cores + ". Hilos que el pool no pudo crear: " + failures + ".");
+    }
+}
+
 function resetStealRate() {
     stealRatePerSecond = 0;
     stealRateHasBaseline = false;
@@ -471,6 +494,8 @@ function reinitializeCore() {
         realtimePriority,
         requestedWorkers,
         workerCount: Module._ssw_worker_count(),
+        detectedCores: Module._ssw_detected_cores(),
+        workerThreadFailures: Module._ssw_worker_thread_failures(),
         noteSharding,
         stealScoreCache,
         fastNoteOff,
@@ -1240,6 +1265,8 @@ SnappySynthCore({
         realtimePriority,
         requestedWorkers,
         workerCount: Module._ssw_worker_count(),
+        detectedCores: Module._ssw_detected_cores(),
+        workerThreadFailures: Module._ssw_worker_thread_failures(),
         noteSharding,
         stealScoreCache,
         fastNoteOff,
@@ -1247,6 +1274,8 @@ SnappySynthCore({
         softClip,
         prebufferFrames
     });
+
+    reportWorkerPool();
 
     pump();
 }).catch(setError);
