@@ -35,19 +35,16 @@ struct CompositorNote {
     std::uint32_t packedData = 0;
 };
 
-// Which note wins a pixel both notes cover.
-enum class Layering {
-    // BPFA's rule, from NoteMeshCache's Composer::Add: the note that starts
-    // later is on top, and on an equal start the later source order wins.
-    // Reverse iteration then makes the first writer final, which needs nothing
-    // per cell but an occupied bit. It is also the faster of the two.
-    LatestStartOnTop,
-    // WASMIDI's original rule. The note shader writes
-    // z = (endTick - startTick) / 16777216 and the depth test is GL_LESS, so a
-    // SHORTER note is on top, and an equal-length note submitted earlier keeps
-    // the pixel. Requires ordering by duration first, so it costs more.
-    ShortestOnTop
-};
+// Layering follows BPFA's rule, from NoteMeshCache's Composer::Add: the note
+// that starts later is on top, and on an equal start the later source order
+// wins. WASMIDI's own rule was the opposite (the shader writes
+// z = (endTick - startTick) / 16777216 under GL_LESS, so a shorter note won),
+// and it was dropped on request. BPFA's rule is also the faster one: reverse
+// iteration is already front-to-back under it, so the first writer is final and
+// a cell needs nothing but an occupied bit, with no duration sort.
+//
+// The renderer must draw the surviving notes in the same order for this to
+// hold, so depth testing has to be off or z made constant for the note pass.
 
 // Which nibble of VisualNote::packedData holds the palette slot.
 //
@@ -82,7 +79,6 @@ struct CompositorSettings {
     // An open note (endTick == 0) is drawn to the right edge of the viewport,
     // matching the shader's `aEndTick > 0u ? aEndTick : uViewEnd`.
     std::uint32_t viewEndTick = 0;
-    Layering layering = Layering::LatestStartOnTop;
 };
 
 struct CompositorResult {
@@ -100,9 +96,6 @@ struct CompositorResult {
 struct CompositorScratch {
     std::vector<std::uint64_t> occupancy;
     std::vector<std::uint32_t> uncovered;
-    std::vector<std::uint32_t> order;
-    std::vector<std::uint32_t> scratchOrder;
-    std::vector<std::uint32_t> counts;
 };
 
 // Culls notes that cannot contribute a pixel. `notes` must be sorted by

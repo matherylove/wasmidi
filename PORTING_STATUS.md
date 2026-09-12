@@ -447,32 +447,18 @@ same shader and palette, with only hidden notes removed.
 
 ### Layering
 
-`Layering` selects which note wins a shared pixel.
+Layering follows BPFA's rule from `Composer::Add`: later start on top, later
+source order breaks a tie. WASMIDI's own rule was the opposite -- the shader
+writes z = (endTick - startTick) / 16777216 under GL_LESS, so a shorter note
+won -- and it was removed on request.
 
-- `LatestStartOnTop` is BPFA's rule from `Composer::Add`: later start on top,
-  later source order breaks a tie.
-- `ShortestOnTop` is WASMIDI's original rule. The shader writes
-  z = (endTick - startTick) / 16777216 under GL_LESS, so a shorter note is on
-  top and an equal-length note submitted earlier keeps the pixel.
+BPFA's rule is also the faster one: reverse iteration is already front-to-back
+under it, so the first writer of a cell is final, a cell needs nothing but an
+occupied bit, and no duration sort is needed.
 
-These are different pictures, not two spellings of one. Switching to BPFA's rule
-is a visual change and is exposed as such.
-
-BPFA's rule is also the faster one. Reverse iteration is already front-to-back
-under it, so the first writer is final and a cell needs nothing but an occupied
-bit. `ShortestOnTop` has to order by duration first (stable LSD radix, four
-8-bit passes), which is what its extra time buys.
-
-### Colour
-
-BPFA picks `tracks->channelColors[track * 16 + channel]`, falling back to
-`primary[channel & 15]`. WASMIDI makes the same distinction when it packs the
-note stream rather than in the shader: bits 16..19 carry the global/channel
-slot, bits 20..23 the per-track slot, and `gl_renderer.cpp` repacks the stream
-when `perTrackColors_` changes. The shader's `uPerTrack` uniform is vestigial --
-it is set at line 3178 but never read, since `colorIndex` always masks bits
-16..19. `SelectColorSlot()` documents the mapping; culling itself never touches
-colour.
+Wiring note: the renderer must submit the survivors in the same order for this
+to hold, so the note pass needs depth testing off or z made constant. That is
+part of the integration that has not been done.
 
 ### Verification
 
@@ -485,13 +471,13 @@ model of the selected layering rule and compares every cell, storing everything
 the fragment shader can distinguish: palette slot, velocity and tick range. It
 runs every case under both rules. Zero cells differ.
 
-| Case | Instances | BPFA order | time | WASMIDI order | time |
-|------|-----------|-----------|------|---------------|------|
-| sparse 10k | 10,000 | 9,741 | 0.5 ms | 7,642 | 0.6 ms |
-| dense 100k | 100,000 | 74,037 | 3.6 ms | 42,220 | 5.1 ms |
-| crashpoint 1M | 1,000,000 | 241,554 | 23.7 ms | 190,239 | 48.9 ms |
-| stacked chord 200k | 200,000 | 1,920 | 7.9 ms | 1,344 | 5.1 ms |
-| long notes 50k | 50,000 | 45,215 | 2.5 ms | 6,132 | 3.1 ms |
+| Case | Instances | After culling | Time |
+|------|-----------|---------------|------|
+| sparse 10k | 10,000 | 9,741 | 0.3 ms |
+| dense 100k | 100,000 | 74,037 | 2.8 ms |
+| crashpoint 1M | 1,000,000 | 241,554 | 21.8 ms |
+| stacked chord 200k | 200,000 | 1,920 | 7.4 ms |
+| long notes 50k | 50,000 | 45,215 | 2.4 ms |
 
 Optimizations that got there: a one-bit-per-cell occupancy bitmap (30 KB for
 128 keys at 1920 columns, against 3.9 MB for the previous owner-per-cell array),
@@ -518,3 +504,40 @@ Remaining work: the tile cache and its worker pool, where those threads live in
 the browser build, reusing the existing note ring for culled output, and a
 density threshold. None of it can be verified here: there is no Qt6 and no emsdk
 in this environment, so `gl_renderer.cpp` cannot be compiled at all.
+
+## Worker threads the pool never created
+
+`_beginthreadex` in `setup_workers()` had its return value ignored. Under
+Emscripten every render worker comes out of the fixed `PTHREAD_POOL_SIZE` pool,
+and that pool was sized to exactly `navigator.hardwareConcurrency` with no
+headroom for the module's own threads. Asking for as many workers as the machine
+has threads exhausted it, `_beginthreadex` returned 0, and `g_threads[w]` was
+left null while `g_worker_count` still claimed the worker existed. Every render
+then signalled that worker's start event and waited for a done event that could
+never arrive, until the emergency escape wait expired, and every voice
+`g_note_worker_map` routed there was dead.
+
+The symptom is exactly "the synth ignores the worker count I asked for", plus
+large periodic stalls that look like a render problem and are not.
+
+Two changes:
+
+- `CMakeLists.txt` sizes the pool at `navigator.hardwareConcurrency + 8`.
+- `voice.c` checks the return, stops at the last worker that started, sets
+  `g_worker_count` to that, and `repair_worker_maps_after_thread_failure()`
+  folds the routing maps onto live workers and resizes the freelist batch. The
+  count reported by `ssw_worker_count()` is then the count actually running,
+  so the UI stops claiming threads that do not exist.
+
+This was found by reading, not by running: there is no emsdk here, so the
+browser behaviour is unverified. `voice.c` does compile clean standalone with
+`gcc -fsyntax-only -I. -DSNAPPYSYNTH_WASM=1 Voice/voice.c`.
+
+## Not done in this pass
+
+- BPFA's audio ring buffer for SnappySynthV2, and the frame buffer depth for
+  3M-note passages. Both need the mix block decoupled from the device block
+  first, which means moving the render off the message thread; see the BPFA
+  comparison section above for why this is structural rather than a constant.
+- BPFA's MIDI loading path (`StreamingMidiParser`, `PreprocessedMidi`).
+- The note mesh tile cache and its worker pool.

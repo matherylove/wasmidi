@@ -19,7 +19,6 @@
 
 using namespace wasmidi;
 
-static Layering g_layering = Layering::LatestStartOnTop;
 static int g_fails = 0;
 #define CHECK(c, ...) do { if(!(c)){ std::printf("  FAIL: "); \
     std::printf(__VA_ARGS__); std::printf("\n"); ++g_fails; } } while(0)
@@ -73,17 +72,10 @@ static std::vector<Shown> Rasterize(const std::vector<CompositorNote>& notes,
         const std::uint32_t order = (std::uint32_t)i;
         for (int c = left; c < right; ++c) {
             Shown& cell = cells[(std::size_t)(pitch - s.firstKey) * w + c];
-            bool wins;
-            if (g_layering == Layering::ShortestOnTop) {
-                // GL_LESS on z = duration, instances in startTick order.
-                wins = cell.empty || (dur != cell.duration
-                    ? dur < cell.duration : order < cell.order);
-            } else {
-                // BPFA: later start on top, later source order breaks the tie.
-                wins = cell.empty ||
-                    (n.startTick != cell.start ? n.startTick >= cell.start
-                                               : order > cell.order);
-            }
+            // BPFA: later start on top, later source order breaks the tie.
+            const bool wins = cell.empty ||
+                (n.startTick != cell.start ? n.startTick >= cell.start
+                                           : order > cell.order);
             if (!wins) continue;
             cell.slot = (n.packedData >> 16) & 0x0f;
             cell.velocity = n.packedData & 0x7f;
@@ -99,7 +91,6 @@ static CompositorSettings MakeSettings(int w) {
     CompositorSettings s;
     s.startTick = 0; s.spanTicks = 3840; s.rasterWidth = w;
     s.firstKey = 0; s.keyCount = 128; s.viewEndTick = 3840;
-    s.layering = g_layering;
     return s;
 }
 static CompositorScratch g_scratch;
@@ -161,7 +152,7 @@ static int RunAll() {
         CHECK(r.notes.size() == 1, "open note was culled");
     }
 
-    std::printf("2. la nota corta gana la celda, como el depth test\n");
+    std::printf("2. la nota posterior gana la celda (regla BPFA)\n");
     {
         CompositorSettings s = MakeSettings(1920);
         std::vector<CompositorNote> notes = {
@@ -177,9 +168,7 @@ static int RunAll() {
             { 0u, 3840u, Pack(100, 61, 7) } };
         CullViewport(covered.data(), covered.size(), s, g_scratch, r);
         CHECK(r.notes.size() == 1, "an entirely hidden note survived");
-        const std::uint32_t expected = g_layering == Layering::ShortestOnTop
-            ? covered[0].packedData    // equal length keeps the earlier one
-            : covered[1].packedData;   // BPFA: later source order wins
+        const std::uint32_t expected = covered[1].packedData;  // later order wins
         CHECK(r.notes[0].packedData == expected,
             "the wrong note survived for this layering rule");
     }
@@ -234,11 +223,7 @@ static int RunAll() {
 }
 
 int main() {
-    std::printf("=== orden BPFA (gana la que empieza despues) ===\n");
-    g_layering = Layering::LatestStartOnTop;
-    RunAll();
-    std::printf("\n=== orden WASMIDI original (gana la mas corta) ===\n");
-    g_layering = Layering::ShortestOnTop;
+    std::printf("=== orden BPFA: gana la que empieza despues ===\n");
     RunAll();
     std::printf("\n%s (%d)\n", g_fails ? "FALLOS" : "TODO OK", g_fails);
     return g_fails ? 1 : 0;

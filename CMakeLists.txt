@@ -188,7 +188,12 @@ if(EMSCRIPTEN)
         "-sMODULARIZE=1"
         "-sEXPORT_NAME=SnappySynthCore"
         "-sENVIRONMENT=worker"
-        "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency"
+        # The render workers all come out of this pool. Sized exactly to the thread
+        # count it had no headroom for the module's own threads, so asking for as
+        # many workers as cores exhausted it, _beginthreadex returned 0, and the
+        # barrier waited on workers that were never created.
+        "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency + 8"
+        "-sPTHREAD_POOL_SIZE_STRICT=0"
         "-sALLOW_MEMORY_GROWTH=1"
         "-sINITIAL_MEMORY=268435456"
         "-sMAXIMUM_MEMORY=2147483648"

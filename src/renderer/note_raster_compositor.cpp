@@ -22,38 +22,6 @@ inline int PopCount64(std::uint64_t value) {
 #endif
 }
 
-// Stable LSD radix sort of note indices by duration ascending, 4 passes of 8
-// bits. Only needed for ShortestOnTop; LatestStartOnTop gets its front-to-back
-// order for free by walking the array backwards.
-void SortByDuration(const std::uint32_t* durations, std::size_t count,
-                    CompositorScratch& scratch) {
-    scratch.order.resize(count);
-    scratch.scratchOrder.resize(count);
-    for (std::size_t i = 0; i < count; ++i)
-        scratch.order[i] = static_cast<std::uint32_t>(i);
-    scratch.counts.resize(256);
-
-    std::uint32_t* from = scratch.order.data();
-    std::uint32_t* to = scratch.scratchOrder.data();
-    for (int shift = 0; shift < 32; shift += 8) {
-        std::memset(scratch.counts.data(), 0, 256 * sizeof(std::uint32_t));
-        for (std::size_t i = 0; i < count; ++i)
-            ++scratch.counts[(durations[from[i]] >> shift) & 0xffu];
-        std::uint32_t total = 0;
-        for (int bucket = 0; bucket < 256; ++bucket) {
-            const std::uint32_t here = scratch.counts[bucket];
-            scratch.counts[bucket] = total;
-            total += here;
-        }
-        for (std::size_t i = 0; i < count; ++i)
-            to[scratch.counts[(durations[from[i]] >> shift) & 0xffu]++] = from[i];
-        std::swap(from, to);
-    }
-    // Four passes is an even number, so the result is back in scratch.order.
-    if (from != scratch.order.data())
-        scratch.order.assign(from, from + count);
-}
-
 }  // namespace
 
 void CullViewport(
@@ -91,26 +59,11 @@ void CullViewport(
 
     std::vector<std::uint8_t> keep(noteCount, 0u);
 
-    // Front-to-back order. LatestStartOnTop is reverse index order and needs no
-    // sort at all; ShortestOnTop needs a duration sort first.
-    std::vector<std::uint32_t> durations;
-    const std::uint32_t* sorted = nullptr;
-    if (settings.layering == Layering::ShortestOnTop) {
-        durations.resize(noteCount);
-        for (std::size_t i = 0; i < noteCount; ++i) {
-            const std::int64_t s = notes[i].startTick;
-            const std::int64_t e = notes[i].endTick > 0u
-                ? static_cast<std::int64_t>(notes[i].endTick) : viewEnd;
-            durations[i] = static_cast<std::uint32_t>(
-                (std::max<std::int64_t>)(0, e - s));
-        }
-        SortByDuration(durations.data(), noteCount, scratch);
-        sorted = scratch.order.data();
-    }
-
+    // Reverse index order is front-to-back under BPFA's layering, since the
+    // array is sorted by startTick. No sort, and the first writer of a cell is
+    // final.
     for (std::size_t step = 0; step < noteCount; ++step) {
-        const std::size_t index =
-            sorted ? sorted[step] : (noteCount - 1u - step);
+        const std::size_t index = noteCount - 1u - step;
         const CompositorNote& note = notes[index];
 
         const int pitch = static_cast<int>((note.packedData >> 8) & 0xffu);

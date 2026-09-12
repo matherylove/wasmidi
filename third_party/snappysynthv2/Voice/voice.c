@@ -5329,7 +5329,28 @@ validate_worker_state("post_compact", widx, wd);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 }
 
-                                                                                                                                                                                                                                                                static void setup_workers(int desired) {
+                                                                                                                                                                                                                                                                static int g_worker_thread_failures;
+
+/*
+ * If the thread pool ran dry, the surviving workers are 0..g_worker_count-1 but
+ * the routing maps were built for the count that was requested. Fold the dead
+ * entries onto live workers so no note is routed into a thread that does not
+ * exist, and resize the freelist batch for the count actually running.
+ */
+static void repair_worker_maps_after_thread_failure(void) {
+    if (g_worker_thread_failures <= 0 || g_worker_count <= 0)
+        return;
+    for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
+        g_channel_worker_map[ch] =
+            (unsigned char)(g_channel_worker_map[ch] % g_worker_count);
+        for (int key = 0; key < MIDI_KEY_COUNT; ++key)
+            g_note_worker_map[ch][key] =
+                (unsigned char)(g_note_worker_map[ch][key] % g_worker_count);
+    }
+    update_worker_freelist_refill(g_worker_count);
+}
+
+static void setup_workers(int desired) {
 if (desired <= 0) {
 SYSTEM_INFO si;
 GetSystemInfo(&si);
@@ -5419,6 +5440,20 @@ g_worker_count = desired;
                                                                                                                                                                                                                                                                 g_done_events[w]  = CreateEvent(NULL, FALSE, FALSE, NULL);
 
                                                                                                                                                                                                                                                                 uintptr_t th = _beginthreadex(NULL, 0, worker_thread, (void*)(intptr_t)w, 0, NULL);
+/*
+ * The return value used to be ignored. Under Emscripten a worker thread comes
+ * out of the fixed PTHREAD_POOL_SIZE pool, so once the pool is exhausted this
+ * fails and leaves g_threads[w] null while g_worker_count still claims the
+ * worker exists. Every render then signals its start event and waits for a
+ * done event that can never arrive, until the emergency escape wait expires,
+ * and the voices g_note_worker_map routes there are simply dead. That reads as
+ * "the synth ignores the worker count I asked for" plus large periodic stalls.
+ */
+if (!th) {
+g_worker_thread_failures += (g_worker_count - w);
+g_worker_count = w;
+break;
+}
                                                                                                                                                                                                                                                                 g_threads[w] = (HANDLE)th;
                                                                                                                                                                                                                                                                 SetThreadPriority(g_threads[w], g_audio.realtime_priority ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
                                                                                                                                                                                                                                                                 }
@@ -5818,6 +5853,7 @@ if (desired < 1) desired = 1; if (desired > cores) desired = cores;
 if (desired > max_voices) desired = max_voices;
 update_worker_freelist_refill(desired);
 setup_workers(desired);
+repair_worker_maps_after_thread_failure();
 
                                                                                                                                                                                                                                                                 // Seed freelists
                                                                                                                                                                                                                                                                 seed_worker_freelists();
