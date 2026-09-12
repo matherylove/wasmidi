@@ -19,6 +19,10 @@ static int64_t g_render_cursor = 1;
  * 1 == exactly the native engine's behaviour (state applied at block start). */
 static int    g_render_budget = 1;
 static double g_render_load_ema = -1.0;
+/* Cost of the most recent block, in microseconds of wall clock. Together with
+ * the load EMA this separates "out of CPU" from "out of data": both produce
+ * underruns and they need opposite fixes. */
+static double g_last_render_us = 0.0;
 static int g_ready = 0;
 static int g_max_voices = 16384;
 static int g_min_voices = 0;
@@ -997,7 +1001,11 @@ events_done:
         (double)g_song_frame /
         (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
 
-    ssw_update_render_budget(ssw_now_ms() - started_ms, frames);
+    {
+        const double elapsed_ms = ssw_now_ms() - started_ms;
+        g_last_render_us = elapsed_ms * 1000.0;
+        ssw_update_render_budget(elapsed_ms, frames);
+    }
     return 1;
 }
 
@@ -1016,6 +1024,20 @@ int ssw_bits_per_sample(void) { return g_cfg.bits_per_sample; }
 int ssw_num_buffers(void) { return g_cfg.num_buffers; }
 int ssw_worker_count(void) { return voice_get_worker_count(); }
 int ssw_worker_thread_failures(void) { return voice_get_worker_thread_failures(); }
+
+/*
+ * Render load as a fraction of the block's own realtime budget, times 1000.
+ * 1000 means a block took exactly as long to render as it lasts, so the synth
+ * is at the edge of what the CPU can do. Well under 1000 while underruns are
+ * climbing means the renderer is not being asked to run often enough, which is
+ * a scheduling problem rather than a throughput one.
+ */
+int ssw_render_load_x1000(void) {
+    const double load = g_render_load_ema < 0.0 ? 0.0 : g_render_load_ema;
+    return (int)(load * 1000.0 + 0.5);
+}
+int ssw_last_render_us(void) { return (int)(g_last_render_us + 0.5); }
+int ssw_render_budget(void) { return g_render_budget; }
 int ssw_detected_cores(void) { return voice_get_detected_cores(); }
 
 void ssw_shutdown(void) {

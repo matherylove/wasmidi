@@ -212,6 +212,46 @@ function reportWorkerPool() {
     }
 }
 
+/*
+ * Periodic telemetry. Underruns alone cannot say whether the synth ran out of
+ * CPU or ran out of scheduling opportunities, and those need opposite fixes:
+ *
+ *   load near or above 1000  -> genuinely CPU bound in the DSP
+ *   load well below 1000 while underruns climb -> the renderer is not being
+ *                               run often enough, or the ring is drained faster
+ *                               than pump() is invited to refill it
+ *
+ * Ring fill tells them apart from the other side: a ring sitting near full with
+ * rising underruns points at the worklet side, near empty points at the render
+ * side.
+ */
+let telemetryLastMs = 0;
+
+function reportTelemetry(ringFillFraction, blocksThisPump) {
+    if (!coreReady || !Module)
+        return;
+    const now =
+        typeof performance !== "undefined" && performance.now
+            ? performance.now()
+            : Date.now();
+    if (now - telemetryLastMs < 2000)
+        return;
+    telemetryLastMs = now;
+
+    const load = Module._ssw_render_load_x1000();
+    const lastUs = Module._ssw_last_render_us();
+    const budget = Module._ssw_render_budget();
+
+    console.log(
+        "[snappysynth] carga " + (load / 10).toFixed(1) + "%" +
+        "  ultimo bloque " + (lastUs / 1000).toFixed(2) + " ms" +
+        "  presupuesto " + budget +
+        "  ring " + Math.round(ringFillFraction * 100) + "%" +
+        "  bloques/pump " + blocksThisPump +
+        "  voces " + Module._ssw_active_voices() +
+        "  workers " + Module._ssw_worker_count());
+}
+
 function resetStealRate() {
     stealRatePerSecond = 0;
     stealRateHasBaseline = false;
@@ -764,6 +804,16 @@ function pump() {
                 break;
 
             produced += frames;
+        }
+
+        if (header) {
+            const availableNow =
+                Math.max(0, Atomics.load(header, RING_AVAILABLE));
+            reportTelemetry(
+                audioRingCapacityFrames > 0
+                    ? availableNow / audioRingCapacityFrames
+                    : 0,
+                Math.floor(produced / Math.max(1, blockFrames)));
         }
 
         if (produced > 0) {
