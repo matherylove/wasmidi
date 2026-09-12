@@ -1007,7 +1007,7 @@ Item {
                                 text = String(root.mainWindow.synthWorkers)
                             }
                             ToolTip.visible: hovered
-                            ToolTip.text: "0 = every logical CPU thread. Any other value sets the thread count directly. The voice pool is divided across the workers, and a worker can only steal voices it owns, so a small pool spread over many threads starts stealing earlier than a shared pool would. Watch VOICES/WKR and STEALS/s together."
+                            ToolTip.text: "0 = every logical thread the browser reports. Brave and some others under-report this for fingerprinting defence, so 0 can give far fewer workers than the CPU has; set the count explicitly and it wins over the reported value. The voice pool is divided across the workers, and a worker can only steal voices it owns, so a small pool over many threads starts stealing earlier. Watch VOICES/WKR and STEALS/s together."
                         }
 
                         Item { Layout.fillWidth: true }

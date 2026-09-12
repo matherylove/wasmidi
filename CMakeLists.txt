@@ -188,11 +188,13 @@ if(EMSCRIPTEN)
         "-sMODULARIZE=1"
         "-sEXPORT_NAME=SnappySynthCore"
         "-sENVIRONMENT=worker"
-        # The render workers all come out of this pool. Sized exactly to the thread
-        # count it had no headroom for the module's own threads, so asking for as
-        # many workers as cores exhausted it, _beginthreadex returned 0, and the
-        # barrier waited on workers that were never created.
-        "-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency + 8"
+        # The render workers all come out of this pool, and it must not be sized
+        # from navigator.hardwareConcurrency. Brave farbles that value down for
+        # fingerprinting defence (a 24-thread machine reports 7), so sizing the
+        # pool from it would cap the worker count the user explicitly asked for.
+        # Use a floor that covers a high explicit request. Idle pooled workers
+        # cost a Worker each but no CPU.
+        "-sPTHREAD_POOL_SIZE=Math.max((navigator.hardwareConcurrency || 4) + 8, 34)"
         "-sPTHREAD_POOL_SIZE_STRICT=0"
         "-sALLOW_MEMORY_GROWTH=1"
         "-sINITIAL_MEMORY=268435456"

@@ -533,6 +533,23 @@ This was found by reading, not by running: there is no emsdk here, so the
 browser behaviour is unverified. `voice.c` does compile clean standalone with
 `gcc -fsyntax-only -I. -DSNAPPYSYNTH_WASM=1 Voice/voice.c`.
 
+### The actual cause of a low worker count
+
+The diagnostics added for this (`ssw_detected_cores()`,
+`ssw_worker_thread_failures()`, reported by `reportWorkerPool()` in the synth
+worker) showed zero creation failures and a detected core count of 7 on a
+24-thread CPU. Brave farbles `navigator.hardwareConcurrency` as a
+fingerprinting defence, and `if (desired > cores) desired = cores;` was then
+silently cutting an explicit request for 24 workers down to 7.
+
+Clamping to the detected count is right when that count is real and wrong when
+the browser refuses to report it, so an explicit request now wins: the user can
+see their own CPU and the engine cannot. The automatic policy (`Workers = 0`)
+stays bounded by what was detected, since it has nothing better to go on.
+
+For the same reason `PTHREAD_POOL_SIZE` must not be derived from
+`hardwareConcurrency` alone; it now has a floor of 34.
+
 ## Not done in this pass
 
 - BPFA's audio ring buffer for SnappySynthV2, and the frame buffer depth for

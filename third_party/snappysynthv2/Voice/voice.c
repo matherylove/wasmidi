@@ -5813,10 +5813,12 @@ cs->applied_bank_lsb = 0;
 
                                                                                                                                                                                                                                                                 // Workers
 int cores = get_cpu_cores();
+int workers_requested_explicitly = 0;
 int desired = (VOICE_WORKER_COUNT > 0) ? VOICE_WORKER_COUNT : (cores > 0 ? cores : 1);
 {
 const char *workers_env = getenv("SS_WORKERS");
 if (workers_env && workers_env[0]) {
+workers_requested_explicitly = 1;
 int requested = atoi(workers_env);
 if (requested > 0) desired = requested;
 }
@@ -5849,7 +5851,19 @@ desired = 1;
 }
 #endif
 }
-if (desired < 1) desired = 1; if (desired > cores) desired = cores;
+if (desired < 1) desired = 1;
+/*
+ * Clamping to the detected core count is right when that count is real, and
+ * wrong when the browser refuses to report it. Brave's fingerprinting defence
+ * farbles navigator.hardwareConcurrency down to a small value, so a machine
+ * with 24 threads reports 7 and an explicit request for 24 workers silently
+ * became 7. Other browsers cap it too, and inside a Worker it is not
+ * guaranteed to be the host CPU on every platform.
+ *
+ * So an explicit request wins: the user can see their own CPU and the engine
+ * cannot. Only the automatic policy stays bounded by what was detected.
+ */
+if (!workers_requested_explicitly && desired > cores) desired = cores;
 if (desired > max_voices) desired = max_voices;
 update_worker_freelist_refill(desired);
 setup_workers(desired);
