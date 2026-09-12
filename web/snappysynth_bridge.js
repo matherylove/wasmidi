@@ -25,8 +25,6 @@
 
         // SnappySynth.cfg / source-exposed settings.
         maxVoices: 16384,
-        totalVoices: 16384,
-        voicesPerWorker: 0,
         minVoices: 0,
         blockFrames: 512,
         numBuffers: 16,
@@ -344,12 +342,6 @@
 
                     if (Number.isFinite(data.maxVoices))
                         state.maxVoices = Math.max(1, Math.round(data.maxVoices));
-                    // Derived pool size, reported separately from the stored
-                    // setting so it can never be fed back into `maxVoices`.
-                    if (Number.isFinite(data.totalVoices))
-                        state.totalVoices = Math.max(1, Math.round(data.totalVoices));
-                    if (Number.isFinite(data.voicesPerWorker))
-                        state.voicesPerWorker = Math.max(0, Math.round(data.voicesPerWorker));
                     if (Number.isFinite(data.minVoices))
                         state.minVoices = Math.max(0, Math.round(data.minVoices));
                     if (Number.isFinite(data.blockFrames))

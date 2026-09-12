@@ -1,0 +1,117 @@
+#pragma once
+
+// Viewport occlusion culling for the horizontal piano roll, derived from BPFA's
+// NoteMeshCache compositor (linux/NoteMeshCache.cpp).
+//
+// The piano roll submits one GPU instance per visible note, so cost scales with
+// how many notes are inside the viewport. A crashpoint puts hundreds of
+// thousands of notes on screen, nearly all of them narrower than a pixel and
+// completely hidden behind others.
+//
+// BPFA composes the viewport into a raster so its work is bounded by visible
+// keys times pixels rather than by note count. This takes that idea but stops
+// short of BPFA's geometry emission, deliberately: BPFA bakes borders, velocity
+// shading and sharp/natural key widths into vertices, while WASMIDI's shader
+// draws a flat palette colour with no border, applies opacity of
+// (velocity + 1) / 128, and brightens the sounding note. Emitting BPFA's
+// geometry would change how WASMIDI looks.
+//
+// So the output is notes, not triangles: the same VisualNote layout, the same
+// instanced draw, the same shader, palette, glow and opacity, with only the
+// hidden notes removed.
+//
+// Free of Qt, GL and engine headers so it can be tested on the host.
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace wasmidi {
+
+// Mirrors VisualNote in src/midi/midi_parser.hpp.
+struct CompositorNote {
+    std::uint32_t startTick = 0;
+    std::uint32_t endTick = 0;
+    std::uint32_t packedData = 0;
+};
+
+// Which note wins a pixel both notes cover.
+enum class Layering {
+    // BPFA's rule, from NoteMeshCache's Composer::Add: the note that starts
+    // later is on top, and on an equal start the later source order wins.
+    // Reverse iteration then makes the first writer final, which needs nothing
+    // per cell but an occupied bit. It is also the faster of the two.
+    LatestStartOnTop,
+    // WASMIDI's original rule. The note shader writes
+    // z = (endTick - startTick) / 16777216 and the depth test is GL_LESS, so a
+    // SHORTER note is on top, and an equal-length note submitted earlier keeps
+    // the pixel. Requires ordering by duration first, so it costs more.
+    ShortestOnTop
+};
+
+// Which nibble of VisualNote::packedData holds the palette slot.
+//
+// BPFA selects colour as tracks->channelColors[track * 16 + channel], falling
+// back to primary[channel & 15]. WASMIDI makes the same distinction when it
+// packs the note stream rather than in the shader: bits 16..19 carry the
+// global/channel slot and bits 20..23 the per-track slot, and gl_renderer.cpp
+// repacks the stream when perTrackColors_ changes. The shader's uPerTrack
+// uniform is vestigial; it is set but never read, so the choice below only
+// needs to agree with whichever stream the renderer built.
+enum class ColorSource {
+    GlobalChannel,  // bits 16..19, BPFA's primary[channel & 15]
+    PerTrack        // bits 20..23, BPFA's channelColors[track * 16 + channel]
+};
+
+inline std::uint32_t SelectColorSlot(std::uint32_t packedData,
+                                     ColorSource source) {
+    return source == ColorSource::PerTrack
+        ? ((packedData >> 20) & 0x0fu)
+        : ((packedData >> 16) & 0x0fu);
+}
+
+struct CompositorSettings {
+    std::uint32_t startTick = 0;
+    std::uint32_t spanTicks = 1;
+    // Raster resolution along the time axis. Matching the framebuffer width
+    // makes a cell exactly one pixel column, the point at which discarding a
+    // note cannot change a rendered pixel.
+    int rasterWidth = 1920;
+    int firstKey = 0;
+    int keyCount = 128;
+    // An open note (endTick == 0) is drawn to the right edge of the viewport,
+    // matching the shader's `aEndTick > 0u ? aEndTick : uViewEnd`.
+    std::uint32_t viewEndTick = 0;
+    Layering layering = Layering::LatestStartOnTop;
+};
+
+struct CompositorResult {
+    // Survivors, still sorted by startTick ascending, so the caller submits
+    // them in ring order exactly as before.
+    std::vector<CompositorNote> notes;
+    std::uint64_t visitedNotes = 0;
+    std::uint64_t culledNotes = 0;
+    // Notes rejected by the O(1) full-row test rather than by scanning cells.
+    std::uint64_t rejectedByFullRow = 0;
+};
+
+// Scratch buffers, reused across viewports so a per-frame or per-tile cull does
+// not reallocate. Safe to keep one per worker thread.
+struct CompositorScratch {
+    std::vector<std::uint64_t> occupancy;
+    std::vector<std::uint32_t> uncovered;
+    std::vector<std::uint32_t> order;
+    std::vector<std::uint32_t> scratchOrder;
+    std::vector<std::uint32_t> counts;
+};
+
+// Culls notes that cannot contribute a pixel. `notes` must be sorted by
+// startTick ascending, which is how the parser emits them.
+void CullViewport(
+    const CompositorNote* notes,
+    std::size_t noteCount,
+    const CompositorSettings& settings,
+    CompositorScratch& scratch,
+    CompositorResult& out);
+
+}  // namespace wasmidi

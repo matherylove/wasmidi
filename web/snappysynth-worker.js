@@ -86,8 +86,7 @@ function postState(type, extra = {}) {
             coreReady && Module ? Module._ssw_active_voices() : 0,
         freeVoices:
             coreReady && Module ? Module._ssw_free_voices() : 0,
-        steals:
-            coreReady && Module ? Module._ssw_steals() : 0,
+        steals: sampleStealRate(),
         layers:
             coreReady && Module ? Module._ssw_layer_count() : 0,
         regions:
@@ -175,6 +174,66 @@ function publishAudioRing(force = false) {
         channels: synthChannels,
         blockFrames
     });
+}
+
+/*
+ * Steals are reported as a rate, not a running total.
+ *
+ * ssw_steals() is cumulative, which makes it useless for telling "the pool is
+ * saturated right now" from "something stole a lot two minutes ago". A rate
+ * reads zero while playback is healthy and rises the moment the pool cannot
+ * keep up, which is what the number is actually consulted for.
+ */
+let stealRatePerSecond = 0;
+let stealRateHasBaseline = false;
+let lastStealCount = 0;
+let lastStealSampleMs = 0;
+
+function resetStealRate() {
+    stealRatePerSecond = 0;
+    stealRateHasBaseline = false;
+    lastStealCount = 0;
+    lastStealSampleMs = 0;
+}
+
+function sampleStealRate() {
+    if (!coreReady || !Module)
+        return 0;
+
+    const now =
+        typeof performance !== "undefined" && performance.now
+            ? performance.now()
+            : Date.now();
+    const total = Module._ssw_steals();
+
+    if (!stealRateHasBaseline) {
+        stealRateHasBaseline = true;
+        lastStealCount = total;
+        lastStealSampleMs = now;
+        return 0;
+    }
+
+    const elapsedMs = now - lastStealSampleMs;
+    // Stats arrive every 250 ms, but postState() is also called for unrelated
+    // events. Ignore samples too short to carry a meaningful rate and reuse the
+    // last one instead of dividing by a near-zero interval.
+    if (elapsedMs < 100)
+        return Math.round(stealRatePerSecond);
+
+    // A reinit or reset restarts the engine counter; never report a negative.
+    let delta = total - lastStealCount;
+    if (delta < 0)
+        delta = 0;
+
+    const instant = (delta * 1000) / elapsedMs;
+    // Light smoothing so the readout is legible rather than flickering.
+    stealRatePerSecond += 0.4 * (instant - stealRatePerSecond);
+    if (stealRatePerSecond < 0.5)
+        stealRatePerSecond = 0;
+
+    lastStealCount = total;
+    lastStealSampleMs = now;
+    return Math.round(stealRatePerSecond);
 }
 
 function preferredRenderFrames() {
@@ -360,58 +419,11 @@ function applyCoreSettings() {
     Module._ssw_set_vor_mode(vorMode);
 }
 
-// WORKER_FREELIST_REFILL in voice.c: a worker takes this many voices at a time
-// from the global pool, and it can only steal voices it owns. A worker that
-// never gets one batch is dead weight, so this is the smallest per-worker value
-// that actually does anything.
-const VOICES_PER_WORKER_MIN = 512;
-// Matches the Voices field's own maxValue, so the UI and the worker agree on
-// the derived pool size and this clamp effectively never binds.
-const VOICE_POOL_CEILING = 5000000;
-
-/*
- * Voice pool sizing.
- *
- * With Workers = 0 the engine owns the policy and `maxVoices` is the total pool,
- * exactly as before.
- *
- * With an explicit Workers count, `maxVoices` means voices PER WORKER and the
- * pool is sized from it. Sizing the pool this way removes a configuration that
- * could not work: the voice pool is shared and handed out in 512-voice batches,
- * so asking for more workers than the pool can seed leaves the surplus workers
- * with nothing to allocate or steal, and the notes routed to them are lost. It
- * also matches how the cost actually behaves -- render time scales with ACTIVE
- * voices, not with the cap, so a pool sized for the thread count costs nothing
- * until the music genuinely uses it.
- */
-function resolveVoicePool() {
-    if (requestedWorkers <= 0) {
-        return {
-            total: maxVoices,
-            perWorker: 0,
-            workers: 0
-        };
-    }
-
-    const perWorker = Math.max(1, maxVoices);
-    const total = Math.min(
-        VOICE_POOL_CEILING,
-        perWorker * requestedWorkers);
-
-    return {
-        total,
-        perWorker,
-        workers: requestedWorkers
-    };
-}
-
-let voicePool = { total: 16384, perWorker: 0, workers: 0 };
-
 function initCore() {
     if (!Module)
         return;
 
-    voicePool = resolveVoicePool();
+    resetStealRate();
 
     Module._ssw_init_ex(
         sampleRateHz,
@@ -420,7 +432,7 @@ function initCore() {
         blockFrames,
         numBuffers,
         realtimePriority,
-        voicePool.total,
+        maxVoices,
         minVoices,
         requestedWorkers,
         noteSharding,
@@ -451,12 +463,6 @@ function reinitializeCore() {
 
     postState("configured", {
         maxVoices,
-        // Derived pool size. Reported under its own key: the bridge feeds
-        // `maxVoices` straight back into the stored setting, so publishing the
-        // product there would multiply it again on every reconfigure.
-        totalVoices: voicePool.total,
-        voicesPerWorker: voicePool.perWorker,
-        voicesPerWorkerMin: VOICES_PER_WORKER_MIN,
         minVoices,
         blockFrames,
         numBuffers,
@@ -948,6 +954,7 @@ onmessage = async event => {
 
             if (data.reset) {
                 Module._ssw_reset();
+            resetStealRate();
                 renderSongTime = time;
                 Module._ssw_set_song_time(renderSongTime);
                 resetAudioRing();
@@ -976,6 +983,7 @@ onmessage = async event => {
                     Number(data.time) || 0.0);
 
             Module._ssw_reset();
+            resetStealRate();
             renderSongTime = time;
             Module._ssw_set_song_time(renderSongTime);
             resetAudioRing();
@@ -988,6 +996,7 @@ onmessage = async event => {
         if (data.type === "stop") {
             playing = false;
             Module._ssw_reset();
+            resetStealRate();
             renderSongTime = 0.0;
             Module._ssw_set_song_time(0.0);
             resetAudioRing();
@@ -1223,9 +1232,6 @@ SnappySynthCore({
     postState("ready", {
         ready: true,
         maxVoices,
-        totalVoices: voicePool.total,
-        voicesPerWorker: voicePool.perWorker,
-        voicesPerWorkerMin: VOICES_PER_WORKER_MIN,
         minVoices,
         blockFrames,
         numBuffers,

@@ -2483,8 +2483,30 @@ static inline int releasepool_take(worker_data *wd, float incoming_x08, int inco
                                                                                                                                                                                                                                                                 // Bulk-drain global CAS pool into worker-local freelist.
                                                                                                                                                                                                                                                                 // Amortises the serialising CAS cost across 512 note-ons instead of 1.
 #define WORKER_FREELIST_REFILL 512
+/*
+ * free_push() returns a voice to the worker's LOCAL stack, never to the global
+ * pool, so whatever a worker drains it keeps. With a fixed 512-voice batch the
+ * first workers to ask take the entire pool and the rest are left with nothing
+ * to allocate and nothing of their own to steal, which silently drops every
+ * note routed to them by g_note_worker_map.
+ *
+ * The batch is therefore a fair share: half of max_voices/worker_count, so a
+ * worker can refill twice inside its share and the sum across workers cannot
+ * exceed the pool. It only drops below 512 when the pool could not have seeded
+ * every worker anyway, so the usual high-cap configurations are unchanged.
+ */
+static int g_worker_freelist_refill = WORKER_FREELIST_REFILL;
+static void update_worker_freelist_refill(int workers) {
+    int share;
+    if (workers < 1) workers = 1;
+    share = max_voices / (workers * 2);
+    if (share > WORKER_FREELIST_REFILL) share = WORKER_FREELIST_REFILL;
+    if (share < 1) share = 1;
+    g_worker_freelist_refill = share;
+}
                                                                                                                                                                                                                                                                  static void refill_worker_freelist(worker_data *wd) {
-                                                                                                                                                                                                                                                                int want = WORKER_FREELIST_REFILL;
+                                                                                                                                                                                                                                                                int want = g_worker_freelist_refill;
+if (want < 1) want = 1;
                                                                                                                                                                                                                                                                 free_reserve(wd, wd->free_top + 1 + want);
                                                                                                                                                                                                                                                                 int got = 0;
                                                                                                                                                                                                                                                                 while (got < want) {
@@ -5768,20 +5790,23 @@ else {
 desired = 1;
 }
 #elif defined(__EMSCRIPTEN__)
-else if (max_voices <= STEAL_SHARED_POOL_VOICES) {
-desired = 1;
+/*
+ * The browser build sizes the worker pool from the hardware thread count and
+ * divides the voice pool across it, which is what the UI offers. The native
+ * STEAL_SHARED_POOL_VOICES rule collapsed to one worker at low caps to stop a
+ * fixed 512-voice refill batch from starving workers; the adaptive batch in
+ * update_worker_freelist_refill() removes that reason.
+ *
+ * A worker still steals only voices it owns, so dividing a small pool across
+ * many workers makes stealing start earlier than a shared pool would: a hot
+ * worker exhausts its share while other workers still hold free voices. Size
+ * the pool for the thread count rather than trimming the thread count.
+ */
+else if (cores > 0) {
+desired = cores;
 }
 else {
-/*
- * Native Win32 event objects scale well to every logical CPU. Browser pthread
- * events are futex/Worker messages, so waking 16+ workers for a few thousand
- * voices costs more than those workers save. Scale gradually with the voice
- * cap and stop at eight by default. Explicit SS_WORKERS remains authoritative.
- */
-int wasm_voice_workers = (max_voices + 1023) / 1024;
-if (wasm_voice_workers < 2) wasm_voice_workers = 2;
-if (wasm_voice_workers > 16) wasm_voice_workers = 16;
-if (desired > wasm_voice_workers) desired = wasm_voice_workers;
+desired = 1;
 }
 #else
 else if (max_voices <= STEAL_SHARED_POOL_VOICES) {
@@ -5789,31 +5814,9 @@ desired = 1;
 }
 #endif
 }
-#ifdef __EMSCRIPTEN__
-/*
- * Browser-only seeding guard.
- *
- * refill_worker_freelist() moves WORKER_FREELIST_REFILL (512) voices at a time
- * from the global pool into a worker's local free stack, and a worker may only
- * steal voices it owns. Asking for more workers than the pool can seed leaves
- * the surplus workers with zero voices: they can neither allocate nor steal, so
- * every note that g_note_worker_map routes to them is dropped or forces a steal
- * elsewhere. At a 1024-voice cap with 24 requested workers, two workers take the
- * whole pool and the other 22 are dead, which sounds like the stealer eating the
- * melody on completely sparse material.
- *
- * The automatic policy avoids this through STEAL_SHARED_POOL_VOICES, but an
- * explicit SS_WORKERS request bypasses that branch and the browser UI exposes
- * exactly that control. Clamp so every worker can be seeded at least once.
- * Native builds are untouched.
- */
-{
-    int seedable = max_voices / WORKER_FREELIST_REFILL;
-    if (seedable < 1) seedable = 1;
-    if (desired > seedable) desired = seedable;
-}
-#endif
 if (desired < 1) desired = 1; if (desired > cores) desired = cores;
+if (desired > max_voices) desired = max_voices;
+update_worker_freelist_refill(desired);
 setup_workers(desired);
 
                                                                                                                                                                                                                                                                 // Seed freelists

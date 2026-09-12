@@ -367,64 +367,154 @@ it saves on a given machine.
 
 ## Worker count and the voice pool
 
-`WORKER_FREELIST_REFILL` is 512: `refill_worker_freelist()` moves 512 voices at a
-time from the global pool into a worker's local free stack, and a worker may only
-steal voices it owns. Requesting more workers than the pool can seed leaves the
-surplus workers with no voices at all. They can neither allocate nor steal, so
-every note `g_note_worker_map` routes to them is lost. At a 1024-voice cap with
-24 requested workers, two workers take the whole pool and the other 22 are dead.
+`free_push()` returns a voice to the worker's LOCAL free stack, never to the
+global pool, so whatever a worker drains it keeps for the rest of the session.
+With a fixed `WORKER_FREELIST_REFILL` of 512 the first workers to ask took the
+entire pool: at 1024 voices across 24 workers, 22 workers ended up owning zero
+voices. A worker with no voices can neither allocate nor steal (it only steals
+its own), so every note `g_note_worker_map` routed to it was silently dropped.
+That presents as melodic notes vanishing on sparse material, with the stats
+panel pinned at capacity and a huge steal count. It is not a stealer bug.
 
-The audible result is melodic notes vanishing on completely sparse material,
-with the stats panel showing the pool pinned at capacity (e.g. ACTIVE 1020 /
-FREE 4) and a huge steal count. It looks like a stealer bug and is not one.
+The batch is now a fair share, `max_voices / (workers * 2)`, capped at 512. A
+worker can refill twice inside its share and the sum across workers cannot
+exceed the pool. It only drops below 512 where the pool could never have seeded
+every worker, so 8192 voices over 8 workers and 16384 over 16 are unchanged.
 
-The automatic policy already avoided this through `STEAL_SHARED_POOL_VOICES`
-(1 worker at 2048 voices or fewer, matching native), but an explicit `SS_WORKERS`
-request bypasses that branch and the browser UI exposes exactly that control.
-`voice.c` now clamps the browser worker count to `max_voices /
-WORKER_FREELIST_REFILL`. Native builds are untouched. The browser automatic
-ceiling also went from 8 to 16, which changes nothing at 8192 voices or below.
+    cc -O1 -o /tmp/share tools/worker_freelist_share_check.c && /tmp/share
 
-Resulting worker counts on a 24-thread CPU:
+With that in place the browser policy is what the UI advertises: `Workers = 0`
+uses every logical thread, any other value sets the thread count, and the Voices
+field is the total pool divided across them.
 
-| Voices | Workers = 0 (auto) | Workers = 24 (manual) |
-|--------|--------------------|-----------------------|
-| 1024   | 1                  | 2                     |
-| 2048   | 1                  | 4                     |
-| 4096   | 4                  | 8                     |
-| 8192   | 8                  | 16                    |
-| 16384  | 16                 | 24                    |
+A worker still steals only voices it owns, so dividing a small pool across many
+threads makes stealing start EARLIER than a shared pool would: a hot worker
+exhausts its share while other workers still hold free voices. This is the
+trade-off the native `STEAL_SHARED_POOL_VOICES` rule avoided by collapsing to
+one worker at low caps. Size the pool for the thread count rather than trimming
+the thread count, and watch `VOICES/WKR` against `STEALS/s`.
 
-A very low voice cap is not a way to reduce CPU load here. Render cost scales
-with ACTIVE voices, not with the cap, so the cap only decides how much memory is
-reserved and when stealing starts. Lowering it saturates the pool, forces
-constant stealing, and costs melodic notes. Raise it and let the load governor in
-`ssw_render_queued_into()` handle the render cost instead.
+Render cost scales with ACTIVE voices, not with the cap, so the cap only decides
+how much memory is reserved and when stealing starts. Lowering it to save CPU
+backfires.
 
-### Voices per worker
+## Steal rate rather than steal total
 
-Because of the above, the browser UI sizes the pool from the thread count rather
-than splitting a fixed pool among threads:
+`ssw_steals()` is cumulative, which cannot distinguish "the pool is saturated
+right now" from "something stole a lot two minutes ago". `sampleStealRate()` in
+`web/snappysynth-worker.js` converts it to steals per second, lightly smoothed,
+with the baseline reset on every `initCore()` and `_ssw_reset()` so a counter
+restart never reports a negative rate. The UI reads `STEALS/s`.
 
-- `Workers = 0`: unchanged. The engine owns the policy and the Voices field is
-  the total pool.
-- `Workers = N`: N is the thread count, and the Voices field means voices PER
-  WORKER. The pool becomes `N * voicesPerWorker`.
+## BPFA comparison: surveyed, not yet ported
 
-This makes the broken configuration unexpressible rather than merely guarded
-against. Use 512 or more per worker, since that is `WORKER_FREELIST_REFILL` and
-a worker that never receives one batch can neither allocate nor steal.
+BPFA's `SynthAudio.cpp` drives SnappySynthV2 with a mix block decoupled from the
+device block:
 
-The derivation lives in `resolveVoicePool()` in `web/snappysynth-worker.js`. It
-is reported to the bridge as `totalVoices`, never as `maxVoices`: the bridge
-feeds `configured.maxVoices` straight back into the stored setting, so
-publishing the product there would multiply it again on every reconfigure. The
-QML `POOL` readout derives the same value from existing properties, so no new
-C++ property was needed, and `ACTIVE + FREE` cross-checks it against the engine.
+    constexpr int DeviceBlockFrames    = 1024;   // WinMM, responsiveness/seek
+    constexpr int SnappyMixBlockFrames = 8192;   // synth render
+    constexpr int DeviceBufferCount    = 8;
 
-Policy check, no toolchain required:
+with the rationale that larger blocks amortize worker barriers while the smaller
+device buffers keep playback and seek responsive. WASMIDI currently uses one
+`blockFrames` for both, so at Block 1024 it pays eight times BPFA's barrier and
+render-queue-rebuild overhead.
 
-    node tools/voice_pool_policy_check.mjs
+This is NOT a constant to change. `preferredRenderFrames()` already carries a
+note that browser mega-blocks were tried and reverted because a single long
+synchronous render starved control/event delivery. The reason is structural:
+BPFA renders on a dedicated thread with a ring between it and the device, while
+WASMIDI's `pump()` runs on the same worker that receives `scheduleBatch`, so a
+long render blocks message delivery. Porting the BPFA block sizing requires
+moving the render off the message thread first, or proving the scheduler
+lookahead always covers a full mix block. Neither has been done or measured.
 
-It pairs the JS sizing rule against the C worker-count policy and asserts that
-every worker can be seeded and that an explicit thread count is honoured.
+`FramePipe.cpp` is offline video export to an FFmpeg child process and does not
+apply to the browser at all. `StreamingMidiParser` and `PreprocessedMidi` are
+loading-path work that has not been reviewed yet.
+
+## Viewport occlusion culling
+
+`src/renderer/note_raster_compositor.{hpp,cpp}` takes BPFA's idea from
+`linux/NoteMeshCache.cpp` -- compose the viewport into a raster so work is
+bounded by visible keys times pixels rather than note count -- but stops short
+of BPFA's geometry emission. BPFA bakes borders, velocity shading and
+sharp/natural key widths into vertices; WASMIDI's shader draws a flat palette
+colour with no border, opacity of (velocity + 1) / 128, and brightens the
+sounding note. Emitting BPFA's geometry would change how WASMIDI looks, so the
+output is notes, not triangles: same VisualNote layout, same instanced draw,
+same shader and palette, with only hidden notes removed.
+
+### Layering
+
+`Layering` selects which note wins a shared pixel.
+
+- `LatestStartOnTop` is BPFA's rule from `Composer::Add`: later start on top,
+  later source order breaks a tie.
+- `ShortestOnTop` is WASMIDI's original rule. The shader writes
+  z = (endTick - startTick) / 16777216 under GL_LESS, so a shorter note is on
+  top and an equal-length note submitted earlier keeps the pixel.
+
+These are different pictures, not two spellings of one. Switching to BPFA's rule
+is a visual change and is exposed as such.
+
+BPFA's rule is also the faster one. Reverse iteration is already front-to-back
+under it, so the first writer is final and a cell needs nothing but an occupied
+bit. `ShortestOnTop` has to order by duration first (stable LSD radix, four
+8-bit passes), which is what its extra time buys.
+
+### Colour
+
+BPFA picks `tracks->channelColors[track * 16 + channel]`, falling back to
+`primary[channel & 15]`. WASMIDI makes the same distinction when it packs the
+note stream rather than in the shader: bits 16..19 carry the global/channel
+slot, bits 20..23 the per-track slot, and `gl_renderer.cpp` repacks the stream
+when `perTrackColors_` changes. The shader's `uPerTrack` uniform is vestigial --
+it is set at line 3178 but never read, since `colorIndex` always masks bits
+16..19. `SelectColorSlot()` documents the mapping; culling itself never touches
+colour.
+
+### Verification
+
+    c++ -O2 -std=c++17 -Isrc/renderer -o /tmp/cull \
+        tools/note_raster_compositor_check.cpp \
+        src/renderer/note_raster_compositor.cpp && /tmp/cull
+
+The check rasterizes the full note set and the culled set through a reference
+model of the selected layering rule and compares every cell, storing everything
+the fragment shader can distinguish: palette slot, velocity and tick range. It
+runs every case under both rules. Zero cells differ.
+
+| Case | Instances | BPFA order | time | WASMIDI order | time |
+|------|-----------|-----------|------|---------------|------|
+| sparse 10k | 10,000 | 9,741 | 0.5 ms | 7,642 | 0.6 ms |
+| dense 100k | 100,000 | 74,037 | 3.6 ms | 42,220 | 5.1 ms |
+| crashpoint 1M | 1,000,000 | 241,554 | 23.7 ms | 190,239 | 48.9 ms |
+| stacked chord 200k | 200,000 | 1,920 | 7.9 ms | 1,344 | 5.1 ms |
+| long notes 50k | 50,000 | 45,215 | 2.5 ms | 6,132 | 3.1 ms |
+
+Optimizations that got there: a one-bit-per-cell occupancy bitmap (30 KB for
+128 keys at 1920 columns, against 3.9 MB for the previous owner-per-cell array),
+an O(1) rejection once a key row is fully covered, word-at-a-time claiming with
+popcount, no second ownership pass under BPFA's rule, and reusable scratch
+buffers so a per-tile cull does not reallocate.
+
+One thing must not be optimized further: the column mapping uses the same double
+`floor`/`ceil` expression as the renderer, in the same operation order. A
+fixed-point form was tried, rounded differently, and let the culler drop notes
+that did own a pixel. The comment in the source says so.
+
+### Still not wired into gl_renderer.cpp
+
+23.7 ms for a million-note viewport is still over a frame budget, and it only
+pays for itself at high density: at 10k notes under BPFA's rule it removes 2.6%
+of instances for 0.5 ms, which is a loss. It is useful only with the half of
+BPFA's design that is NOT ported: `NoteMeshCache` runs 2-32 background threads,
+builds up to 64 screens ahead, caches by (settings signature, start tick), and
+invalidates by generation counter on seek. There the cull is paid ahead of time
+and off the render thread.
+
+Remaining work: the tile cache and its worker pool, where those threads live in
+the browser build, reusing the existing note ring for culled output, and a
+density threshold. None of it can be verified here: there is no Qt6 and no emsdk
+in this environment, so `gl_renderer.cpp` cannot be compiled at all.
