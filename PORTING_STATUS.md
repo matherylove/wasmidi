@@ -558,3 +558,46 @@ For the same reason `PTHREAD_POOL_SIZE` must not be derived from
   comparison section above for why this is structural rather than a constant.
 - BPFA's MIDI loading path (`StreamingMidiParser`, `PreprocessedMidi`).
 - The note mesh tile cache and its worker pool.
+
+## Audio pump cadence
+
+Telemetry (`reportTelemetry()` in the synth worker, backed by
+`ssw_render_load_x1000()` and `ssw_last_render_us()`) on a dense file at 8192
+voices and 24 workers:
+
+    carga 65.1%  ultimo bloque 7.84 ms  ring 62%  bloques/pump 16  voces 8190
+    carga 118.0% ultimo bloque 12.78 ms ring 48%  bloques/pump 16  voces 8172
+    carga 110.0% ultimo bloque 13.34 ms ring  3%  bloques/pump 16  voces 8056
+
+Three things are visible there. Load averages 45-69%, so the CPU was not the
+limit. `bloques/pump` sat at 16 on every single line, which was the old
+`guard++ < 16` ceiling, meaning about 120 ms of synchronous rendering per call
+during which this worker cannot process `scheduleBatch`. And the ring sagged
+from 70% to 3% on a spike, because production arrived in bursts rather than
+steadily.
+
+So the problem was cadence, not throughput. Two changes to `pump()`:
+
+- Fill toward a target occupancy (`PUMP_RING_TARGET_FRACTION`, 0.75) instead of
+  only covering the immediate request. That is the cushion BPFA's `SynthAudio`
+  keeps ahead of its device buffers, and it is why raising `Bufs` alone did
+  nothing before: capacity grew but nothing ever filled it in advance.
+- Bound a single call by wall clock (`PUMP_SLICE_BUDGET_MS`, 12 ms) rather than
+  by block count, then resume on the next turn of the event loop. Same total
+  work, spread evenly, with message handling able to run between slices.
+
+    node tools/pump_slice_sim.mjs
+
+The simulation replays the measured render costs (5-8.3 ms typical, 13 ms
+spikes) against a 48 x 512 ring draining in realtime:
+
+| Strategy | Max synchronous burst | Mean ring |
+|----------|----------------------|-----------|
+| demand-driven, 16-block cap | 116 ms | 97% |
+| target fill, 12 ms slices | 20 ms | 73% |
+
+What that does and does not show: it confirms the burst length drops by about
+6x, which is the mechanism that was starving message delivery. It does NOT
+predict the underrun count, because the simulation invites the pump freely
+while the real one is invited by worklet messages -- the very thing the burst
+was blocking. Whether underruns actually fall has to be measured in the browser.

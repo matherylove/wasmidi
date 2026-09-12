@@ -756,6 +756,20 @@ function renderOneBlock(frames) {
     return true;
 }
 
+// Ring occupancy to keep ahead of the worklet. Below this the pump treats the
+// shortfall as demand in its own right rather than waiting to be asked.
+const PUMP_RING_TARGET_FRACTION = 0.75;
+// Wall clock a single pump call may spend rendering before yielding. Roughly
+// one 512 frame block's worth of realtime, so a slice can never stall message
+// handling for longer than the audio it just produced.
+const PUMP_SLICE_BUDGET_MS = 12;
+// Safety ceiling only; the time budget is what normally ends a slice.
+const PUMP_MAX_BLOCKS_PER_CALL = 64;
+
+function ringTargetFrames() {
+    return Math.floor(audioRingCapacityFrames * PUMP_RING_TARGET_FRACTION);
+}
+
 function pump() {
     if (!Module ||
         !coreReady ||
@@ -774,9 +788,28 @@ function pump() {
         const header = ringHeader();
         const renderQuantum = Math.max(1, preferredRenderFrames());
 
-        // Render strictly in response to AudioWorklet demand. The ring is a
-        // realtime transport queue, not a background PCM prerender cache.
-        while (header && guard++ < 16) {
+        // Keep a cushion ahead of AudioWorklet demand, in slices.
+        //
+        // This used to render strictly on demand, with a hard ceiling of 16
+        // blocks per call. Telemetry on a dense file showed that ceiling being
+        // hit on every single call: 16 blocks at roughly 7.5 ms each is about
+        // 120 ms of synchronous rendering in one go, during which this worker
+        // cannot process scheduleBatch at all. Average load was only 45-69%,
+        // so the CPU was not the limit; the ring still sagged from about 70%
+        // down to 3% on a spike because production came in bursts rather than
+        // steadily.
+        //
+        // So two changes. Fill toward a target occupancy instead of only
+        // covering the immediate request, which is the cushion BPFA's
+        // SynthAudio keeps ahead of its device buffers. And cap a single call
+        // by wall clock rather than by block count, handing control back so
+        // messages get processed, then resume immediately. Same total work,
+        // spread evenly, with the message thread able to breathe between
+        // slices.
+        const sliceStartedMs = performance.now();
+        let stoppedForTimeSlice = false;
+
+        while (header && guard++ < PUMP_MAX_BLOCKS_PER_CALL) {
             const available =
                 Math.max(0, Atomics.load(header, RING_AVAILABLE));
             const freeFrames = audioRingCapacityFrames - available;
@@ -784,17 +817,36 @@ function pump() {
             if (freeFrames < Math.max(1, blockFrames))
                 break;
 
+            // Past the target, only keep going while there is real demand.
+            if (produced > 0 &&
+                available >= ringTargetFrames() &&
+                pendingNeedFrames <= 0)
+                break;
+
+            if (produced > 0 &&
+                performance.now() - sliceStartedMs >= PUMP_SLICE_BUDGET_MS) {
+                stoppedForTimeSlice = true;
+                break;
+            }
+
             const writeFrame =
                 Math.max(0, Atomics.load(header, RING_WRITE));
             const contiguous =
                 Math.max(0, audioRingCapacityFrames - writeFrame);
+
+            // Below the target the cushion itself is the demand, so do not
+            // let a small pendingNeedFrames cap the slice.
+            const wanted =
+                Math.max(
+                    pendingNeedFrames,
+                    ringTargetFrames() - available);
 
             let frames =
                 Math.min(
                     renderQuantum,
                     freeFrames,
                     contiguous,
-                    Math.max(blockFrames, pendingNeedFrames));
+                    Math.max(blockFrames, wanted));
 
             frames =
                 Math.floor(frames / Math.max(1, blockFrames)) *
@@ -830,9 +882,13 @@ function pump() {
                 : 0;
         const room = audioRingCapacityFrames - available;
 
-        if (pendingNeedFrames > 0 &&
-            room >= Math.max(1, blockFrames)) {
-            setTimeout(pump, 0);
+        const wantsMore =
+            pendingNeedFrames > 0 || available < ringTargetFrames();
+
+        if (wantsMore && room >= Math.max(1, blockFrames)) {
+            // A time-sliced stop means work is still owed right now; anything
+            // else can wait for the next turn of the event loop.
+            setTimeout(pump, stoppedForTimeSlice ? 0 : 0);
         }
     } catch (error) {
         setError(error);
