@@ -25,6 +25,12 @@
 
         // SnappySynth.cfg / source-exposed settings.
         maxVoices: 16384,
+        renderLoadPercent: 0,
+        lastRenderMs: 0,
+        ringFillPercent: 0,
+        pumpGapMs: 0,
+        blocksPerPump: 0,
+        renderBudget: 0,
         minVoices: 0,
         blockFrames: 512,
         numBuffers: 16,
@@ -257,6 +263,21 @@
                     state.freeVoices = Math.max(0, Math.round(data.freeVoices));
                 if (Number.isFinite(data.steals))
                     state.steals = Math.max(0, Math.round(data.steals));
+                // Render telemetry for the sidebar graphs. Carried here
+                // rather than printed: console output from a worker at this
+                // rate costs the main thread real time.
+                if (Number.isFinite(data.renderLoadPercent))
+                    state.renderLoadPercent = data.renderLoadPercent;
+                if (Number.isFinite(data.lastRenderMs))
+                    state.lastRenderMs = data.lastRenderMs;
+                if (Number.isFinite(data.ringFillPercent))
+                    state.ringFillPercent = data.ringFillPercent;
+                if (Number.isFinite(data.pumpGapMs))
+                    state.pumpGapMs = data.pumpGapMs;
+                if (Number.isFinite(data.blocksPerPump))
+                    state.blocksPerPump = data.blocksPerPump;
+                if (Number.isFinite(data.renderBudget))
+                    state.renderBudget = data.renderBudget;
                 if (Number.isFinite(data.layers))
                     state.layers = Math.max(0, Math.round(data.layers));
                 if (Number.isFinite(data.regions))

@@ -87,6 +87,19 @@ function postState(type, extra = {}) {
         freeVoices:
             coreReady && Module ? Module._ssw_free_voices() : 0,
         steals: sampleStealRate(),
+        renderLoadPercent:
+            coreReady && Module
+                ? Module._ssw_render_load_x1000() / 10
+                : 0,
+        lastRenderMs:
+            coreReady && Module
+                ? Module._ssw_last_render_us() / 1000
+                : 0,
+        renderBudget:
+            coreReady && Module ? Module._ssw_render_budget() : 0,
+        ringFillPercent: telemetryRingFill * 100,
+        blocksPerPump: telemetryBlocksPerPump,
+        pumpGapMs: telemetryPumpGapMs,
         layers:
             coreReady && Module ? Module._ssw_layer_count() : 0,
         regions:
@@ -190,66 +203,59 @@ let lastStealCount = 0;
 let lastStealSampleMs = 0;
 
 /*
+ * Render telemetry.
+ *
+ * These used to be console lines. Printing from a worker at this rate is itself
+ * a cost the browser pays on the main thread, so the numbers are carried in the
+ * stats payload instead and the UI graphs them. Nothing here formats a string
+ * unless something is genuinely wrong.
+ *
+ * The pump gap is the important one and it is easy to misread. This code only
+ * runs from inside pump(), so a stall does not appear as a low load number, it
+ * appears as no sample at all. Measuring the gap since the previous pump turns
+ * a stall into a value rather than into missing output. A large gap with low
+ * load means the thread was stopped, not busy.
+ */
+let telemetryLastPumpMs = 0;
+let telemetryPumpGapMs = 0;
+let telemetryRingFill = 0;
+let telemetryBlocksPerPump = 0;
+
+function noteTelemetry(ringFillFraction, blocksThisPump) {
+    const now =
+        typeof performance !== "undefined" && performance.now
+            ? performance.now()
+            : Date.now();
+    if (telemetryLastPumpMs > 0) {
+        const gap = now - telemetryLastPumpMs;
+        // Decay, so a single stall stays visible for a moment instead of being
+        // erased by the next healthy pump.
+        telemetryPumpGapMs = Math.max(gap, telemetryPumpGapMs * 0.6);
+    }
+    telemetryLastPumpMs = now;
+    telemetryRingFill = ringFillFraction;
+    telemetryBlocksPerPump = blocksThisPump;
+}
+
+/*
  * A worker count below what was asked for has two unrelated causes and the
- * count alone cannot tell them apart:
- *   - the engine clamped to the reported core count, so the browser is not
- *     reporting the machine's threads (hardwareConcurrency is capped by some
- *     browsers, and is not the host CPU inside a Worker on every platform);
- *   - thread creation failed, so PTHREAD_POOL_SIZE is still too small.
- * Print both numbers rather than guessing.
+ * count alone cannot tell them apart: the engine clamped to a core count the
+ * browser under-reports (Brave farbles navigator.hardwareConcurrency), or
+ * thread creation failed because the pool is too small. Reported once at init,
+ * not per frame.
  */
 function reportWorkerPool() {
     if (!coreReady || !Module)
         return;
     const running = Module._ssw_worker_count();
-    const cores = Module._ssw_detected_cores();
-    const failures = Module._ssw_worker_thread_failures();
     if (requestedWorkers > 0 && running < requestedWorkers) {
-        console.warn(
-            "[snappysynth] pediste " + requestedWorkers + " workers, corren " +
-            running + ". navigator.hardwareConcurrency visto por el modulo: " +
-            cores + ". Hilos que el pool no pudo crear: " + failures + ".");
+        postState("workerPool", {
+            requestedWorkers,
+            workerCount: running,
+            detectedCores: Module._ssw_detected_cores(),
+            workerThreadFailures: Module._ssw_worker_thread_failures()
+        });
     }
-}
-
-/*
- * Periodic telemetry. Underruns alone cannot say whether the synth ran out of
- * CPU or ran out of scheduling opportunities, and those need opposite fixes:
- *
- *   load near or above 1000  -> genuinely CPU bound in the DSP
- *   load well below 1000 while underruns climb -> the renderer is not being
- *                               run often enough, or the ring is drained faster
- *                               than pump() is invited to refill it
- *
- * Ring fill tells them apart from the other side: a ring sitting near full with
- * rising underruns points at the worklet side, near empty points at the render
- * side.
- */
-let telemetryLastMs = 0;
-
-function reportTelemetry(ringFillFraction, blocksThisPump) {
-    if (!coreReady || !Module)
-        return;
-    const now =
-        typeof performance !== "undefined" && performance.now
-            ? performance.now()
-            : Date.now();
-    if (now - telemetryLastMs < 2000)
-        return;
-    telemetryLastMs = now;
-
-    const load = Module._ssw_render_load_x1000();
-    const lastUs = Module._ssw_last_render_us();
-    const budget = Module._ssw_render_budget();
-
-    console.log(
-        "[snappysynth] carga " + (load / 10).toFixed(1) + "%" +
-        "  ultimo bloque " + (lastUs / 1000).toFixed(2) + " ms" +
-        "  presupuesto " + budget +
-        "  ring " + Math.round(ringFillFraction * 100) + "%" +
-        "  bloques/pump " + blocksThisPump +
-        "  voces " + Module._ssw_active_voices() +
-        "  workers " + Module._ssw_worker_count());
 }
 
 function resetStealRate() {
@@ -861,7 +867,7 @@ function pump() {
         if (header) {
             const availableNow =
                 Math.max(0, Atomics.load(header, RING_AVAILABLE));
-            reportTelemetry(
+            noteTelemetry(
                 audioRingCapacityFrames > 0
                     ? availableNow / audioRingCapacityFrames
                     : 0,

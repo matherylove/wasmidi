@@ -197,9 +197,28 @@ if(EMSCRIPTEN)
         "-sPTHREAD_POOL_SIZE=Math.max((navigator.hardwareConcurrency || 4) + 8, 34)"
         "-sPTHREAD_POOL_SIZE_STRICT=0"
         "-sALLOW_MEMORY_GROWTH=1"
-        "-sINITIAL_MEMORY=268435456"
-        "-sMAXIMUM_MEMORY=2147483648"
+        # This module runs with pthreads, so its heap is a SharedArrayBuffer and
+        # memory.grow has to synchronise every worker thread. With 24 render
+        # workers each growth freezes all of them at once: nothing runs and
+        # nothing logs, which reads as a stall with no CPU load behind it.
+        #
+        # The allocation that provokes it scales with the worker count.
+        # CH_EVENT_QUEUE_SIZE is 16384 events per (worker, channel), so 24
+        # workers across 16 channels is over 150 MB of event queues alone,
+        # against roughly 44 MB at 7 workers. Add the soundfont samples and the
+        # voice pool and 256 MB is crossed during startup, then repeatedly as
+        # the geometric step nibbles upward.
+        #
+        # So: start high enough that playback never grows, and make any growth
+        # that does happen a single large step instead of many small ones.
+        "-sINITIAL_MEMORY=1073741824"
+        "-sMEMORY_GROWTH_GEOMETRIC_STEP=0"
+        "-sMEMORY_GROWTH_LINEAR_STEP=268435456"
+        "-sMAXIMUM_MEMORY=3221225472"
         "-sSTACK_SIZE=8388608"
+        # Render workers use shallow stacks; the default would multiply across
+        # the whole pool for no benefit.
+        "-sDEFAULT_PTHREAD_STACK_SIZE=262144"
         "-sFILESYSTEM=1"
         "-sFORCE_FILESYSTEM=1"
         "-sEXPORTED_FUNCTIONS=['_ssw_init','_ssw_init_ex','_ssw_load_sf2','_ssw_clear_soundfonts','_ssw_set_volume','_ssw_set_vor_mode','_ssw_set_soft_clip','_ssw_reset','_ssw_set_song_time','_ssw_clear_events','_ssw_queue_events','_ssw_render','_ssw_render_into','_ssw_render_queued_into','_ssw_send_sysex','_ssw_active_voices','_ssw_free_voices','_ssw_steals','_ssw_layer_count','_ssw_region_count','_ssw_channels','_ssw_sample_rate','_ssw_bits_per_sample','_ssw_num_buffers','_ssw_worker_count','_ssw_worker_thread_failures','_ssw_detected_cores','_ssw_render_load_x1000','_ssw_last_render_us','_ssw_render_budget','_ssw_shutdown','_malloc','_free']"
