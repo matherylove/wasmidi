@@ -99,7 +99,7 @@ function postState(type, extra = {}) {
             coreReady && Module ? Module._ssw_render_budget() : 0,
         ringFillPercent: telemetryRingFill * 100,
         blocksPerPump: telemetryBlocksPerPump,
-        pumpGapMs: telemetryPumpGapMs,
+        pumpGapMs: telemetryLateMs,
         layers:
             coreReady && Module ? Module._ssw_layer_count() : 0,
         regions:
@@ -217,20 +217,36 @@ let lastStealSampleMs = 0;
  * load means the thread was stopped, not busy.
  */
 let telemetryLastPumpMs = 0;
-let telemetryPumpGapMs = 0;
+let telemetryLateMs = 0;
 let telemetryRingFill = 0;
 let telemetryBlocksPerPump = 0;
 
-function noteTelemetry(ringFillFraction, blocksThisPump) {
+/*
+ * How late the pump was, not how long it slept.
+ *
+ * The first version of this reported the raw gap between pump() calls, which is
+ * backwards: when load is low the ring reaches its target, the pump exits early
+ * and is not invited again until the worklet drains, so healthy idling produced
+ * the largest gaps. Under heavy load the pump runs constantly and the gaps are
+ * tiny. The number lit up red exactly when nothing was wrong.
+ *
+ * A gap only matters measured against what the ring could cover while it
+ * lasted. Sitting out 100 ms with 300 ms of audio buffered is free; sitting out
+ * 100 ms with 20 ms buffered is an underrun. So the reported value is the
+ * overrun past that cover, and it is zero whenever the buffer was deep enough,
+ * however long the pause.
+ */
+function noteTelemetry(ringFillFraction, blocksThisPump, ringMsAtEntry) {
     const now =
         typeof performance !== "undefined" && performance.now
             ? performance.now()
             : Date.now();
     if (telemetryLastPumpMs > 0) {
         const gap = now - telemetryLastPumpMs;
-        // Decay, so a single stall stays visible for a moment instead of being
-        // erased by the next healthy pump.
-        telemetryPumpGapMs = Math.max(gap, telemetryPumpGapMs * 0.6);
+        const late = Math.max(0, gap - ringMsAtEntry);
+        // Decay, so one real stall stays readable for a moment rather than
+        // being erased by the next healthy pump.
+        telemetryLateMs = Math.max(late, telemetryLateMs * 0.6);
     }
     telemetryLastPumpMs = now;
     telemetryRingFill = ringFillFraction;
@@ -814,6 +830,13 @@ function pump() {
         // slices.
         const sliceStartedMs = performance.now();
         let stoppedForTimeSlice = false;
+        // Depth of the ring before this call renders anything, in milliseconds
+        // of audio. This is what the pump had to cover the pause it just woke
+        // from.
+        const ringMsAtEntry = header
+            ? (Math.max(0, Atomics.load(header, RING_AVAILABLE)) * 1000) /
+                Math.max(1, sampleRateHz)
+            : 0;
 
         while (header && guard++ < PUMP_MAX_BLOCKS_PER_CALL) {
             const available =
@@ -871,7 +894,8 @@ function pump() {
                 audioRingCapacityFrames > 0
                     ? availableNow / audioRingCapacityFrames
                     : 0,
-                Math.floor(produced / Math.max(1, blockFrames)));
+                Math.floor(produced / Math.max(1, blockFrames)),
+                ringMsAtEntry);
         }
 
         if (produced > 0) {

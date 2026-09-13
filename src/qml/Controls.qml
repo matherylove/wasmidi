@@ -879,6 +879,48 @@ Item {
                     Item { Layout.fillWidth: true }
                 }
 
+                // Telemetry gets its own line. A RowLayout does not wrap, so
+                // adding these to a full row pushed the controls below it off
+                // screen; Flow reflows instead.
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 7
+                    visible: root.mainWindow.synthReady
+
+                    Text {
+                        // Render cost as a share of the block's own realtime
+                        // budget. Over 100 means a block took longer to render
+                        // than it lasts.
+                        text: "LOAD " + root.formatNumber(root.mainWindow.synthRenderLoad, 0) + "%"
+                        color: root.mainWindow.synthRenderLoad > 90 ? "#f59e0b" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        text: "BLOCK " + root.formatNumber(root.mainWindow.synthRenderLatencyMs, 1) + "ms"
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        text: "RING " + root.formatInteger(root.mainWindow.synthRingFill) + "%"
+                        color: root.mainWindow.synthRingFill < 20 ? "#f59e0b" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        // Milliseconds the pump was late beyond what the ring
+                        // could cover while it was away. Zero whenever the
+                        // buffer was deep enough, however long the pause.
+                        text: "LATE " + root.formatInteger(root.mainWindow.synthPumpGapMs) + "ms"
+                        color: root.mainWindow.synthPumpGapMs > 0
+                            ? (root.mainWindow.synthPumpGapMs > 20 ? "#ef4444" : "#f59e0b")
+                            : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                }
+
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 7
@@ -898,36 +940,6 @@ Item {
                                   Math.floor(root.mainWindow.synthMaxVoices /
                                       Math.max(1, root.mainWindow.synthWorkerCount)))
                         color: "#70667e"
-                        font.pixelSize: 7
-                        font.bold: true
-                    }
-                    Text {
-                        // Render cost as a share of the block's own realtime
-                        // budget. Over 100 means a block took longer to render
-                        // than it lasts.
-                        text: "LOAD " + root.formatNumber(root.mainWindow.synthRenderLoad, 1) + "%"
-                        color: root.mainWindow.synthRenderLoad > 90 ? "#f59e0b" : "#70667e"
-                        font.pixelSize: 7
-                        font.bold: true
-                    }
-                    Text {
-                        text: "BLOCK " + root.formatNumber(root.mainWindow.synthRenderLatencyMs, 2) + " ms"
-                        color: "#70667e"
-                        font.pixelSize: 7
-                        font.bold: true
-                    }
-                    Text {
-                        text: "RING " + root.formatInteger(root.mainWindow.synthRingFill) + "%"
-                        color: root.mainWindow.synthRingFill < 20 ? "#f59e0b" : "#70667e"
-                        font.pixelSize: 7
-                        font.bold: true
-                    }
-                    Text {
-                        // A stall shows up as a gap, not as low load: the pump
-                        // only samples while it runs, so a stopped thread
-                        // produces no sample at all rather than a small one.
-                        text: "GAP " + root.formatInteger(root.mainWindow.synthPumpGapMs) + " ms"
-                        color: root.mainWindow.synthPumpGapMs > 250 ? "#ef4444" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }
