@@ -63,6 +63,10 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthActiveVoices READ synthActiveVoices NOTIFY synthStateChanged)
     Q_PROPERTY(int synthFreeVoices READ synthFreeVoices NOTIFY synthStateChanged)
     Q_PROPERTY(int synthSteals READ synthSteals NOTIFY synthStateChanged)
+    Q_PROPERTY(double synthRenderLoad READ synthRenderLoad NOTIFY synthStateChanged)
+    Q_PROPERTY(double synthRenderLatencyMs READ synthRenderLatencyMs NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthPumpGapMs READ synthPumpGapMs NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthRingFill READ synthRingFill NOTIFY synthStateChanged)
     Q_PROPERTY(int synthLayers READ synthLayers NOTIFY synthStateChanged)
     Q_PROPERTY(int synthRegions READ synthRegions NOTIFY synthStateChanged)
     Q_PROPERTY(int synthUnderruns READ synthUnderruns NOTIFY synthStateChanged)
@@ -134,6 +138,10 @@ public:
     int synthActiveVoices() const { return synthActiveVoices_; }
     int synthFreeVoices() const { return synthFreeVoices_; }
     int synthSteals() const { return synthSteals_; }
+    double synthRenderLoad() const { return synthRenderLoad_; }
+    double synthRenderLatencyMs() const { return synthRenderLatencyMs_; }
+    int synthPumpGapMs() const { return synthPumpGapMs_; }
+    int synthRingFill() const { return synthRingFill_; }
     int synthLayers() const { return synthLayers_; }
     int synthRegions() const { return synthRegions_; }
     int synthUnderruns() const { return synthUnderruns_; }
@@ -415,6 +423,10 @@ private:
     int synthActiveVoices_ = 0;
     int synthFreeVoices_ = 0;
     int synthSteals_ = 0;
+    double synthRenderLoad_ = 0.0;
+    double synthRenderLatencyMs_ = 0.0;
+    int synthPumpGapMs_ = 0;
+    int synthRingFill_ = 0;
     int synthLayers_ = 0;
     int synthRegions_ = 0;
     int synthUnderruns_ = 0;

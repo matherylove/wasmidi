@@ -1112,6 +1112,29 @@ EM_JS(int, wasmidi_snappy_steals, (), {
     return b && b.state ? (Number(b.state.steals) | 0) : 0;
 });
 
+// Render telemetry. Carried in the bridge state rather than printed: console
+// output from the synth worker at this rate costs the main thread real time.
+// Scaled by 10 so the value survives the int round trip with one decimal.
+EM_JS(int, wasmidi_snappy_render_load_x10, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? Math.round((Number(b.state.renderLoadPercent) || 0) * 10) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_render_latency_x100, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? Math.round((Number(b.state.lastRenderMs) || 0) * 100) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_pump_gap_ms, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? Math.round(Number(b.state.pumpGapMs) || 0) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_ring_fill, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? Math.round(Number(b.state.ringFillPercent) || 0) : 0;
+});
+
 EM_JS(int, wasmidi_snappy_layers, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? (Number(b.state.layers) | 0) : 0;
@@ -3887,6 +3910,7 @@ void MainWindow::pollSynthState()
         ready != synthReady_ || loaded != soundfontLoaded_ ||
         sampleRate != synthSampleRate_ || active != synthActiveVoices_ ||
         freeVoices != synthFreeVoices_ || steals != synthSteals_ ||
+        wasmidi_snappy_render_load_x10() / 10.0 != synthRenderLoad_ ||
         layers != synthLayers_ || regions != synthRegions_ ||
         workerCount != synthWorkerCount_ ||
         underruns != synthUnderruns_ || name != soundfontName_ || status != synthStatus_;
@@ -3897,6 +3921,10 @@ void MainWindow::pollSynthState()
     synthActiveVoices_ = active;
     synthFreeVoices_ = freeVoices;
     synthSteals_ = steals;
+    synthRenderLoad_ = wasmidi_snappy_render_load_x10() / 10.0;
+    synthRenderLatencyMs_ = wasmidi_snappy_render_latency_x100() / 100.0;
+    synthPumpGapMs_ = wasmidi_snappy_pump_gap_ms();
+    synthRingFill_ = wasmidi_snappy_ring_fill();
     synthLayers_ = layers;
     synthRegions_ = regions;
     synthWorkerCount_ = workerCount;
