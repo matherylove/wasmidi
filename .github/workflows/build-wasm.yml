@@ -47,6 +47,36 @@ jobs:
           cache: true
           aqtversion: '==3.3.*'
 
+      # Engine changes are verified by host tests, not by the browser build
+      # (HANDOFF section 2). Run every check the handoff lists so a change that
+      # breaks one cannot reach a deploy. Uses the runner's gcc, not emcc.
+      - name: Host tests (engine logic, no Emscripten)
+        run: |
+          set -euo pipefail
+          cd third_party/snappysynthv2
+          gcc -fsyntax-only -I. -DSNAPPYSYNTH_WASM=1 Voice/voice.c
+          gcc -fsyntax-only -I. -DSNAPPYSYNTH_WASM=1 snappy_wasm_core.c
+          cd ../..
+          python3 tools/extract_ssw_schedule_logic.py
+          cc -O1 -Wall -o /tmp/ssw_harness tools/ssw_schedule_harness.c -lm
+          /tmp/ssw_harness
+          cc -O1 -Wall -o /tmp/share tools/worker_freelist_share_check.c
+          /tmp/share
+          python3 tools/extract_voice_rebalance_logic.py
+          cc -O1 -Wall -pthread -o /tmp/borrow tools/worker_freelist_borrow_check.c
+          /tmp/borrow
+          node tools/pump_slice_sim.mjs
+          c++ -O2 -std=c++17 -Isrc/renderer -o /tmp/compositor \
+            tools/note_raster_compositor_check.cpp \
+            src/renderer/note_raster_compositor.cpp
+          /tmp/compositor
+          node --check web/snappysynth_bridge.js
+          node --check web/visual-cache-worker.js
+          # The manifest is what the user validates a drop against; a stale
+          # one means a file changed without the handoff noticing.
+          python3 tools/regen_manifest.py --check
+          sha256sum -c MANIFEST.sha256
+
       - name: Toolchain diagnostics
         run: |
           emcc --version
