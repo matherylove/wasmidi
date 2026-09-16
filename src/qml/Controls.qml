@@ -874,7 +874,8 @@ Item {
                         // keep them on the non-wrapping summary row. On a narrow
                         // panel they previously landed below the visible part of
                         // the telemetry Flow.
-                        text: "SIMD " + root.formatInteger(root.mainWindow.synthSimdPercent) + "%"
+                        // This counts stereo sustain batch admission, not all SIMD loops.
+                        text: "BATCH " + root.formatInteger(root.mainWindow.synthSimdPercent) + "%"
                         color: root.mainWindow.synthSimdPercent < 50 ? "#ef4444" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true

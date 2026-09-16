@@ -209,7 +209,28 @@ Visibles en el panel de SnappySynth:
 | bajo | bajo | Ambos. Empezar por SIMD. |
 | alto | alto | El DSP es genuinamente así de caro en WASM. Revisar la meta de 8192 voces. |
 
-**Este es el siguiente paso del proyecto.** Todo lo demás está subordinado.
+### Nueva captura: corrección de la interpretación anterior
+
+Captura recibida: `LOAD 509%`, `BLOCK 58ms`, `EVT 0.1ms`, `SIMD 0%`,
+`BUSY 873ms`, 16 workers, 8192 voces activas, 512 frames, 44100 Hz,
+`STEALS/s 3120`, `DROPPED 0`, `RING 2%`, `LATE 48ms`, `UNDERRUNS 802`.
+
+**La tabla anterior no basta para elegir una optimización.** La inspección de
+`Voice/voice.c` confirma que `g_path_fast_voices` sólo cuenta admisiones al batch
+estéreo sustain; `g_path_scalar_voices` se incrementa antes de los otros caminos
+SIMD por voz (incluidos mono → estéreo). Por eso 0% NO prueba DSP completamente
+escalar. El panel ahora dice `BATCH` para describir el contador real, conservando
+los nombres internos/API por compatibilidad.
+
+El batch WASM exige sustain, muestra estéreo, pitch casi unitario, sin loops,
+sin filtros ni transiciones pendientes. No se deben quitar esas condiciones sin
+implementar sus semánticas. No sabemos cuáles dominan en este SoundFont/captura.
+
+`873 / 58 ≈ 15` es consistente con workers solapados, no con serialización total.
+Son tiempos de pared: no prueban utilización CPU efectiva ni scaling ideal.
+Siguiente paso: perfilar los caminos fuera del batch (envolvente, interpolación,
+loops y filtros), o instrumentar sus causas de rechazo y cobertura SIMD real.
+No hay todavía una mejora de throughput validada en navegador.
 
 ---
 
