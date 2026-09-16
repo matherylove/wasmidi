@@ -87,6 +87,9 @@ function postState(type, extra = {}) {
         freeVoices:
             coreReady && Module ? Module._ssw_free_voices() : 0,
         steals: sampleStealRate(),
+        rebalanced: sampleRebalanceRate(),
+        droppedNotes:
+            coreReady && Module ? Module._ssw_dropped_notes() : 0,
         renderLoadPercent:
             coreReady && Module
                 ? Module._ssw_render_load_x1000() / 10
@@ -213,6 +216,17 @@ let lastStealCount = 0;
 let lastStealSampleMs = 0;
 
 /*
+ * Same treatment for the free-voice rebalance counter: ssw_rebalanced() is
+ * cumulative, the panel wants "is it happening now". Dropped notes stay a
+ * running total: a note that never sounded is something the user wants to see
+ * stick, not fade.
+ */
+let rebalanceRatePerSecond = 0;
+let rebalanceRateHasBaseline = false;
+let lastRebalanceCount = 0;
+let lastRebalanceSampleMs = 0;
+
+/*
  * Render telemetry.
  *
  * These used to be console lines. Printing from a worker at this rate is itself
@@ -289,6 +303,45 @@ function resetStealRate() {
     stealRateHasBaseline = false;
     lastStealCount = 0;
     lastStealSampleMs = 0;
+    rebalanceRatePerSecond = 0;
+    rebalanceRateHasBaseline = false;
+    lastRebalanceCount = 0;
+    lastRebalanceSampleMs = 0;
+}
+
+function sampleRebalanceRate() {
+    if (!coreReady || !Module)
+        return 0;
+
+    const now =
+        typeof performance !== "undefined" && performance.now
+            ? performance.now()
+            : Date.now();
+    const total = Module._ssw_rebalanced();
+
+    if (!rebalanceRateHasBaseline) {
+        rebalanceRateHasBaseline = true;
+        lastRebalanceCount = total;
+        lastRebalanceSampleMs = now;
+        return 0;
+    }
+
+    const elapsedMs = now - lastRebalanceSampleMs;
+    if (elapsedMs < 100)
+        return Math.round(rebalanceRatePerSecond);
+
+    let delta = total - lastRebalanceCount;
+    if (delta < 0)
+        delta = 0;
+
+    const instant = (delta * 1000) / elapsedMs;
+    rebalanceRatePerSecond += 0.4 * (instant - rebalanceRatePerSecond);
+    if (rebalanceRatePerSecond < 0.5)
+        rebalanceRatePerSecond = 0;
+
+    lastRebalanceCount = total;
+    lastRebalanceSampleMs = now;
+    return Math.round(rebalanceRatePerSecond);
 }
 
 function sampleStealRate() {

@@ -63,6 +63,8 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthActiveVoices READ synthActiveVoices NOTIFY synthStateChanged)
     Q_PROPERTY(int synthFreeVoices READ synthFreeVoices NOTIFY synthStateChanged)
     Q_PROPERTY(int synthSteals READ synthSteals NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthRebalanced READ synthRebalanced NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthDroppedNotes READ synthDroppedNotes NOTIFY synthStateChanged)
     Q_PROPERTY(double synthRenderLoad READ synthRenderLoad NOTIFY synthStateChanged)
     Q_PROPERTY(double synthRenderLatencyMs READ synthRenderLatencyMs NOTIFY synthStateChanged)
     Q_PROPERTY(double synthDispatchMs READ synthDispatchMs NOTIFY synthStateChanged)
@@ -141,6 +143,8 @@ public:
     int synthActiveVoices() const { return synthActiveVoices_; }
     int synthFreeVoices() const { return synthFreeVoices_; }
     int synthSteals() const { return synthSteals_; }
+    int synthRebalanced() const { return synthRebalanced_; }
+    int synthDroppedNotes() const { return synthDroppedNotes_; }
     double synthRenderLoad() const { return synthRenderLoad_; }
     double synthRenderLatencyMs() const { return synthRenderLatencyMs_; }
     double synthDispatchMs() const { return synthDispatchMs_; }
@@ -429,6 +433,8 @@ private:
     int synthActiveVoices_ = 0;
     int synthFreeVoices_ = 0;
     int synthSteals_ = 0;
+    int synthRebalanced_ = 0;
+    int synthDroppedNotes_ = 0;
     double synthRenderLoad_ = 0.0;
     double synthRenderLatencyMs_ = 0.0;
     double synthDispatchMs_ = 0.0;

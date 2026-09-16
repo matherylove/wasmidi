@@ -17,6 +17,12 @@ static double g_render_load_ema = -1.0;
 static int g_ready = 1;
 static double g_song_time_seconds = 0.0;
 static int64_t g_song_frame = 0;
+/* Telemetry sinks written by ssw_render_queued_into() (revision 20 split of
+ * block cost into render vs. event dispatch). The harness only needs them to
+ * exist; their values are not asserted here. */
+static double g_last_render_us = 0.0;
+static double g_last_dispatch_us = 0.0;
+static double g_dispatch_accum_us = 0.0;
 
 typedef struct { int64_t sample_frame; uint32_t message; } ssw_scheduled_event;
 typedef struct ssw_event_block {

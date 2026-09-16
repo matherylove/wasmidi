@@ -34,6 +34,19 @@ Browser-specific compatibility changes are limited to:
   since the last boundary, because voice.c routes note events by key hash and
   channel events by channel, so with more than one worker they are in different
   queues and only a render boundary orders them
+- per-cycle rebalance of the worker-local freelists (`rebalance_worker_freelist`
+  in `voice.c`). Upstream `free_push()` returns a finished voice to the stack of
+  the worker that owned it and nothing ever moves it back to the global pool,
+  so after the pool drains the free voices stay wherever they ended. A worker
+  whose keys are busy then sits at zero while a neighbour idles with hundreds,
+  and the note is dropped or a sounding voice is stolen. At the top of every
+  cycle each worker now hands back whatever it holds above what its queued
+  events can use (`worker_freelist_keep`, capped at 128), linked into one
+  chain so the return is a single CAS. The refill batch and the per-cycle
+  pre-refill are bounded by the same figure so the three do not churn. Two
+  counters come with it: `rebalanced` (voices handed back) and `drops`
+  (note-ons lost with no sound), exposed as `ssw_rebalanced()` and
+  `ssw_dropped_notes()`. Host test: `tools/worker_freelist_borrow_check.c`
 - a scalar VOR helper needed when AVX2 is unavailable
 - minimal Windows compatibility types/stubs
 - `snappy_wasm_core.c`, which exposes only init/SF2/render/reset/settings.

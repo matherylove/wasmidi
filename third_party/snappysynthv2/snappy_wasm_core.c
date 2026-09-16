@@ -1032,6 +1032,28 @@ int ssw_steals(void) {
     if (value < 0) return 0;
     return value > 2147483647L ? 2147483647 : (int)value;
 }
+/*
+ * Free voices that workers handed back to the global pool (cumulative). A
+ * rising value while STEALS/s is high means the pool is genuinely full; a flat
+ * zero while notes vanish means workers are hoarding and rebalance is not
+ * running. See rebalance_worker_freelist() in voice.c.
+ */
+int ssw_rebalanced(void) {
+    long value = GetVoiceStats().rebalanced;
+    if (value < 0) return 0;
+    return value > 2147483647L ? 2147483647 : (int)value;
+}
+/*
+ * Note-ons that were dropped with no sound (cumulative): no free voice in the
+ * worker, none in the global pool, none borrowable, and steal_voice_fast()
+ * found nothing to take. This is the "notes that do not sound" symptom made
+ * countable; before this it was invisible in every stat.
+ */
+int ssw_dropped_notes(void) {
+    long value = GetVoiceStats().drops;
+    if (value < 0) return 0;
+    return value > 2147483647L ? 2147483647 : (int)value;
+}
 int ssw_layer_count(void) { return g_soundfont_layers; }
 int ssw_region_count(void) { return instrument ? instrument->num_regions : 0; }
 int ssw_channels(void) { return g_cfg.num_channels; }

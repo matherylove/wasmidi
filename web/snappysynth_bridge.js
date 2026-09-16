@@ -13,6 +13,8 @@
         activeVoices: 0,
         freeVoices: 0,
         steals: 0,
+        rebalanced: 0,     // free voices returned to the global pool, per second
+        droppedNotes: 0,   // note-ons lost with no sound, cumulative
         underruns: 0,
         layers: 0,
         regions: 0,
@@ -267,6 +269,10 @@
                     state.freeVoices = Math.max(0, Math.round(data.freeVoices));
                 if (Number.isFinite(data.steals))
                     state.steals = Math.max(0, Math.round(data.steals));
+                if (Number.isFinite(data.rebalanced))
+                    state.rebalanced = Math.max(0, Math.round(data.rebalanced));
+                if (Number.isFinite(data.droppedNotes))
+                    state.droppedNotes = Math.max(0, Math.round(data.droppedNotes));
                 // Render telemetry for the sidebar graphs. Carried here
                 // rather than printed: console output from a worker at this
                 // rate costs the main thread real time.

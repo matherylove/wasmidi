@@ -320,6 +320,8 @@ typedef struct {
     int steal_cursor;
     int release_hint_vid;
     LONG steals_local;
+    LONG rebalanced_local; // free voices returned to the global pool by this worker
+    LONG drops_local;      // note-ons dropped: no free voice anywhere and nothing to steal
 
     noteoff_overflow_entry *noteoff_overflow;
     volatile LONG noteoff_overflow_head;
@@ -2480,6 +2482,97 @@ static inline int releasepool_take(worker_data *wd, float incoming_x08, int inco
                                                                                                                                                                                                                                                                 return wd->free_stack[wd->free_top--];
                                                                                                                                                                                                                                                                 }
 
+/* BEGIN worker freelist rebalance (host-tested by tools/worker_freelist_borrow_check.c) */
+/*
+ * Cross-worker sharing of free voices.
+ *
+ * enqueue_event() routes a note-on to g_note_worker_map[ch][key]; that worker
+ * allocates from its LOCAL free stack, refills from the global CAS pool when the
+ * stack is dry, and otherwise steals a SOUNDING voice it owns. free_push()
+ * returns a finished voice to the stack of the worker that owned it, never to
+ * the global pool, so once the pool has been drained the free voices stay
+ * wherever they happened to end. A worker whose keys are busy can then sit at
+ * zero while a neighbour idles with hundreds: the note is dropped (nothing to
+ * steal either) or a voice that did not need to die is stolen. Both present
+ * as "notes vanish with many workers" and both look like a stealer bug.
+ *
+ * Fix: at the start of every cycle each worker returns to the global pool
+ * whatever it holds above what it can use THIS cycle. The pool is the Treiber
+ * stack the engine already has (g_free_head / g_next_free), and the surplus is
+ * linked into one chain first so the whole return costs a single CAS however
+ * many voices go back. The hot path (free_pop, refill batch) is untouched.
+ *
+ * What a worker keeps is bounded by its queued events: a voice stays local
+ * only if there is a pending event that could consume it in this cycle. So a
+ * sounding voice is stolen only when the global pool is empty AND every free
+ * voice left anywhere is reserved by a worker about to use it -- which is the
+ * "no active voice is stolen while a free one exists" invariant, stated per
+ * cycle. The host test checks exactly that.
+ */
+#ifndef WORKER_FREELIST_KEEP_MAX
+#define WORKER_FREELIST_KEEP_MAX 128 /* same figure as the per-cycle pre-refill */
+#endif
+
+/* Upper bound on the note-ons this worker can admit this cycle: every event
+ * still queued for it. Note-offs and CCs inflate the bound, which only makes
+ * the worker keep a little more; the noteoff overflow queue holds no note-ons
+ * and is not counted. */
+static inline int worker_pending_event_count(const worker_data *wd) {
+    int total = 0;
+    if (!wd || !wd->queues) return 0;
+    for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
+        const event_queue *q = &wd->queues[ch];
+        total += (int)((q->head - q->tail) & CH_EVENT_QUEUE_MASK);
+    }
+    return total;
+}
+
+/* How many free voices this worker should keep local for the coming cycle. */
+static inline int worker_freelist_keep(const worker_data *wd) {
+    int keep = worker_pending_event_count(wd);
+    if (keep > WORKER_FREELIST_KEEP_MAX) keep = WORKER_FREELIST_KEEP_MAX;
+    return keep;
+}
+
+/* Splice a chain of vids (already linked through g_next_free, ending in -1)
+ * onto the global pool with one CAS. Owner thread of the chain only. */
+static inline void global_pool_push_chain(int first, int last) {
+    if (first < 0 || last < 0) return;
+    LONG expected;
+    do {
+        expected = load_relaxed_long(&g_free_head);
+        g_next_free[last] = expected;
+    } while (InterlockedCompareExchange(&g_free_head, (LONG)first, expected) != expected);
+}
+
+/* Return this worker's surplus free voices to the global pool. Returns how
+ * many went back. Called by the worker thread at the top of its cycle, before
+ * it processes events, so the stack is owner-only here. */
+static int rebalance_worker_freelist(worker_data *wd) {
+    if (!wd || !g_next_free) return 0;
+    int have = wd->free_top + 1;
+    int keep = worker_freelist_keep(wd);
+    int give = have - keep;
+    if (give <= 0) return 0;
+
+    int first = -1, last = -1, moved = 0;
+    while (moved < give) {
+        int vid = free_pop(wd);
+        if (vid < 0) break;
+        if (g_steal_score) g_steal_score[vid] = FLT_MAX;
+        g_next_free[vid] = (LONG)first;
+        if (last < 0) last = vid;
+        first = vid;
+        ++moved;
+    }
+    if (moved > 0) {
+        global_pool_push_chain(first, last);
+        wd->rebalanced_local += (LONG)moved;
+    }
+    return moved;
+}
+/* END worker freelist rebalance */
+
                                                                                                                                                                                                                                                                 // Bulk-drain global CAS pool into worker-local freelist.
                                                                                                                                                                                                                                                                 // Amortises the serialising CAS cost across 512 note-ons instead of 1.
 /*
@@ -2531,6 +2624,14 @@ static void update_worker_freelist_refill(int workers) {
 }
                                                                                                                                                                                                                                                                  static void refill_worker_freelist(worker_data *wd) {
                                                                                                                                                                                                                                                                 int want = g_worker_freelist_refill;
+                                                                                                                                                                                                                                                                {
+                                                                                                                                                                                                                                                                // Never pull more than the events still queued for this worker can
+                                                                                                                                                                                                                                                                // use (+1 for the event being processed, already dequeued): a partial
+                                                                                                                                                                                                                                                                // last batch otherwise strands voices here while a sibling finds the
+                                                                                                                                                                                                                                                                // pool empty in the same cycle. Host test case 2 at 2048/24 shows it.
+                                                                                                                                                                                                                                                                int pending = worker_pending_event_count(wd) + 1;
+                                                                                                                                                                                                                                                                if (pending < want) want = pending;
+                                                                                                                                                                                                                                                                }
 if (want < 1) want = 1;
                                                                                                                                                                                                                                                                 free_reserve(wd, wd->free_top + 1 + want);
                                                                                                                                                                                                                                                                 int got = 0;
@@ -3324,14 +3425,22 @@ worker_data *wd = &g_workers[widx];
                                                                                                                                                                                                                                                                 int frames_this_block = (g_worker_mix_cap_frames != NULL) ? g_worker_mix_cap_frames[widx] : 0;
                                                                                                                                                                                                                                                                 LONG render_cycle = load_relaxed_long(&g_cycle_id);
 
+                                                                                                                                                                                                                                                                // Give back what this cycle cannot use, so a sibling at zero can refill
+                                                                                                                                                                                                                                                                // from the global pool instead of stealing a sounding voice or dropping
+                                                                                                                                                                                                                                                                // the note. See rebalance_worker_freelist().
+                                                                                                                                                                                                                                                                rebalance_worker_freelist(wd);
+
                                                                                                                                                                                                                                                                 // Pre-refill worker-local freelist to amortize global CAS cost.
                                                                                                                                                                                                                                                                 // Keep the target small — 256 entries is enough for burst note-ons
                                                                                                                                                                                                                                                                 // within a single render block. A larger target aggressively drains the
                                                                                                                                                                                                                                                                 // global pool, starving sibling workers and causing spurious steals.
                                                                                                                                                                                                                                                                 {
                                                                                                                                                                                                                                                                 if (worker_has_pending_events(wd)) {
-                                                                                                                                                                                                                                                                int refill_target = 128; // per-worker, per-cycle
-                                                                                                                                                                                                                                                                while (wd->free_top < refill_target) {
+                                                                                                                                                                                                                                                                // Bounded by this cycle's queued events (<= WORKER_FREELIST_KEEP_MAX),
+                                                                                                                                                                                                                                                                // the same figure rebalance_worker_freelist() keeps, so the two do
+                                                                                                                                                                                                                                                                // not fight over the same voices every cycle.
+                                                                                                                                                                                                                                                                int refill_target = worker_freelist_keep(wd);
+                                                                                                                                                                                                                                                                while (wd->free_top + 1 < refill_target) {
                                                                                                                                                                                                                                                                 int vid = alloc_voice_lockfree(-1);
                                                                                                                                                                                                                                                                 if (vid < 0) break; // global pool empty
                                                                                                                                                                                                                                                                 // Mark as fully idle so it's safe to hand out
@@ -3524,7 +3633,12 @@ vid = steal_voice_fast(wd, e.ch, widx, incoming_loudness, original_volume_unit, 
                                                                                                                                                                                                                                                                 if (stolen) logger_log("NOTE_ON: ch=%d key=%d vel=%d layer=%d GOT_STOLEN_VID=%d\n",
                                                                                                                                                                                                                                                                 e.ch, e.key, e.value, layer_index, vid);
                                                                                                                                                                                                                                                                 #endif
-                                                                                                                                                                                                                                                                if (vid < 0) continue;
+                                                                                                                                                                                                                                                                if (vid < 0) {
+                                                                                                                                                                                                                                                                // No free voice anywhere and nothing stealable: the note is lost.
+                                                                                                                                                                                                                                                                // Counted so the UI can show it; previously invisible.
+                                                                                                                                                                                                                                                                ++wd->drops_local;
+                                                                                                                                                                                                                                                                continue;
+                                                                                                                                                                                                                                                                }
 
                                                                                                                                                                                                                                                                 if (stolen) {
                                                                                                                                                                                                                                                                 voice *stolen_v = &voices[vid];
@@ -5455,6 +5569,8 @@ g_worker_count = desired;
                                                                                                                                                                                                                                                                 g_workers[w].release_best_idx = -1;
                                                                                                                                                                                                                                                                 g_workers[w].release_best_score = FLT_MAX;
                                                                                                                                                                                                                                                                 g_workers[w].steals_local = 0;
+                                                                                                                                                                                                                                                                g_workers[w].rebalanced_local = 0;
+                                                                                                                                                                                                                                                                g_workers[w].drops_local = 0;
                                                                                                                                                                                                                                                                 g_workers[w].note_region_cache = (note_region_cache_entry*)calloc(NOTE_REGION_CACHE_SIZE, sizeof(note_region_cache_entry));
                                                                                                                                                                                                                                                                 g_workers[w].note_single_region_cache = (note_single_region_cache_entry*)calloc(
                                                                                                                                                                                                                                                                     MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT,
@@ -6669,14 +6785,20 @@ ss_game_mix_float(out_buffer, num_frames, channels, g_audio.sample_rate);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 VoiceStats GetVoiceStats(void) {
                                                                                                                                                                                                                                                                 long steals = 0;
+                                                                                                                                                                                                                                                                long rebalanced = 0;
+                                                                                                                                                                                                                                                                long drops = 0;
                                                                                                                                                                                                                                                                 if (g_workers && g_worker_count > 0) {
                                                                                                                                                                                                                                                                 for (int w = 0; w < g_worker_count; ++w) {
                                                                                                                                                                                                                                                                 steals += g_workers[w].steals_local;
+                                                                                                                                                                                                                                                                rebalanced += g_workers[w].rebalanced_local;
+                                                                                                                                                                                                                                                                drops += g_workers[w].drops_local;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 } else {
                                                                                                                                                                                                                                                                 steals = g_voice_stats.steals;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 g_voice_stats.steals = steals;
+                                                                                                                                                                                                                                                                g_voice_stats.rebalanced = rebalanced;
+                                                                                                                                                                                                                                                                g_voice_stats.drops = drops;
                                                                                                                                                                                                                                                                 return g_voice_stats;
                                                                                                                                                                                                                                                                 }
 /*

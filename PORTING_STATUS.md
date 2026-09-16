@@ -388,11 +388,49 @@ uses every logical thread, any other value sets the thread count, and the Voices
 field is the total pool divided across them.
 
 A worker still steals only voices it owns, so dividing a small pool across many
-threads makes stealing start EARLIER than a shared pool would: a hot worker
-exhausts its share while other workers still hold free voices. This is the
+threads made stealing start EARLIER than a shared pool would: a hot worker
+exhausted its share while other workers still held free voices. This is the
 trade-off the native `STEAL_SHARED_POOL_VOICES` rule avoided by collapsing to
-one worker at low caps. Size the pool for the thread count rather than trimming
-the thread count, and watch `VOICES/WKR` against `STEALS/s`.
+one worker at low caps.
+
+### Per-cycle freelist rebalance (Update 0 Revision 21)
+
+The fair-share batch fixed seeding but not the steady state. A finished voice
+goes back to the stack of the worker that owned it and nothing ever moved it
+back to the global pool, so once the pool had been drained the free voices
+stayed wherever they happened to end. With hash sharding a run of chords on a
+few keys keeps one worker busy while the others release everything: that
+worker reaches zero, finds `g_free_head == -1`, and either steals a voice that
+did not need to die or, with nothing of its own active, drops the note. This
+is the "notes that do not sound with many workers" of HANDOFF 7.1, and it is
+not the stealer either.
+
+`rebalance_worker_freelist()` runs at the top of every worker cycle, before
+events are processed. The worker keeps as many free voices as it has events
+queued (`worker_freelist_keep`, capped at `WORKER_FREELIST_KEEP_MAX` = 128) and
+hands the rest back to the Treiber pool. The surplus is linked into one chain
+through `g_next_free` first, so the return is one CAS regardless of how many
+voices go back; the allocation hot path (`free_pop`) is unchanged. Two things
+were made consistent with that bound so they do not fight it every cycle: the
+refill batch never pulls more than the worker's remaining events (+1 in
+flight) can use, and the per-cycle pre-refill targets `keep()` instead of a
+fixed 128.
+
+The invariant this buys, stated per cycle: a sounding voice is stolen only when
+the global pool is empty AND every free voice left anywhere is reserved by a
+worker about to use it. The host test includes the real block extracted from
+`voice.c`, reproduces the bug with rebalance off (1792 fall-throughs at 4096/8),
+then proves zero fall-throughs across 1024..16384 voices x 2..24 workers, plus
+conservation, chain integrity and an 8-thread stress against the single CAS
+pool:
+
+    python3 tools/extract_voice_rebalance_logic.py
+    cc -O1 -Wall -pthread -o /tmp/b tools/worker_freelist_borrow_check.c && /tmp/b
+
+Two counters make the effect visible: `REBAL/s` (voices handed back per second,
+`ssw_rebalanced()`) and `DROPPED` (note-ons lost with no sound, cumulative,
+`ssw_dropped_notes()`). Before this the drop path was invisible in every stat.
+Not measured in the browser yet; it is a structural fix with a host proof.
 
 Render cost scales with ACTIVE voices, not with the cap, so the cap only decides
 how much memory is reserved and when stealing starts. Lowering it to save CPU

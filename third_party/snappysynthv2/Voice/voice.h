@@ -97,6 +97,8 @@ typedef struct {
     int active_voices;
     int free_voices;
     long steals;
+    long rebalanced; /* free voices workers returned to the global pool (cumulative) */
+    long drops;      /* note-ons lost: no free voice anywhere, nothing stealable (cumulative) */
 } VoiceStats;
 
 VoiceStats GetVoiceStats(void);

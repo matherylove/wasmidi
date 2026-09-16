@@ -949,6 +949,25 @@ Item {
                         font.pixelSize: 7
                         font.bold: true
                     }
+                    Text {
+                        // Free voices workers handed back to the shared pool
+                        // per second. Non-zero while STEALS/s is high means
+                        // the pool is genuinely full; zero while notes vanish
+                        // means a worker is hoarding.
+                        text: "REBAL/s " + root.formatInteger(root.mainWindow.synthRebalanced)
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        // Note-ons that produced no sound: nothing free
+                        // anywhere and nothing to steal. Cumulative so a lost
+                        // note stays on screen.
+                        text: "DROPPED " + root.formatInteger(root.mainWindow.synthDroppedNotes)
+                        color: root.mainWindow.synthDroppedNotes > 0 ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
                 }
 
                 RowLayout {
@@ -964,8 +983,9 @@ Item {
                         font.bold: true
                     }
                     Text {
-                        // A worker can only steal voices it owns, so the share
-                        // per worker is what decides when stealing starts.
+                        // A worker steals only voices it owns. Free voices are
+                        // rebalanced through the shared pool every cycle, so
+                        // this share bounds stealing, not allocation.
                         text: "VOICES/WKR " + root.formatInteger(
                                   Math.floor(root.mainWindow.synthMaxVoices /
                                       Math.max(1, root.mainWindow.synthWorkerCount)))
@@ -1079,7 +1099,7 @@ Item {
                                 text = String(root.mainWindow.synthWorkers)
                             }
                             ToolTip.visible: hovered
-                            ToolTip.text: "0 = every logical thread the browser reports. Brave and some others under-report this for fingerprinting defence, so 0 can give far fewer workers than the CPU has; set the count explicitly and it wins over the reported value. The voice pool is divided across the workers, and a worker can only steal voices it owns, so a small pool over many threads starts stealing earlier. Watch VOICES/WKR and STEALS/s together."
+                            ToolTip.text: "0 = every logical thread the browser reports. Brave and some others under-report this for fingerprinting defence, so 0 can give far fewer workers than the CPU has; set the count explicitly and it wins over the reported value. The voice pool is divided across the workers. Free voices are handed back to the shared pool every cycle (REBAL/s), so a worker never drops or steals a note while another worker has an idle free voice; a worker still steals only voices it owns. Watch VOICES/WKR, STEALS/s and DROPPED together."
                         }
 
                         Item { Layout.fillWidth: true }

@@ -1112,6 +1112,21 @@ EM_JS(int, wasmidi_snappy_steals, (), {
     return b && b.state ? (Number(b.state.steals) | 0) : 0;
 });
 
+// Free voices handed back to the global pool per second. Non-zero while the
+// per-worker freelists are being rebalanced; zero with notes vanishing means
+// the workers are hoarding.
+EM_JS(int, wasmidi_snappy_rebalanced, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.rebalanced) | 0) : 0;
+});
+
+// Note-ons that produced no sound: no free voice anywhere and nothing to
+// steal. Cumulative on purpose; a lost note should stay visible.
+EM_JS(int, wasmidi_snappy_dropped_notes, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.droppedNotes) | 0) : 0;
+});
+
 // Render telemetry. Carried in the bridge state rather than printed: console
 // output from the synth worker at this rate costs the main thread real time.
 // Scaled by 10 so the value survives the int round trip with one decimal.
@@ -3913,6 +3928,8 @@ void MainWindow::pollSynthState()
     const int active = wasmidi_snappy_active_voices();
     const int freeVoices = wasmidi_snappy_free_voices();
     const int steals = wasmidi_snappy_steals();
+    const int rebalanced = wasmidi_snappy_rebalanced();
+    const int droppedNotes = wasmidi_snappy_dropped_notes();
     const int layers = wasmidi_snappy_layers();
     const int regions = wasmidi_snappy_regions();
     const int workerCount = wasmidi_snappy_worker_count();
@@ -3929,6 +3946,7 @@ void MainWindow::pollSynthState()
         ready != synthReady_ || loaded != soundfontLoaded_ ||
         sampleRate != synthSampleRate_ || active != synthActiveVoices_ ||
         freeVoices != synthFreeVoices_ || steals != synthSteals_ ||
+        rebalanced != synthRebalanced_ || droppedNotes != synthDroppedNotes_ ||
         wasmidi_snappy_render_load_x10() / 10.0 != synthRenderLoad_ ||
         layers != synthLayers_ || regions != synthRegions_ ||
         workerCount != synthWorkerCount_ ||
@@ -3940,6 +3958,8 @@ void MainWindow::pollSynthState()
     synthActiveVoices_ = active;
     synthFreeVoices_ = freeVoices;
     synthSteals_ = steals;
+    synthRebalanced_ = rebalanced;
+    synthDroppedNotes_ = droppedNotes;
     synthRenderLoad_ = wasmidi_snappy_render_load_x10() / 10.0;
     synthRenderLatencyMs_ = wasmidi_snappy_render_latency_x100() / 100.0;
     synthDispatchMs_ = wasmidi_snappy_dispatch_x100() / 100.0;
