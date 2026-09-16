@@ -903,6 +903,17 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Share of the block spent admitting events instead of
+                        // rendering voices. Dispatch is single threaded, so a
+                        // large value here is why more workers stop helping.
+                        text: "EVT " + root.formatNumber(root.mainWindow.synthDispatchMs, 1) + "ms"
+                        color: root.mainWindow.synthDispatchMs >
+                                   root.mainWindow.synthRenderLatencyMs * 0.4
+                            ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         text: "RING " + root.formatInteger(root.mainWindow.synthRingFill) + "%"
                         color: root.mainWindow.synthRingFill < 20 ? "#f59e0b" : "#70667e"
                         font.pixelSize: 7

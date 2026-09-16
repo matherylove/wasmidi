@@ -27,6 +27,7 @@
         maxVoices: 16384,
         renderLoadPercent: 0,
         lastRenderMs: 0,
+        lastDispatchMs: 0,
         ringFillPercent: 0,
         pumpGapMs: 0,
         blocksPerPump: 0,
@@ -270,6 +271,8 @@
                     state.renderLoadPercent = data.renderLoadPercent;
                 if (Number.isFinite(data.lastRenderMs))
                     state.lastRenderMs = data.lastRenderMs;
+                if (Number.isFinite(data.lastDispatchMs))
+                    state.lastDispatchMs = data.lastDispatchMs;
                 if (Number.isFinite(data.ringFillPercent))
                     state.ringFillPercent = data.ringFillPercent;
                 if (Number.isFinite(data.pumpGapMs))

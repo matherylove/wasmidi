@@ -23,6 +23,15 @@ static double g_render_load_ema = -1.0;
  * the load EMA this separates "out of CPU" from "out of data": both produce
  * underruns and they need opposite fixes. */
 static double g_last_render_us = 0.0;
+/*
+ * Split of that cost. ssw_render_queued_into() does two very different jobs:
+ * it dispatches every event in the block, and it renders voices. Only the
+ * second is spread across the worker pool; dispatch runs alone on this thread.
+ * Timing them together cannot explain why adding workers stops helping, so
+ * they are measured apart.
+ */
+static double g_last_dispatch_us = 0.0;
+static double g_dispatch_accum_us = 0.0;
 static int g_ready = 0;
 static int g_max_voices = 16384;
 static int g_min_voices = 0;
@@ -917,6 +926,7 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
     unsigned char note_pending[16];
 
     memset(note_pending, 0, sizeof(note_pending));
+    g_dispatch_accum_us = 0.0;
     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
 
     while (g_event_head) {
@@ -973,9 +983,14 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                     voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
                 }
 
-                dispatch_short_at_qpc(
-                    event->message,
-                    g_render_cursor + (frame - segment_start));
+                {
+                    const double dispatch_started = ssw_now_ms();
+                    dispatch_short_at_qpc(
+                        event->message,
+                        g_render_cursor + (frame - segment_start));
+                    g_dispatch_accum_us +=
+                        (ssw_now_ms() - dispatch_started) * 1000.0;
+                }
 
                 if (command == 0x90u || command == 0x80u)
                     note_pending[ch] = 1u;
@@ -1004,6 +1019,7 @@ events_done:
     {
         const double elapsed_ms = ssw_now_ms() - started_ms;
         g_last_render_us = elapsed_ms * 1000.0;
+        g_last_dispatch_us = g_dispatch_accum_us;
         ssw_update_render_budget(elapsed_ms, frames);
     }
     return 1;
@@ -1037,6 +1053,10 @@ int ssw_render_load_x1000(void) {
     return (int)(load * 1000.0 + 0.5);
 }
 int ssw_last_render_us(void) { return (int)(g_last_render_us + 0.5); }
+/* Of the block's cost, the part spent admitting events rather than rendering
+ * voices. This part is single threaded, so a large share here is why adding
+ * workers stops helping. */
+int ssw_last_dispatch_us(void) { return (int)(g_last_dispatch_us + 0.5); }
 int ssw_render_budget(void) { return g_render_budget; }
 int ssw_detected_cores(void) { return voice_get_detected_cores(); }
 

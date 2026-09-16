@@ -95,6 +95,10 @@ function postState(type, extra = {}) {
             coreReady && Module
                 ? Module._ssw_last_render_us() / 1000
                 : 0,
+        lastDispatchMs:
+            coreReady && Module
+                ? Module._ssw_last_dispatch_us() / 1000
+                : 0,
         renderBudget:
             coreReady && Module ? Module._ssw_render_budget() : 0,
         ringFillPercent: telemetryRingFill * 100,
