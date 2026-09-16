@@ -870,8 +870,19 @@ Item {
                     }
 
                     Text {
-                        text: "STEALS/s " + root.formatInteger(root.mainWindow.synthSteals)
-                        color: root.mainWindow.synthSteals > 0 ? "#fb923c" : "#70667e"
+                        // These two values choose the next performance fix, so
+                        // keep them on the non-wrapping summary row. On a narrow
+                        // panel they previously landed below the visible part of
+                        // the telemetry Flow.
+                        text: "SIMD " + root.formatInteger(root.mainWindow.synthSimdPercent) + "%"
+                        color: root.mainWindow.synthSimdPercent < 50 ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+
+                    Text {
+                        text: "BUSY " + root.formatNumber(root.mainWindow.synthWorkerBusyMs, 0) + "ms"
+                        color: "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }
@@ -914,21 +925,17 @@ Item {
                         font.bold: true
                     }
                     Text {
-                        // Share of voices taking the SIMD batch path. A low
-                        // value means the entry conditions are rejecting them
-                        // into the scalar loop, which a block time alone cannot
-                        // show.
-                        text: "SIMD " + root.formatInteger(root.mainWindow.synthSimdPercent) + "%"
-                        color: root.mainWindow.synthSimdPercent < 50 ? "#ef4444" : "#70667e"
+                        text: "STEALS/s " + root.formatInteger(root.mainWindow.synthSteals)
+                        color: root.mainWindow.synthSteals > 0 ? "#fb923c" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }
                     Text {
-                        // Summed busy time across workers. Near workers x block
-                        // time means real parallelism; near block time alone
-                        // means they are serialized.
-                        text: "BUSY " + root.formatNumber(root.mainWindow.synthWorkerBusyMs, 0) + "ms"
-                        color: "#70667e"
+                        // Note-ons that produced no sound: nothing free
+                        // anywhere and nothing to steal. Cumulative so a lost
+                        // note stays on screen.
+                        text: "DROPPED " + root.formatInteger(root.mainWindow.synthDroppedNotes)
+                        color: root.mainWindow.synthDroppedNotes > 0 ? "#ef4444" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }
@@ -956,15 +963,6 @@ Item {
                         // means a worker is hoarding.
                         text: "REBAL/s " + root.formatInteger(root.mainWindow.synthRebalanced)
                         color: "#70667e"
-                        font.pixelSize: 7
-                        font.bold: true
-                    }
-                    Text {
-                        // Note-ons that produced no sound: nothing free
-                        // anywhere and nothing to steal. Cumulative so a lost
-                        // note stays on screen.
-                        text: "DROPPED " + root.formatInteger(root.mainWindow.synthDroppedNotes)
-                        color: root.mainWindow.synthDroppedNotes > 0 ? "#ef4444" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }

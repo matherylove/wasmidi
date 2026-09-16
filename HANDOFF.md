@@ -169,8 +169,13 @@ conclusiones sobre el conteo de workers. Inválido. Siempre fijar el archivo.
 
 ## 4. Estado del diagnóstico de rendimiento
 
-Última medición: `LOAD 475%`, `BLOCK 55.6ms`, `EVT 0.3ms`, `STEALS/s 3156`,
-`FREE 134`, 24 workers, 8192 voces, bloque 512, bufs 48.
+Última medición (navegador, rev. 21): `LOAD 494%`, `BLOCK 56.2ms`, `EVT 0.1ms`,
+`STEALS/s 2220`, `FREE 40`, `RING 26%`, `LATE 45ms`, `UNDERRUNS 841`,
+16 workers, 8192 voces, bloque 512, bufs 48. Confirma que el rebalance de
+freelist no era una mejora de throughput: arregla admisión justa, pero el DSP
+sigue tardando casi cinco veces el presupuesto real. `SIMD %` y `BUSY ms`
+quedaron fuera de la captura por el ancho del panel; ahora están en la primera
+fila siempre visible. Son los próximos números obligatorios antes de optimizar.
 
 ### Descartado con medición. No volver a perseguirlo.
 
