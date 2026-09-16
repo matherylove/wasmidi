@@ -66,6 +66,8 @@ class MainWindow : public QObject {
     Q_PROPERTY(double synthRenderLoad READ synthRenderLoad NOTIFY synthStateChanged)
     Q_PROPERTY(double synthRenderLatencyMs READ synthRenderLatencyMs NOTIFY synthStateChanged)
     Q_PROPERTY(double synthDispatchMs READ synthDispatchMs NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthSimdPercent READ synthSimdPercent NOTIFY synthStateChanged)
+    Q_PROPERTY(double synthWorkerBusyMs READ synthWorkerBusyMs NOTIFY synthStateChanged)
     Q_PROPERTY(int synthPumpGapMs READ synthPumpGapMs NOTIFY synthStateChanged)
     Q_PROPERTY(int synthRingFill READ synthRingFill NOTIFY synthStateChanged)
     Q_PROPERTY(int synthLayers READ synthLayers NOTIFY synthStateChanged)
@@ -142,6 +144,8 @@ public:
     double synthRenderLoad() const { return synthRenderLoad_; }
     double synthRenderLatencyMs() const { return synthRenderLatencyMs_; }
     double synthDispatchMs() const { return synthDispatchMs_; }
+    int synthSimdPercent() const { return synthSimdPercent_; }
+    double synthWorkerBusyMs() const { return synthWorkerBusyMs_; }
     int synthPumpGapMs() const { return synthPumpGapMs_; }
     int synthRingFill() const { return synthRingFill_; }
     int synthLayers() const { return synthLayers_; }
@@ -428,6 +432,8 @@ private:
     double synthRenderLoad_ = 0.0;
     double synthRenderLatencyMs_ = 0.0;
     double synthDispatchMs_ = 0.0;
+    int synthSimdPercent_ = 0;
+    double synthWorkerBusyMs_ = 0.0;
     int synthPumpGapMs_ = 0;
     int synthRingFill_ = 0;
     int synthLayers_ = 0;

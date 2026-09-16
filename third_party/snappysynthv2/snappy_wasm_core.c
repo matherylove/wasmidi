@@ -1060,6 +1060,22 @@ int ssw_last_dispatch_us(void) { return (int)(g_last_dispatch_us + 0.5); }
 int ssw_render_budget(void) { return g_render_budget; }
 int ssw_detected_cores(void) { return voice_get_detected_cores(); }
 
+/*
+ * Render path split for the last cycle. The SIMD batch has entry conditions
+ * (stereo, sustain, no interpolation, suitable frame count); a voice missing
+ * any of them falls to the scalar loop. A block time alone cannot distinguish
+ * an expensive DSP from one where almost nothing is vectorized.
+ */
+int ssw_path_fast_voices(void) { return voice_get_path_fast(); }
+int ssw_path_scalar_voices(void) { return voice_get_path_scalar(); }
+/*
+ * Summed busy time across workers for the last cycle. Compared against the
+ * block's own wall clock this says whether the pool actually overlaps: near the
+ * worker count times the block time means real parallelism, near the block time
+ * alone means the workers are serialized.
+ */
+int ssw_worker_busy_us(void) { return voice_get_worker_busy_us(); }
+
 void ssw_shutdown(void) {
     if (g_ready) voice_shutdown();
     g_ready = 0;

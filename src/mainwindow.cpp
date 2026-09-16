@@ -1130,6 +1130,20 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
     return b && b.state ? Math.round((Number(b.state.lastDispatchMs) || 0) * 100) : 0;
 });
 
+EM_JS(int, wasmidi_snappy_path_simd_percent, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (!b || !b.state) return 0;
+    const fast = Number(b.state.pathFastVoices) || 0;
+    const scalar = Number(b.state.pathScalarVoices) || 0;
+    const total = fast + scalar;
+    return total > 0 ? Math.round((fast * 100) / total) : 0;
+});
+
+EM_JS(int, wasmidi_snappy_worker_busy_x10, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? Math.round((Number(b.state.workerBusyMs) || 0) * 10) : 0;
+});
+
 EM_JS(int, wasmidi_snappy_pump_gap_ms, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? Math.round(Number(b.state.pumpGapMs) || 0) : 0;
@@ -3929,6 +3943,8 @@ void MainWindow::pollSynthState()
     synthRenderLoad_ = wasmidi_snappy_render_load_x10() / 10.0;
     synthRenderLatencyMs_ = wasmidi_snappy_render_latency_x100() / 100.0;
     synthDispatchMs_ = wasmidi_snappy_dispatch_x100() / 100.0;
+    synthSimdPercent_ = wasmidi_snappy_path_simd_percent();
+    synthWorkerBusyMs_ = wasmidi_snappy_worker_busy_x10() / 10.0;
     synthPumpGapMs_ = wasmidi_snappy_pump_gap_ms();
     synthRingFill_ = wasmidi_snappy_ring_fill();
     synthLayers_ = layers;

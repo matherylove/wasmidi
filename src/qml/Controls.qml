@@ -914,6 +914,25 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Share of voices taking the SIMD batch path. A low
+                        // value means the entry conditions are rejecting them
+                        // into the scalar loop, which a block time alone cannot
+                        // show.
+                        text: "SIMD " + root.formatInteger(root.mainWindow.synthSimdPercent) + "%"
+                        color: root.mainWindow.synthSimdPercent < 50 ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
+                        // Summed busy time across workers. Near workers x block
+                        // time means real parallelism; near block time alone
+                        // means they are serialized.
+                        text: "BUSY " + root.formatNumber(root.mainWindow.synthWorkerBusyMs, 0) + "ms"
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         text: "RING " + root.formatInteger(root.mainWindow.synthRingFill) + "%"
                         color: root.mainWindow.synthRingFill < 20 ? "#f59e0b" : "#70667e"
                         font.pixelSize: 7

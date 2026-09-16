@@ -1,4 +1,39 @@
-# Handoff — Update 0 Revision 19
+# Handoff — Update 0 Revision 20
+
+## Estado del diagnóstico de rendimiento (leer primero)
+
+`LOAD 475%`, `BLOCK 55.6ms`, `EVT 0.3ms`, `STEALS/s 3156`, `FREE 134`,
+24 workers, 8192 voces.
+
+**Descartado con medición, no repetir:**
+
+- *No* es cadencia del pump. Eso se arregló: underruns 4.770 → 82.
+- *No* es el pool de voces por sí solo. Con el pool sano igual da 475%.
+- *No* es el despacho de eventos. `EVT` es 0,3 ms de 55,6 ms, o sea 0,5%.
+  Esta era mi hipótesis y **era falsa**. No la persigan de nuevo.
+
+**La cuenta que queda abierta:** 8.058 voces × 512 frames ÷ 55,3 ms = 74,6 M
+voice-samples/s en total. El nativo sostiene ~361 M/s en 16 hilos, o sea 22,6 M
+por hilo. Con 24 workers se está obteniendo el equivalente a poco más de 3
+hilos nativos. O casi nada se vectoriza, o los workers no se solapan.
+
+**Los dos números que lo resuelven, ya instrumentados en esta revisión:**
+
+- `SIMD %` — porción de voces que toma el batch SIMD. Bajo significa que las
+  condiciones de entrada (estéreo, sustain, sin interpolación, frames aptos)
+  las están rechazando al camino escalar.
+- `BUSY ms` — tiempo ocupado sumado entre workers en el último ciclo. Cerca de
+  `workers × BLOCK` significa paralelismo real; cerca de `BLOCK` a secas
+  significa que están serializados.
+
+Cómo interpretar la próxima captura:
+
+| SIMD | BUSY | Conclusión |
+|------|------|-----------|
+| bajo | alto | El DSP corre en escalar. Relajar condiciones de entrada o agrupar voces compatibles antes de renderizar. |
+| alto | bajo | Los workers no se solapan. Mirar la barrera y el reparto de la render queue. |
+| bajo | bajo | Ambos. Empezar por SIMD. |
+| alto | alto | El DSP es genuinamente así de caro en WASM y hay que revisar la meta de 8192 voces. |
 
 ## Qué hice en este update
 

@@ -2482,6 +2482,31 @@ static inline int releasepool_take(worker_data *wd, float incoming_x08, int inco
 
                                                                                                                                                                                                                                                                 // Bulk-drain global CAS pool into worker-local freelist.
                                                                                                                                                                                                                                                                 // Amortises the serialising CAS cost across 512 note-ons instead of 1.
+/*
+ * Render path instrumentation.
+ *
+ * The SIMD batch path has entry conditions: stereo, in sustain, no
+ * interpolation, and a frame count that suits the batch. A voice that misses
+ * any of them falls to the scalar loop. Measuring the split is the only way to
+ * tell "the DSP is genuinely this expensive" from "almost nothing is taking the
+ * vector path", which look identical from the block time alone.
+ *
+ * Also accumulate per-cycle worker busy time. If the busy total across workers
+ * matches the block's wall clock they really are running in parallel and the
+ * cost is in the DSP; if it is far smaller they are not overlapping and the
+ * problem is elsewhere.
+ */
+static volatile LONG g_path_fast_voices = 0;
+static volatile LONG g_path_scalar_voices = 0;
+static volatile LONG g_worker_busy_us = 0;
+static volatile LONG g_path_fast_last = 0;
+static volatile LONG g_path_scalar_last = 0;
+static volatile LONG g_worker_busy_last = 0;
+
+int voice_get_path_fast(void) { return (int)g_path_fast_last; }
+int voice_get_path_scalar(void) { return (int)g_path_scalar_last; }
+int voice_get_worker_busy_us(void) { return (int)g_worker_busy_last; }
+
 #define WORKER_FREELIST_REFILL 512
 /*
  * free_push() returns a voice to the worker's LOCAL stack, never to the global
@@ -4031,10 +4056,21 @@ if      (render_size >  32000) pop_chunk = 1024;
 else if (render_size >  16000) pop_chunk = 512;
 else                           pop_chunk = RENDER_POP_CHUNK;
 }
+LARGE_INTEGER ss_busy_begin, ss_busy_end, ss_busy_freq;
+QueryPerformanceFrequency(&ss_busy_freq);
+QueryPerformanceCounter(&ss_busy_begin);
 for (;;) {
 if (load_relaxed_long(&g_quit_flag)) return 0;
 LONG idx = InterlockedAdd(&g_render_pop, pop_chunk) - pop_chunk;
-if (idx >= render_size) break;
+if (idx >= render_size) {
+QueryPerformanceCounter(&ss_busy_end);
+if (ss_busy_freq.QuadPart > 0) {
+InterlockedAdd(&g_worker_busy_us,
+(LONG)(((ss_busy_end.QuadPart - ss_busy_begin.QuadPart) * 1000000)
+/ ss_busy_freq.QuadPart));
+}
+break;
+}
 LONG end = idx + pop_chunk; if (end > render_size) end = render_size;
 for (LONG k = idx; k < end; ++k) {
 #if defined(__AVX2__) || defined(__wasm_simd128__)
@@ -4049,9 +4085,11 @@ fast_batch = render_fast_stereo_sustain_batch_wasm(
 #endif
 }
 if (fast_batch > 0) {
+InterlockedAdd(&g_path_fast_voices, (LONG)fast_batch);
 k += (LONG)fast_batch - 1;
 continue;
 }
+InterlockedAdd(&g_path_scalar_voices, 1);
 #endif
                                                                                                                                                                                                                                                                 int vid = g_render_queue[k];
                                                                                                                                                                                                                                                                 if (vid < 0 || vid >= max_voices) continue;
@@ -6294,6 +6332,14 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 void voice_render_float(float *out_buffer, int num_frames) {
+/* Snapshot the previous cycle's split before clearing it for this one. */
+g_path_fast_last = g_path_fast_voices;
+g_path_scalar_last = g_path_scalar_voices;
+g_worker_busy_last = g_worker_busy_us;
+g_path_fast_voices = 0;
+g_path_scalar_voices = 0;
+g_worker_busy_us = 0;
+
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
                                                                                                                                                                                                                                                                 logger_log("voice_render_float: Entered with num_frames=%d.\n", num_frames);
                                                                                                                                                                                                                                                                 #endif

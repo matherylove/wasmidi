@@ -28,6 +28,9 @@
         renderLoadPercent: 0,
         lastRenderMs: 0,
         lastDispatchMs: 0,
+        pathFastVoices: 0,
+        pathScalarVoices: 0,
+        workerBusyMs: 0,
         ringFillPercent: 0,
         pumpGapMs: 0,
         blocksPerPump: 0,
@@ -273,6 +276,12 @@
                     state.lastRenderMs = data.lastRenderMs;
                 if (Number.isFinite(data.lastDispatchMs))
                     state.lastDispatchMs = data.lastDispatchMs;
+                if (Number.isFinite(data.pathFastVoices))
+                    state.pathFastVoices = data.pathFastVoices;
+                if (Number.isFinite(data.pathScalarVoices))
+                    state.pathScalarVoices = data.pathScalarVoices;
+                if (Number.isFinite(data.workerBusyMs))
+                    state.workerBusyMs = data.workerBusyMs;
                 if (Number.isFinite(data.ringFillPercent))
                     state.ringFillPercent = data.ringFillPercent;
                 if (Number.isFinite(data.pumpGapMs))
