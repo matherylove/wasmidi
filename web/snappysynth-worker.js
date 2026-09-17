@@ -1058,6 +1058,9 @@ onmessage = async event => {
 
             const path = mountSoundfontFile(file);
             const regions = callLoadSoundfont(path);
+            if (regions > 0) {
+                Module._ssw_warmup();
+            }
             if (regions <= 0) {
                 // Roll back the failed layer mount/list entry.
                 const mount = soundfontMounts.pop();

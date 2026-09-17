@@ -565,6 +565,22 @@ int ssw_load_sf2(const char* path) {
     return instrument->num_regions;
 }
 
+int ssw_warmup(void) {
+    if (!g_ready || !instrument || !instrument->num_regions) return 0;
+    const int frames = g_cfg.buffer_size > 0 ? g_cfg.buffer_size : 512;
+    const int channels = g_cfg.num_channels > 0 ? g_cfg.num_channels : 2;
+    float *scratch = (float*)calloc((size_t)frames * (size_t)channels, sizeof(float));
+    if (!scratch) return 0;
+    uint32_t note_on = 0x90u | (0u & 0x0fu);
+    note_on |= (60u << 8);
+    note_on |= (80u << 16);
+    dispatch_short_at_qpc(note_on, 0);
+    voice_render_float(scratch, frames);
+    voice_reset();
+    free(scratch);
+    return 1;
+}
+
 void ssw_clear_soundfonts(void) {
     if (g_ready) {
         voice_shutdown();
@@ -843,21 +859,12 @@ static int ssw_affects_sounding_voices(uint32_t message) {
         return 0;
 
     switch ((message >> 8) & 0x7fu) {
-        case 1:                         /* modulation */
-        case 2:                         /* breath */
-        case 4:                         /* foot */
-        case 5:                         /* portamento time */
-        case 7:                         /* volume */
-        case 10:                        /* pan */
-        case 11:                        /* expression */
         case 64:                        /* sustain */
         case 65:                        /* portamento on/off */
-        case 71:                        /* resonance */
-        case 72:                        /* release */
-        case 73:                        /* attack */
-        case 74:                        /* cutoff */
-        case 91:                        /* reverb send */
-        case 93:                        /* chorus send */
+        // All other CCs (volume, pan, expression, modulation, cutoff, etc.) are
+        // removed from the boundary-forcing list. They update g_channel_render
+        // silently and the next voice_render_float picks them up without splitting.
+        // With 100k+ CC/s this prevents thousands of segment splits per second.
             return 1;
         default:
             return 0;
