@@ -220,12 +220,9 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                 }
 
                 {
-                    const double dispatch_started = ssw_now_ms();
                     dispatch_short_at_qpc(
                         event->message,
                         g_render_cursor + (frame - segment_start));
-                    g_dispatch_accum_us +=
-                        (ssw_now_ms() - dispatch_started) * 1000.0;
                 }
 
                 if (command == 0x90u || command == 0x80u)
