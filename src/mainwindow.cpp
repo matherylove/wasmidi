@@ -1149,7 +1149,7 @@ EM_JS(int, wasmidi_snappy_path_simd_percent, (), {
     const b = globalThis.WasmidiSnappyBridge;
     if (!b || !b.state) return 0;
     const fast = Number(b.state.pathSimdVoiceVoices) || 0;
-    const scalar = Number(b.state.pathFastVoices) || 0;
+    const scalar = Number(b.state.pathScalarVoices) || 0;
     const total = fast + scalar;
     return total > 0 ? Math.round((fast * 100) / total) : 0;
 });
