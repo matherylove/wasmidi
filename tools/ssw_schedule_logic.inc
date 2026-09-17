@@ -79,21 +79,12 @@ static int ssw_affects_sounding_voices(uint32_t message) {
         return 0;
 
     switch ((message >> 8) & 0x7fu) {
-        case 1:                         /* modulation */
-        case 2:                         /* breath */
-        case 4:                         /* foot */
-        case 5:                         /* portamento time */
-        case 7:                         /* volume */
-        case 10:                        /* pan */
-        case 11:                        /* expression */
         case 64:                        /* sustain */
         case 65:                        /* portamento on/off */
-        case 71:                        /* resonance */
-        case 72:                        /* release */
-        case 73:                        /* attack */
-        case 74:                        /* cutoff */
-        case 91:                        /* reverb send */
-        case 93:                        /* chorus send */
+        // All other CCs (volume, pan, expression, modulation, cutoff, etc.) are
+        // removed from the boundary-forcing list. They update g_channel_render
+        // silently and the next voice_render_float picks them up without splitting.
+        // With 100k+ CC/s this prevents thousands of segment splits per second.
             return 1;
         default:
             return 0;
