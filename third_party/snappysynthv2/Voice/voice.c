@@ -2592,6 +2592,42 @@ static int rebalance_worker_freelist(worker_data *wd) {
 static volatile LONG g_path_fast_voices = 0;
 static volatile LONG g_path_scalar_voices = 0;
 static volatile LONG g_worker_busy_us = 0;
+/*
+ * How many distinct workers actually consumed at least one chunk of the render
+ * queue this cycle, and how many voices the queue held.
+ *
+ * BUSY alone cannot distinguish "the timer is wrong" from "the workers are not
+ * doing the work", and those need opposite fixes. Participation says which: if
+ * it reports 24 while BUSY reads 0 the timer is at fault; if it reports 1 or 2
+ * the pool is not sharing the queue and that is the real bug.
+ */
+static volatile LONG g_workers_participating = 0;
+static volatile LONG g_workers_participating_last = 0;
+static volatile LONG g_render_queue_size_last = 0;
+
+/*
+ * Re-apply the per-region runtime cache after a soundfont finishes loading.
+ *
+ * refresh_region_runtime_cache() folds sample_rate / g_audio.sample_rate into
+ * cached_pitch_base_multiplier, and it used to run only from
+ * voice_init_with_count(). On the FIRST soundfont the regions are created after
+ * that call, so they never received the correction: every voice then played at
+ * a ratio that is not 1.0, no_interp was false for all of them, and every voice
+ * fell out of the SIMD paths into the scalar loop. Loading a second soundfont
+ * re-entered init with regions present and silently fixed it, which is why the
+ * first load always performed badly and any reload appeared to "fix" it.
+ *
+ * The pitch multiplier is also what sets playback rate, so this is a correctness
+ * fix as much as a performance one.
+ */
+void voice_refresh_all_region_caches(void) {
+    if (!instrument) return;
+    for (int i = 0; i < instrument->num_regions; ++i)
+        refresh_region_runtime_cache(&instrument->regions[i]);
+}
+
+int voice_get_workers_participating(void) { return (int)g_workers_participating_last; }
+int voice_get_render_queue_size(void) { return (int)g_render_queue_size_last; }
 static volatile LONG g_path_fast_last = 0;
 static volatile LONG g_path_scalar_last = 0;
 static volatile LONG g_worker_busy_last = 0;
@@ -4216,6 +4252,7 @@ LONG render_size = load_relaxed_long(&g_render_size);
     pop_chunk = base > per_worker ? base : per_worker;
     pop_chunk = (pop_chunk + 7) & ~7;   // round to multiple of 8 for SIMD alignment
 }
+int ss_worker_counted = 0;
 LARGE_INTEGER ss_busy_begin, ss_busy_end, ss_busy_freq;
 QueryPerformanceFrequency(&ss_busy_freq);
 QueryPerformanceCounter(&ss_busy_begin);
@@ -4232,6 +4269,7 @@ InterlockedAdd(&g_worker_busy_us,
 break;
 }
 LONG end = idx + pop_chunk; if (end > render_size) end = render_size;
+if (!ss_worker_counted) { ss_worker_counted = 1; InterlockedAdd(&g_workers_participating, 1); }
 for (LONG k = idx; k < end; ++k) {
 #if defined(__AVX2__) || defined(__wasm_simd128__)
 int fast_batch = 0;
@@ -6606,6 +6644,8 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
 g_path_fast_last = g_path_fast_voices;
 g_path_scalar_last = g_path_scalar_voices;
 g_worker_busy_last = g_worker_busy_us;
+g_workers_participating_last = g_workers_participating;
+g_workers_participating = 0;
 g_path_simd_voice_last = g_path_simd_voice_voices;
 g_miss_interp_last = g_miss_interp;
 g_miss_loop_last = g_miss_loop;

@@ -869,11 +869,25 @@ Item {
                         font.bold: true
                     }
 
+                    Item { Layout.fillWidth: true }
+                }
+
+                // Telemetry gets its own line. A RowLayout does not wrap, so
+                // adding these to a full row pushed the controls below it off
+                // screen; Flow reflows instead.
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 7
+                    // No visibility gate. Hiding the row until the synth is
+                    // ready made half the counters vanish while the ones in the
+                    // row above stayed at zero, and made the panel jump when
+                    // the soundfont finished loading. Showing zeros is both
+                    // consistent and stable.
+
                     Text {
-                        // These two values choose the next performance fix, so
-                        // keep them on the non-wrapping summary row. On a narrow
-                        // panel they previously landed below the visible part of
-                        // the telemetry Flow.
+                        // Moved here from the summary RowLayout: that row does
+                        // not wrap, so on a narrow panel these ran off the right
+                        // edge. Flow reflows instead.
                         // Share of active voices that rendered entirely inside a
                         // per-voice SIMD fast path (WASM, AVX2 or AVX512 sustain
                         // no-interp). Distinct from the multi-voice batch counter.
@@ -901,18 +915,6 @@ Item {
                         font.pixelSize: 7
                         font.bold: true
                     }
-
-                    Item { Layout.fillWidth: true }
-                }
-
-                // Telemetry gets its own line. A RowLayout does not wrap, so
-                // adding these to a full row pushed the controls below it off
-                // screen; Flow reflows instead.
-                Flow {
-                    Layout.fillWidth: true
-                    spacing: 7
-                    visible: root.mainWindow.synthReady
-
                     Text {
                         // Render cost as a share of the block's own realtime
                         // budget. Over 100 means a block took longer to render

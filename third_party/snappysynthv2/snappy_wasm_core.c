@@ -562,6 +562,24 @@ int ssw_load_sf2(const char* path) {
 
     ++g_soundfont_layers;
     sfz_apply_presampling(instrument, g_cfg.sample_rate);
+    /*
+     * Re-apply the per-region runtime cache now that the regions exist.
+     *
+     * refresh_region_runtime_cache() folds sample_rate / g_audio.sample_rate
+     * into cached_pitch_base_multiplier, and it used to run only from
+     * voice_init_with_count(). On the FIRST soundfont the regions are created
+     * after that call, so they never received the correction: every voice
+     * played at a ratio that is not 1.0, no_interp was false for all of them,
+     * and every voice fell out of the SIMD paths into the scalar loop.
+     * Loading a second soundfont re-entered init with regions present and
+     * silently fixed it, which is why the first load always performed badly
+     * and any reload appeared to cure it -- reported as 400% load in sessions
+     * with no real work in them.
+     *
+     * The pitch multiplier also sets playback rate, so this is a correctness
+     * fix as much as a performance one.
+     */
+    voice_refresh_all_region_caches();
     return instrument->num_regions;
 }
 
@@ -1106,6 +1124,10 @@ int ssw_path_scalar_voices(void) { return voice_get_path_scalar(); }
  * looping needs the wrap inside the vector loop, the filter needs a vectorized
  * biquad -- so the split says which to write first.
  */
+/* Distinct workers that consumed at least one render-queue chunk last cycle.
+ * Read together with BUSY: 24 here with BUSY at 0 means the timer is wrong;
+ * 1 or 2 here means the pool is not sharing the queue. */
+int ssw_workers_participating(void) { return voice_get_workers_participating(); }
 int ssw_miss_interp(void) { return voice_get_miss_interp(); }
 int ssw_miss_loop(void) { return voice_get_miss_loop(); }
 int ssw_miss_filter(void) { return voice_get_miss_filter(); }

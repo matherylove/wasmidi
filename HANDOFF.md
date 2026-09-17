@@ -1,7 +1,44 @@
 # WASMIDI — Handoff
 
-**Revisión 22.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 23.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Qué se hizo en la revisión 23 (leer primero)
+
+**7.9 resuelto: el bug de la primera carga de soundfont.** Era la causa del
+`SIMD 0%`, del `MISS INTERP 100%`, y de la aparente variación de rendimiento
+entre soundfonts. Los tres eran el mismo bug.
+
+`refresh_region_runtime_cache()` pliega `sample_rate / g_audio.sample_rate`
+dentro de `cached_pitch_base_multiplier`, y tenía **una sola llamada en todo
+voice.c**, dentro de `voice_init_with_count()`. En la primera soundfont las
+regiones se crean *después* de esa llamada, así que nunca reciben la
+corrección. Consecuencia: todas las voces reproducen a una relación distinta
+de 1.0, `no_interp` es falso para todas, y **el 100% cae al bucle escalar**.
+Cargar una segunda soundfont volvía a entrar a init con regiones presentes y lo
+arreglaba en silencio: de ahí "el primer SF2 siempre carga mal, luego de cargar
+otro mejora", y el 400% de carga en sesiones sin trabajo real.
+
+Arreglo: `voice_refresh_all_region_caches()` en `voice.c`, llamada desde
+`ssw_load_sf2()` justo después de `sfz_apply_presampling()`. El multiplicador de
+pitch también fija la velocidad de reproducción, así que esto es tanto una
+corrección de **sonido** como de rendimiento — antes de esto la primera
+soundfont sonaba con el pitch mal.
+
+**Qué mirar en la próxima captura:** con la primera soundfont recién cargada,
+`MISS INTERP` debería dejar de ser 100% y `SIMD %` subir. Si eso pasa, la
+decisión sobre el resampler vectorizado queda en suspenso hasta volver a medir,
+porque la medición que la motivaba estaba contaminada por este bug.
+
+**Sigue abierto y sin explicar:** `BUSY 0ms` con `BLOCK 101.5ms`. El reloj no es
+el problema (`QueryPerformanceCounter` da nanosegundos con frecuencia 1e9, y la
+aritmética no trunca ni desborda). O el contador tiene un camino no visto, o los
+workers realmente no consumen la cola. Quedó a medias un contador de
+participación de workers que lo separa: cuenta cuántos workers distintos
+tomaron al menos un chunk. Si reporta 24 con BUSY en 0, el timer está mal; si
+reporta 1 o 2, el pool no reparte la cola y ese es el bug real.
+
+---
 
 ## 0. Qué se hizo en la revisión 22 (leer primero)
 
@@ -436,8 +473,9 @@ rendimiento esté resuelto:
 - Limpiar referencias a proyectos de terceros y a funcionamiento interno
   avanzado, para que sea apto para producción.
 
-**7.9 — Rendimiento malo hasta cambiar de soundfont una vez.** Reportado por el
-usuario, sin investigar. La primera carga de SF2 parece dejar algo en un estado
+**7.9 — RESUELTO en la rev. 23.** Ver §0.
+
+**7.9 (histórico) — Rendimiento malo hasta cambiar de soundfont una vez.** La primera carga de SF2 parece dejar algo en un estado
 peor que el que deja una recarga. Candidatos: layout o conversión de samples,
 preprocesado de regiones, el caché de steal score, o el conteo de workers al
 momento de la primera carga. Comparar la ruta de `ssw_load_sf2` en primera
