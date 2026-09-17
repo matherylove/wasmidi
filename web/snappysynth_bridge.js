@@ -32,6 +32,10 @@
         lastDispatchMs: 0,
         pathFastVoices: 0,
         pathScalarVoices: 0,
+        missInterp: 0,
+        missLoop: 0,
+        missFilter: 0,
+        missOther: 0,
         pathSimdVoiceVoices: 0,
         workerBusyMs: 0,
         ringFillPercent: 0,
@@ -287,6 +291,8 @@
                     state.pathFastVoices = data.pathFastVoices;
                 if (Number.isFinite(data.pathScalarVoices))
                     state.pathScalarVoices = data.pathScalarVoices;
+                for (const k of ["missInterp","missLoop","missFilter","missOther"])
+                    if (Number.isFinite(data[k])) state[k] = data[k];
                 if (Number.isFinite(data.pathSimdVoiceVoices))
                     state.pathSimdVoiceVoices = data.pathSimdVoiceVoices;
                 if (Number.isFinite(data.workerBusyMs))

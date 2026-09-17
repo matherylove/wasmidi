@@ -882,6 +882,18 @@ Item {
                         font.pixelSize: 7
                         font.bold: true
                     }
+                    Text {
+                        // Which guard rejected most voices from the vectorized
+                        // path. Each one needs a different kernel, so this says
+                        // which to write rather than which to guess.
+                        readonly property var reasons: ["", "INTERP", "LOOP", "FILTER", "OTHER"]
+                        visible: root.mainWindow.synthMissReason > 0
+                        text: "MISS " + reasons[root.mainWindow.synthMissReason] +
+                              " " + root.formatInteger(root.mainWindow.synthMissPercent) + "%"
+                        color: "#f59e0b"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
 
                     Text {
                         text: "BUSY " + root.formatNumber(root.mainWindow.synthWorkerBusyMs, 0) + "ms"

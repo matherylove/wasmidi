@@ -2603,6 +2603,33 @@ static volatile LONG g_worker_busy_last = 0;
 // this path entirely -- that batch requires stereo, non-looped samples, so it
 // reports 0% for SF2 imports that are mostly mono and looped even when this
 // per-voice path is fully vectorized.
+/*
+ * Why a voice missed the vectorized path.
+ *
+ * The per-voice SIMD guards require, together: rate exactly 1.0 (no_interp),
+ * a non-looping sample, no filter, sustain phase, and a mono source. In real
+ * material almost nothing satisfies all of them at once, which is why SIMD%
+ * reads 0 while the block time says the DSP is the bottleneck.
+ *
+ * Knowing the split matters because each blocker needs a different path:
+ * interpolation needs a resampling kernel, looping needs the wrap handled
+ * inside the vector loop, the filter needs a vectorized biquad. Counting them
+ * says which one to write first instead of guessing.
+ */
+static volatile LONG g_miss_interp = 0;
+static volatile LONG g_miss_loop = 0;
+static volatile LONG g_miss_filter = 0;
+static volatile LONG g_miss_other = 0;
+static volatile LONG g_miss_interp_last = 0;
+static volatile LONG g_miss_loop_last = 0;
+static volatile LONG g_miss_filter_last = 0;
+static volatile LONG g_miss_other_last = 0;
+
+int voice_get_miss_interp(void) { return (int)g_miss_interp_last; }
+int voice_get_miss_loop(void) { return (int)g_miss_loop_last; }
+int voice_get_miss_filter(void) { return (int)g_miss_filter_last; }
+int voice_get_miss_other(void) { return (int)g_miss_other_last; }
+
 static volatile LONG g_path_simd_voice_voices = 0;
 static volatile LONG g_path_simd_voice_last = 0;
 
@@ -4940,6 +4967,15 @@ if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
     f_start = frames;
 }
 #endif
+if (f_start < frames && env_state == ENV_SUSTAIN) {
+/* Attribute the miss to the first blocking condition, in the order the
+ * guards test them, so the counts partition the voices rather than
+ * overlapping. */
+if (!no_interp) InterlockedAdd(&g_miss_interp, 1);
+else if (loop_active) InterlockedAdd(&g_miss_loop, 1);
+else if (filter_enabled) InterlockedAdd(&g_miss_filter, 1);
+else InterlockedAdd(&g_miss_other, 1);
+}
 if (f_start >= frames && env_state == ENV_SUSTAIN && pending_note_off_samples < 0 &&
 !v->note_off_received && !v->kill_now && startup_samples == 0) {
 InterlockedAdd(&g_path_simd_voice_voices, 1);
@@ -6571,6 +6607,14 @@ g_path_fast_last = g_path_fast_voices;
 g_path_scalar_last = g_path_scalar_voices;
 g_worker_busy_last = g_worker_busy_us;
 g_path_simd_voice_last = g_path_simd_voice_voices;
+g_miss_interp_last = g_miss_interp;
+g_miss_loop_last = g_miss_loop;
+g_miss_filter_last = g_miss_filter;
+g_miss_other_last = g_miss_other;
+g_miss_interp = 0;
+g_miss_loop = 0;
+g_miss_filter = 0;
+g_miss_other = 0;
 g_path_fast_voices = 0;
 g_path_scalar_voices = 0;
 g_worker_busy_us = 0;

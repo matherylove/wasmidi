@@ -106,6 +106,10 @@ function postState(type, extra = {}) {
             coreReady && Module ? Module._ssw_path_fast_voices() : 0,
         pathScalarVoices:
             coreReady && Module ? Module._ssw_path_scalar_voices() : 0,
+        missInterp: coreReady && Module ? Module._ssw_miss_interp() : 0,
+        missLoop: coreReady && Module ? Module._ssw_miss_loop() : 0,
+        missFilter: coreReady && Module ? Module._ssw_miss_filter() : 0,
+        missOther: coreReady && Module ? Module._ssw_miss_other() : 0,
         pathSimdVoiceVoices:
             coreReady && Module ? Module._ssw_path_simd_voice_voices() : 0,
         workerBusyMs:

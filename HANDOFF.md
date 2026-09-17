@@ -1,40 +1,64 @@
 # WASMIDI — Handoff
 
-**Revisión 21.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 22.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
 
-## 0. Qué se hizo en la revisión 21 (leer primero)
+## 0. Qué se hizo en la revisión 22 (leer primero)
 
-**7.1 resuelto en el motor, con prueba de host. Sin verificar en navegador.**
+**La pregunta abierta de §4 quedó respondida: `SIMD 0%`.** Casi ninguna voz
+entra al camino vectorizado, y por eso el DSP corre escalar. Medido en
+navegador junto con `BUSY 63ms` contra `BLOCK 87.9ms` con 24 workers: si el
+render de voces sumara 63 ms entre 24 hilos mientras el bloque tarda 87,9, el
+tiempo no está ahí, está en el trabajo fijo y las barreras. Pero la causa raíz
+de que el bloque sea tan caro es que nada se vectoriza.
 
-- `voice.c`: `rebalance_worker_freelist()` corre al inicio de cada ciclo de
-  worker. El worker se queda con tantas voces libres como eventos tiene en
-  cola (tope 128) y devuelve el resto al pool global en **un solo CAS**
-  (encadena el sobrante por `g_next_free` primero). El camino caliente
-  (`free_pop`) no cambia. El lote de refill y el pre-refill del ciclo quedan
-  acotados por la misma cifra para que los tres no se peleen.
-- Invariante que compra, por ciclo: **ninguna voz sonando se roba mientras
-  exista una libre en cualquier worker que no la vaya a usar**. Es exactamente
-  lo que pedía 7.1.
-- Contadores nuevos: `REBAL/s` (voces devueltas al pool por segundo) y
-  `DROPPED` (note-ons que se cayeron sin sonar, acumulado). Antes la caída
-  era invisible en todo stat. Van por los cinco archivos de la ruta de
-  telemetría (§5), en el `Flow`, no en el `RowLayout`.
-- Test: `tools/worker_freelist_borrow_check.c` incluye el bloque **real**
-  extraído de `voice.c`. Reproduce el bug con rebalance apagado (1792 notas
-  caen a robo/drop en 4096/8), luego prueba cero caídas en 1024..16384 voces ×
-  2..24 workers, conservación (cada vid en exactamente un lugar), integridad
-  de la cadena, y estrés de 8 hilos contra el pool CAS. Determinista, ~90 ms.
-- CI: `.github/workflows/build-wasm.yml` ahora corre **todos** los tests de
-  host de §2 antes del build de Emscripten. Un cambio de motor que rompa uno
-  no llega a deploy.
-- Arreglado `tools/ssw_schedule_harness.c`: le faltaban tres globals de
-  telemetría de la rev. 20 y no compilaba. Pasa 14/14.
+Las guardas del camino SIMD por voz exigen, **todas a la vez**:
 
-**Qué mirar en la próxima captura:** `DROPPED` debe quedarse en 0 en el
-material que antes perdía notas melódicas. Si sube con `REBAL/s > 0` y
-`FREE > 0`, el problema es otro (selector, 3.1). Si sube con `REBAL/s = 0`,
-el rebalance no está corriendo y hay que mirar `worker_has_pending_events`.
+```c
+vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
+channels == 1 && s_ch == 1 && no_interp && env_state == ENV_SUSTAIN &&
+!filter_enabled && !loop_active
+```
+
+Tres son muy restrictivas en material real, y explican las tres observaciones
+del usuario:
+
+- `no_interp` exige velocidad exactamente 1.0, o sea solo la nota en el root
+  key sin pitch bend.
+- `!loop_active`: la mayoría de los samples sostenidos de un SF2 tienen loop.
+  Esto es el **"depende de la soundfont y de los samples, no de los efectos"**.
+- `!filter_enabled`: cualquier CC que active el filtro echa a todas las voces
+  del camino de golpe. Esto es el **"algunos CC provocan lag"**.
+
+**Instrumentación agregada:** contador `MISS <razón> <pct>` que atribuye cada
+voz que falla a la primera guarda que la bloquea, en el orden en que se
+evalúan, así las cuentas particionan en vez de solaparse. Razones: `INTERP`,
+`LOOP`, `FILTER`, `OTHER`. Va por los cinco archivos de la ruta de §5 y en el
+`Flow`.
+
+**Por qué importa la razón y no solo el número:** cada bloqueo necesita un
+kernel distinto. Interpolación pide un resampler vectorizado; el loop pide que
+el wrap entre en el bucle vectorial; el filtro pide un biquad vectorizado. La
+próxima captura dice cuál escribir primero en vez de adivinar.
+
+**Pendiente nuevo, reportado por el usuario y sin investigar:** el rendimiento
+es malo al arrancar **hasta cambiar de soundfont al menos una vez**. Eso
+sugiere que la ruta de primera carga deja algo en un estado distinto del que
+deja una recarga (layout de samples, preprocesado de regiones, o algún caché).
+Es un bug concreto y aparte del tema SIMD. Ver 7.9.
+
+**Revisión de la revisión 21, hecha y aprobada.** Verifiqué manifiesto 41/41,
+compilación de C, `node --check`, llaves de QML, y corrí los seis tests de
+host: todos pasan. Confirmé además que `tools/voice_rebalance_logic.inc` se
+regenera idéntico desde `voice.c`, o sea que el test usa el código real y no
+una copia que se pueda desincronizar. El rebalance corre en el tope del ciclo
+del worker, donde la pila es owner-only, así que `free_pop()` ahí es seguro.
+
+Riesgo anotado sobre esa revisión: con 0 eventos pendientes `keep = 0` y el
+worker devuelve **todas** sus voces libres de a una. `REBAL/s` es el número que
+lo delata; si sale alto y `BLOCK` no mejora, conviene acotar el `give` por
+ciclo. En la captura actual `REBAL/s` es 0 porque el pool está agotado
+(`FREE 79`), así que el dato todavía no se pudo leer.
 
 ---
 
@@ -195,9 +219,10 @@ vectoriza, o los workers no se solapan.
 
 Visibles en el panel de SnappySynth:
 
-- **`SIMD %`** — porción de voces que toma el batch SIMD. Bajo significa que las
-  condiciones de entrada (estéreo, sustain, sin interpolación, frames aptos) las
-  rechazan al bucle escalar.
+- **`SIMD %`** — porción de voces que toma el camino vectorizado. **Medido: 0%.**
+  Ver §0 para las guardas exactas y qué las bloquea.
+- **`MISS <razón> <pct>`** — cuál guarda rechaza a la mayoría. Es el número que
+  decide qué kernel escribir.
 - **`BUSY ms`** — tiempo ocupado sumado entre workers en el último ciclo. Con 24
   workers y `BLOCK 55ms`, paralelismo real daría del orden de 1.300 ms sumados.
   Si da ~55 ms, están serializados.
@@ -410,6 +435,13 @@ rendimiento esté resuelto:
   network" que antes estaba.
 - Limpiar referencias a proyectos de terceros y a funcionamiento interno
   avanzado, para que sea apto para producción.
+
+**7.9 — Rendimiento malo hasta cambiar de soundfont una vez.** Reportado por el
+usuario, sin investigar. La primera carga de SF2 parece dejar algo en un estado
+peor que el que deja una recarga. Candidatos: layout o conversión de samples,
+preprocesado de regiones, el caché de steal score, o el conteo de workers al
+momento de la primera carga. Comparar la ruta de `ssw_load_sf2` en primera
+carga contra recarga.
 
 **7.8 — Frames del renderizador se detienen** en pasajes de 3M+ notas por
 segundo. El ring visual arranca en `1 << 23` notas y **duplica**: a 12 bytes por

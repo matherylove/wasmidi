@@ -1100,6 +1100,16 @@ int ssw_detected_cores(void) { return voice_get_detected_cores(); }
  */
 int ssw_path_fast_voices(void) { return voice_get_path_fast(); }
 int ssw_path_scalar_voices(void) { return voice_get_path_scalar(); }
+/*
+ * Breakdown of why voices miss the vectorized path, for the last cycle. Each
+ * blocker needs a different fix -- interpolation needs a resampling kernel,
+ * looping needs the wrap inside the vector loop, the filter needs a vectorized
+ * biquad -- so the split says which to write first.
+ */
+int ssw_miss_interp(void) { return voice_get_miss_interp(); }
+int ssw_miss_loop(void) { return voice_get_miss_loop(); }
+int ssw_miss_filter(void) { return voice_get_miss_filter(); }
+int ssw_miss_other(void) { return voice_get_miss_other(); }
 int ssw_path_simd_voice_voices(void) { return voice_get_path_simd_voice(); }
 /*
  * Summed busy time across workers for the last cycle. Compared against the
