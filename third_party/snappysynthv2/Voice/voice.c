@@ -4177,9 +4177,17 @@ int need_compact = (wd->release_count > 0);
 LONG pop_chunk;
 LONG render_size = load_relaxed_long(&g_render_size);
 {
-if      (render_size >  32000) pop_chunk = 1024;
-else if (render_size >  16000) pop_chunk = 512;
-else                           pop_chunk = RENDER_POP_CHUNK;
+    LONG base = RENDER_POP_CHUNK;
+    if      (render_size >  32000) base = 1024;
+    else if (render_size >  16000) base = 512;
+    // Scale chunk with worker count so each worker grabs at most ~2 chunks.
+    // At 24 workers / 8192 voices the old fixed 256 meant 32×24 = 768 atomic
+    // pops — lines bounce between all cores.  per_worker = 8192/24 = 341, so
+    // chunk becomes max(256, aligned 344) = 344, only 24 pops total.
+    LONG per_worker = render_size / (LONG)g_worker_count;
+    if (per_worker < 1) per_worker = 1;
+    pop_chunk = base > per_worker ? base : per_worker;
+    pop_chunk = (pop_chunk + 7) & ~7;   // round to multiple of 8 for SIMD alignment
 }
 LARGE_INTEGER ss_busy_begin, ss_busy_end, ss_busy_freq;
 QueryPerformanceFrequency(&ss_busy_freq);
@@ -4834,24 +4842,26 @@ if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
     }
 }
 
-// Looped sustain, mono sample -> stereo output, no interp. WASM SIMD128
-// equivalent of the AVX2 loop-wrapping path above (see s_ch == 1 case
-// near line 4497): most SF2 imports produce mono, looped samples for
-// sustained instruments, so without this the batch path (which requires
-// !loop_active) never sees them and every voice falls to the scalar
-// per-sample loop. Same wrap-at-segment-boundary math, vectorized.
+// Looped or non-looped sustain, mono sample -> stereo output, no interp.
+// WASM SIMD128 equivalent of the AVX2 loop-wrapping path near line 4497.
+// Unified: uses playback_end (loop_end if loop_active, else sample_end) and
+// only wraps when loop is active. Most SF2 imports produce mono looped
+// samples — the old code required loop_active, meaning zero SIMD coverage
+// when voices are not looping (attack/decay segments or one-shot samples).
 if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
     channels == 2 && s_ch == 1 && no_interp &&
-    env_state == ENV_SUSTAIN && !filter_enabled && loop_active &&
-    loop_end > loop_start) {
+    env_state == ENV_SUSTAIN && !filter_enabled) {
+    const int use_loop = (loop_active && loop_end > loop_start);
+    const int end_limit = use_loop ? loop_end : sample_end;
+    const int loop_span = use_loop ? (loop_end - loop_start) : 0;
     v128_t scale = wasm_f32x4_make(
         gainL * env, gainR * env,
         gainL * env, gainR * env);
     int rendered = 0;
     int pi = (int)pos;
     while (rendered < frames) {
-        if (pi >= loop_end) pi = loop_start;
-        int todo = loop_end - pi;
+        if (use_loop && pi >= end_limit) pi = loop_start;
+        int todo = end_limit - pi;
         if (todo > frames - rendered) todo = frames - rendered;
         int vec4 = todo & ~3;
         int j = 0;
@@ -4877,25 +4887,27 @@ if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
         rendered += todo;
         pi += todo;
     }
-    if (pi >= loop_end) pi = loop_start;
+    if (use_loop && pi >= end_limit) pi = loop_start;
     pos = (float)pi;
     f_start = frames;
 }
 
-// Looped sustain, stereo sample -> stereo output, no interp. WASM SIMD128
-// equivalent of the AVX2 s_ch == 2 loop-wrapping path near line 4544.
+// Looped or non-looped sustain, stereo sample -> stereo output, no interp.
+// WASM SIMD128 equivalent of the AVX2 s_ch == 2 path near line 4544.
 if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
     channels == 2 && s_ch == 2 && no_interp &&
-    env_state == ENV_SUSTAIN && !filter_enabled && loop_active &&
-    loop_end > loop_start) {
+    env_state == ENV_SUSTAIN && !filter_enabled) {
+    const int use_loop = (loop_active && loop_end > loop_start);
+    const int end_limit = use_loop ? loop_end : sample_end;
+    const int loop_span = use_loop ? (loop_end - loop_start) : 0;
     v128_t scale = wasm_f32x4_make(
         gainL * env, gainR * env,
         gainL * env, gainR * env);
     int rendered = 0;
     int pi = (int)pos;
     while (rendered < frames) {
-        if (pi >= loop_end) pi = loop_start;
-        int todo = loop_end - pi;
+        if (use_loop && pi >= end_limit) pi = loop_start;
+        int todo = end_limit - pi;
         if (todo > frames - rendered) todo = frames - rendered;
         int vec4 = todo & ~3;
         int j = 0;
@@ -4923,7 +4935,7 @@ if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
         rendered += todo;
         pi += todo;
     }
-    if (pi >= loop_end) pi = loop_start;
+    if (use_loop && pi >= end_limit) pi = loop_start;
     pos = (float)pi;
     f_start = frames;
 }

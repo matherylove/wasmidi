@@ -461,7 +461,9 @@ private:
     int synthChannels_ = 2;
     int synthBitsPerSample_ = 32;
     bool synthRealtimePriority_ = true;
-    int synthWorkers_ = 0;             // 0 = original auto policy
+    int synthWorkers_ = 4;             // 4 workers default — sweet spot for WASM
+                                     // pthread overhead vs. parallel gain. User can
+                                     // override via slider in Controls.qml.
     int synthWorkerCount_ = 0;         // actual source-selected workers
     int synthNoteSharding_ = 0;        // 0 auto, 1 channel, 2 hash
     bool synthStealScoreCache_ = true;
