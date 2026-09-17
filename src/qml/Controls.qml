@@ -897,6 +897,20 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Distinct workers that consumed at least one chunk of
+                        // the render queue last cycle. BUSY says how much work
+                        // happened; this says how many threads it was spread
+                        // across, which BUSY alone cannot distinguish from a
+                        // broken timer.
+                        text: "WACT " + root.formatInteger(root.mainWindow.synthWorkersActive)
+                        color: root.mainWindow.synthWorkersActive > 0 &&
+                               root.mainWindow.synthWorkersActive <
+                                   root.mainWindow.synthWorkerCount / 2
+                            ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         // Which guard rejected most voices from the vectorized
                         // path. Each one needs a different kernel, so this says
                         // which to write rather than which to guess.

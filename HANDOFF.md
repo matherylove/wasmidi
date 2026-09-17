@@ -1,7 +1,82 @@
 # WASMIDI — Handoff
 
-**Revisión 23.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 24.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 24 (leer primero)
+
+### Corrección de un error de interpretación mío
+
+`MISS INTERP 100%` **no es un bug, es el caso esperado.** `no_interp` exige una
+relación de velocidad exactamente 1.0, o sea solo la nota en el root key del
+sample sin pitch bend. En música real casi ninguna nota cumple eso, así que el
+100% es normal. Lo interpreté como patología durante dos revisiones. El arreglo
+de la rev. 23 (`voice_refresh_all_region_caches`) es correcto en sí mismo — el
+multiplicador de pitch se aplicaba tarde y eso afectaba el sonido — pero **no
+era la causa del bug de primera carga**, que sigue abierto.
+
+### El bug de primera carga, medido
+
+Misma soundfont, mismo material, prácticamente las mismas voces activas:
+
+| | 1ª carga | 2ª carga |
+|---|---|---|
+| ACTIVE | 5.209 | 5.022 |
+| BUSY | **609 ms** | **5 ms** |
+| BLOCK | 31 ms | 3,5 ms |
+| LOAD | 269% | 31% |
+
+Con el mismo conteo de voces, el trabajo real de los workers difiere ~100×.
+Eso no puede ser planificación ni paralelismo: cada voz recorre un camino de
+datos distinto. Sospechoso principal:
+`sfz_apply_presampling(instrument, g_cfg.sample_rate)`. Si en la primera carga
+no se aplica o se aplica con la tasa equivocada, `is_resampled` queda falso y
+cada voz resamplea en tiempo de ejecución sobre el sample original; al cargar
+otra soundfont la región ya quedó presampleada. **Verificación pendiente:** un
+contador de cuántas regiones tienen `is_resampled` verdadero tras cada carga.
+Si la primera da 0 y la segunda da todas, confirmado.
+
+### El paralelismo es malo siempre; el bug de primera carga lo camuflaba
+
+`BUSY` no estaba roto: lee 0 cuando el bloque es barato. Ahora que funciona,
+paralelismo efectivo = BUSY / BLOCK.
+
+**Cuidado con qué se compara contra qué.** Entre la captura de primera carga y
+la de sesión densa cambian DOS variables a la vez (primera-vs-segunda carga, y
+liviano-vs-denso), así que esa comparación no sirve para aislar el paralelismo.
+La comparación válida es entre las dos capturas que son ambas post-recarga:
+
+| Escenario | ACTIVE | BUSY | BLOCK | Workers efectivos (de 24) |
+|---|---|---|---|---|
+| post-recarga, liviano | 5.022 | 5 ms | 3,5 ms | **1,4** |
+| post-recarga, denso | 8.182 | 65 ms | 22,8 ms | **2,9** |
+| primera carga, liviano | 5.209 | 609 ms | 31 ms | ~20 (ver abajo) |
+
+O sea: **después de recargar, el paralelismo es malo en los dos casos.** El ~20
+de la primera carga NO es buen paralelismo, es un artefacto del bug de primera
+carga: al encarecer cada voz ~100×, los chunks duran lo suficiente como para que
+todos los workers alcancen a tomar uno. Cuando el trabajo por voz vuelve a su
+costo real, el reparto no llega a involucrar al pool.
+
+Son dos problemas separados, y el segundo estaba camuflado por el primero:
+
+1. **Primera carga:** ~100× de costo por voz. Sospechoso `sfz_apply_presampling`.
+2. **Siempre:** 24 workers rinden como ~3. Este es el techo real de throughput y
+   el que bloquea la meta de 8192 voces con 8 workers.
+
+En la sesión densa además `FREE 0`, `STEALS/s 87.793` y `DROPPED 309.544`: el
+pool está agotado encima de todo lo anterior.
+
+**Instrumento agregado en esta revisión:** `WACT`, cuántos workers distintos
+consumieron al menos un chunk de la cola en el último ciclo. Se pone rojo bajo
+la mitad del conteo configurado. Junto a `BUSY` separa las dos lecturas:
+
+| WACT | Lectura |
+|---|---|
+| ~24 con BUSY bajo | Todos participan pero hay poco trabajo; el costo está en las barreras y el trabajo fijo por llamada. |
+| ~3 con BUSY alto | El reparto de la cola no involucra al pool. Mirar `pop_chunk` en `worker_thread`: se dimensiona como `max(base, render_size / g_worker_count)`, así que con chunks grandes los primeros workers en despertar se llevan todo antes de que los demás lleguen. |
+
+---
 
 ## 0. Qué se hizo en la revisión 23 (leer primero)
 
@@ -474,6 +549,59 @@ rendimiento esté resuelto:
   avanzado, para que sea apto para producción.
 
 **7.9 — RESUELTO en la rev. 23.** Ver §0.
+
+**7.10 — Los CC no se aplican como en el SnappySynthV2 original.** Reportado por
+el usuario: las canciones se deforman, como si el pitch bend y el release no se
+aplicaran correctamente o a tiempo. **Investigado, no arreglado.** Hay dos
+causas candidatas y son independientes:
+
+*Causa A: coalescencia de CC contra agendado por lotes.* `enqueue_event()` en
+`voice.c` fusiona un CC con el evento inmediatamente anterior de la misma cola
+cuando coinciden canal y número de CC:
+
+```c
+if (prev->type == EVT_CONTROL_CHANGE && prev->ch == e.ch && prev->key == e.key) {
+    prev->value = e.value;
+    prev->timestamp_qpc = e.timestamp_qpc;
+    return;
+}
+```
+
+Notar que **no compara timestamps**, a diferencia de la fusión de notas, que
+exige `prev->timestamp_qpc == e.timestamp_qpc`. Quedan excluidos los CC 6, 38,
+98, 99, 100, 101, 120, 121 y 123, pero **no** los continuos: 1, 7, 10, 11, 64,
+71-74, 91, 93.
+
+En el motor nativo esto es inofensivo, porque los eventos llegan en tiempo real
+y el hilo de render drena la cola entre llegadas: los valores intermedios de una
+rampa sobreviven. En WASMIDI los eventos de un bloque entero se despachan de
+golpe **antes** de un único `voice_render_float()`, así que una rampa de CC11 de
+0 a 127 a lo largo de 512 frames se colapsa a 127 aplicado al inicio del bloque.
+La automatización continua pierde su forma. Esto es estructural del agendado por
+lotes, no un bug puntual.
+
+Verificar primero si el pitch bend sufre lo mismo: existe una rama
+`prev->type == EVT_PITCH_BEND` en el mismo enqueue y hay que leer sus
+condiciones. Si también fusiona sin comparar timestamp, explica directamente la
+deformación reportada, porque un bend colapsado salta en vez de deslizarse.
+
+*Causa B: el gobernador de segmentación colapsa a un solo render bajo carga.*
+`ssw_render_queued_into()` reduce el presupuesto a 1 cuando la carga medida
+pasa el umbral, y con presupuesto 1 **ningún** CC abre frontera: todos se
+aplican al inicio del bloque. Con bloque de 512 eso es 11,6 ms de granularidad
+justo cuando el material es denso. Además, las fronteras se cuantizan hacia
+abajo en la grilla, así que un CC se aplica hasta un cuanto **antes** de su
+posición real; el nativo lo aplica *después*, en el chunk siguiente. Temprano y
+tarde no suenan igual.
+
+*Cómo separarlas:* forzar `g_render_budget` a su máximo y ver si la deformación
+persiste. Si desaparece, es B y se ataca con el presupuesto o con el bloque de
+mezcla desacoplado (7.4). Si persiste, es A y hay que hacer que la fusión de CC
+respete el timestamp como ya lo hace la de notas — con el costo de que la cola
+se llena más, ver `CH_EVENT_QUEUE_SIZE`.
+
+*Advertencia:* tocar esto cambia el sonido por definición, así que es el tipo de
+cambio que hay que comparar contra el nativo antes y después, no solo medir.
 
 **7.9 (histórico) — Rendimiento malo hasta cambiar de soundfont una vez.** La primera carga de SF2 parece dejar algo en un estado
 peor que el que deja una recarga. Candidatos: layout o conversión de samples,
