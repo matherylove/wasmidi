@@ -576,7 +576,13 @@ int ssw_warmup(void) {
     note_on |= (80u << 16);
     dispatch_short_at_qpc(note_on, 0);
     voice_render_float(scratch, frames);
-    voice_reset();
+    /* Silence the warmup note through all-sound-off on every channel. */
+    for (int ch = 0; ch < 16; ++ch) {
+        uint32_t msg = 0xb0u | (uint32_t)ch;
+        msg |= (120u << 8);   /* CC 120 = all sound off */
+        msg |= (0u << 16);
+        dispatch_short_at_qpc(msg, 0);
+    }
     free(scratch);
     return 1;
 }
