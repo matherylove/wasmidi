@@ -1,0 +1,263 @@
+/* Finest scheduling cell, about 1.45 ms at 44.1 kHz. Multiple of 8. */
+#define SSW_STATE_QUANTUM_MIN 64
+/* Absolute ceiling on voice_render_float() calls per block. */
+#define SSW_MAX_BLOCK_RENDERS 8
+/* Extra boundaries reserved for all-notes/all-sound-off style controllers,
+ * which do change currently sounding voices and are rare in normal material. */
+#define SSW_PANIC_RENDER_RESERVE 2
+/* Load thresholds, as a fraction of the block's own realtime budget. */
+#define SSW_LOAD_BACKOFF 0.45
+#define SSW_LOAD_RECOVER 0.20
+
+/*
+ * All-notes-off / all-sound-off / reset-controllers / mono-poly. These do
+ * affect sounding voices and are normally sparse, so they are allowed an exact
+ * boundary from a small separate reserve even when the load budget is 1.
+ */
+static int ssw_is_panic_cc(uint32_t cc) {
+    switch (cc & 0x7fu) {
+        case 120: case 121: case 123:
+        case 124: case 125: case 126: case 127:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Set to 1 to make every selector event open a boundary unconditionally, i.e.
+ * exactly the pre-governor behaviour. Rollback switch if the note gate below is
+ * ever suspected of dropping notes again.
+ */
+#ifndef SSW_FORCE_SELECTOR_BOUNDARIES
+#define SSW_FORCE_SELECTOR_BOUNDARIES 0
+#endif
+
+/*
+ * Selector events choose the state a FUTURE note-on resolves against: bank
+ * select, RPN/NRPN select, data entry and program change. They must be ordered
+ * exactly against note events on the same channel, because voice.c shards note
+ * events by key and channel events by channel, so with more than one worker the
+ * two live in different queues and are consumed concurrently. Data entry is
+ * included because RPN 0 is pitch-bend range, which changes sounding voices as
+ * well; exact is the safe side for it.
+ */
+static int ssw_is_selector_event(uint32_t message) {
+    const uint32_t command = message & 0xf0u;
+
+    if (command == 0xc0u)
+        return 1;                       /* program change */
+    if (command != 0xb0u)
+        return 0;
+
+    switch ((message >> 8) & 0x7fu) {
+        case 0:                         /* bank select MSB */
+        case 6:                         /* data entry MSB  */
+        case 32:                        /* bank select LSB */
+        case 38:                        /* data entry LSB  */
+        case 98:                        /* NRPN LSB */
+        case 99:                        /* NRPN MSB */
+        case 100:                       /* RPN LSB  */
+        case 101:                       /* RPN MSB  */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Does this event change what already-sounding voices produce? These only need
+ * to be heard at the right time, not ordered against note admission, so they
+ * are the ones the load governor may quantize onto the grid.
+ */
+static int ssw_affects_sounding_voices(uint32_t message) {
+    const uint32_t command = message & 0xf0u;
+
+    if (command == 0xe0u)
+        return 1;                       /* pitch bend */
+    if (command != 0xb0u)
+        return 0;
+
+    switch ((message >> 8) & 0x7fu) {
+        case 1:                         /* modulation */
+        case 2:                         /* breath */
+        case 4:                         /* foot */
+        case 5:                         /* portamento time */
+        case 7:                         /* volume */
+        case 10:                        /* pan */
+        case 11:                        /* expression */
+        case 64:                        /* sustain */
+        case 65:                        /* portamento on/off */
+        case 71:                        /* resonance */
+        case 72:                        /* release */
+        case 73:                        /* attack */
+        case 74:                        /* cutoff */
+        case 91:                        /* reverb send */
+        case 93:                        /* chorus send */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* Grid size for this block, given how many renders we may spend on it. */
+static int ssw_state_quantum(int frames, int budget) {
+    int quantum;
+    if (budget <= 1 || frames <= SSW_STATE_QUANTUM_MIN)
+        return frames;
+    quantum = (frames + budget - 1) / budget;
+    if (quantum < SSW_STATE_QUANTUM_MIN)
+        quantum = SSW_STATE_QUANTUM_MIN;
+    quantum = (quantum + 7) & ~7;      /* keep the SIMD sustain paths eligible */
+    if (quantum > frames)
+        quantum = frames;
+    return quantum;
+}
+
+/*
+ * Fast backoff, gradual recovery. Halving on overload reaches the native
+ * single-render behaviour within three blocks; doubling on idle takes three
+ * blocks to return to the finest grid, which prevents the budget from
+ * oscillating around a threshold.
+ */
+static void ssw_update_render_budget(double used_ms, int frames) {
+    const int rate = g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100;
+    const double realtime_ms = (double)frames * 1000.0 / (double)rate;
+    double load;
+
+    if (realtime_ms <= 0.0)
+        return;
+
+    load = used_ms / realtime_ms;
+    if (!isfinite(load) || load < 0.0)
+        load = 0.0;
+
+    if (g_render_load_ema < 0.0) g_render_load_ema = load;
+    else g_render_load_ema += 0.25 * (load - g_render_load_ema);
+
+    if (g_render_load_ema > SSW_LOAD_BACKOFF) {
+        g_render_budget /= 2;
+        if (g_render_budget < 1) g_render_budget = 1;
+    } else if (g_render_load_ema < SSW_LOAD_RECOVER) {
+        g_render_budget *= 2;
+        if (g_render_budget > SSW_MAX_BLOCK_RENDERS)
+            g_render_budget = SSW_MAX_BLOCK_RENDERS;
+    }
+}
+
+int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
+    if (!g_ready || !out_ptr || frames <= 0) return 0;
+
+    const int64_t block_start_frame = g_song_frame;
+    const int64_t block_end_frame = block_start_frame + (int64_t)frames;
+    const int channels = g_cfg.num_channels > 0 ? g_cfg.num_channels : 2;
+    const int budget = g_render_budget;
+    const int quantum = ssw_state_quantum(frames, budget);
+    const double started_ms = ssw_now_ms();
+    int segment_start = 0;
+    int splits_used = 0;
+    int panic_splits_used = 0;
+    /* Per-channel: has a note been admitted since the last boundary? Selector
+     * events only have to force a boundary when the answer is yes. */
+    unsigned char note_pending[16];
+
+    memset(note_pending, 0, sizeof(note_pending));
+    g_dispatch_accum_us = 0.0;
+    voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
+
+    while (g_event_head) {
+        ssw_event_block* block = g_event_head;
+        while (block->index < block->count) {
+            const ssw_scheduled_event* event = &block->events[block->index];
+            if (event->sample_frame >= block_end_frame) goto events_done;
+
+            int64_t frame = event->sample_frame - block_start_frame;
+            if (frame < 0) frame = 0;
+            if (frame >= frames) frame = frames - 1;
+
+            {
+                const uint32_t command = event->message & 0xf0u;
+                const int ch = (int)(event->message & 0x0fu);
+                const int panic =
+                    command == 0xb0u &&
+                    ssw_is_panic_cc((event->message >> 8) & 0x7fu);
+                /* Correctness boundary: never subject to the load budget. */
+                const int ordering =
+                    !panic &&
+                    ssw_is_selector_event(event->message) &&
+#if SSW_FORCE_SELECTOR_BOUNDARIES
+                    1;
+#else
+                    note_pending[ch];
+#endif
+                int boundary = segment_start;
+
+                if (panic) {
+                    if (panic_splits_used < SSW_PANIC_RENDER_RESERVE)
+                        boundary = (int)frame;
+                } else if (ordering) {
+                    boundary = (int)frame;
+                } else if (ssw_affects_sounding_voices(event->message) &&
+                           splits_used < budget - 1) {
+                    boundary = ((int)frame / quantum) * quantum;
+                }
+
+                if (boundary > segment_start) {
+                    const int segment_frames = boundary - segment_start;
+                    voice_render_float(
+                        ((float*)out_ptr) +
+                            (size_t)segment_start * (size_t)channels,
+                        segment_frames);
+                    g_render_cursor += segment_frames;
+                    segment_start = boundary;
+                    if (panic) ++panic_splits_used;
+                    else if (!ordering) ++splits_used;
+                    /* Everything queued before this boundary has been consumed,
+                     * so nothing is left for a selector to be reordered
+                     * against. */
+                    memset(note_pending, 0, sizeof(note_pending));
+                    voice_set_render_timing(g_render_cursor, g_cfg.sample_rate);
+                }
+
+                {
+                    const double dispatch_started = ssw_now_ms();
+                    dispatch_short_at_qpc(
+                        event->message,
+                        g_render_cursor + (frame - segment_start));
+                    g_dispatch_accum_us +=
+                        (ssw_now_ms() - dispatch_started) * 1000.0;
+                }
+
+                if (command == 0x90u || command == 0x80u)
+                    note_pending[ch] = 1u;
+            }
+            ++block->index;
+        }
+
+        g_event_head = block->next;
+        if (!g_event_head) g_event_tail = NULL;
+        free(block);
+    }
+
+events_done:
+    if (segment_start < frames) {
+        const int remaining = frames - segment_start;
+        voice_render_float(
+            ((float*)out_ptr) + (size_t)segment_start * (size_t)channels,
+            remaining);
+        g_render_cursor += remaining;
+    }
+    g_song_frame = block_end_frame;
+    g_song_time_seconds =
+        (double)g_song_frame /
+        (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
+
+    {
+        const double elapsed_ms = ssw_now_ms() - started_ms;
+        g_last_render_us = elapsed_ms * 1000.0;
+        g_last_dispatch_us = g_dispatch_accum_us;
+        ssw_update_render_budget(elapsed_ms, frames);
+    }
+    return 1;
+}
+
