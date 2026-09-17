@@ -32,6 +32,7 @@
         lastDispatchMs: 0,
         pathFastVoices: 0,
         pathScalarVoices: 0,
+        pathSimdVoiceVoices: 0,
         workerBusyMs: 0,
         ringFillPercent: 0,
         pumpGapMs: 0,
@@ -286,6 +287,8 @@
                     state.pathFastVoices = data.pathFastVoices;
                 if (Number.isFinite(data.pathScalarVoices))
                     state.pathScalarVoices = data.pathScalarVoices;
+                if (Number.isFinite(data.pathSimdVoiceVoices))
+                    state.pathSimdVoiceVoices = data.pathSimdVoiceVoices;
                 if (Number.isFinite(data.workerBusyMs))
                     state.workerBusyMs = data.workerBusyMs;
                 if (Number.isFinite(data.ringFillPercent))

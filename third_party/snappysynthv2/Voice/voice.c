@@ -2595,10 +2595,21 @@ static volatile LONG g_worker_busy_us = 0;
 static volatile LONG g_path_fast_last = 0;
 static volatile LONG g_path_scalar_last = 0;
 static volatile LONG g_worker_busy_last = 0;
+// Counts voices that finished their whole block in one of the per-voice SIMD
+// fast paths below (AVX512/AVX2/WASM sustain no-interp, looped or not), as
+// opposed to falling through to the fully scalar per-sample loop. Distinct
+// from g_path_fast_voices/g_path_scalar_voices, which only track admission to
+// the separate multi-voice batch (render_fast_stereo_sustain_batch*) and miss
+// this path entirely -- that batch requires stereo, non-looped samples, so it
+// reports 0% for SF2 imports that are mostly mono and looped even when this
+// per-voice path is fully vectorized.
+static volatile LONG g_path_simd_voice_voices = 0;
+static volatile LONG g_path_simd_voice_last = 0;
 
 int voice_get_path_fast(void) { return (int)g_path_fast_last; }
 int voice_get_path_scalar(void) { return (int)g_path_scalar_last; }
 int voice_get_worker_busy_us(void) { return (int)g_worker_busy_last; }
+int voice_get_path_simd_voice(void) { return (int)g_path_simd_voice_last; }
 
 #define WORKER_FREELIST_REFILL 512
 /*
@@ -4822,9 +4833,104 @@ if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
         f_start = vec4;
     }
 }
+
+// Looped sustain, mono sample -> stereo output, no interp. WASM SIMD128
+// equivalent of the AVX2 loop-wrapping path above (see s_ch == 1 case
+// near line 4497): most SF2 imports produce mono, looped samples for
+// sustained instruments, so without this the batch path (which requires
+// !loop_active) never sees them and every voice falls to the scalar
+// per-sample loop. Same wrap-at-segment-boundary math, vectorized.
+if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
+    channels == 2 && s_ch == 1 && no_interp &&
+    env_state == ENV_SUSTAIN && !filter_enabled && loop_active &&
+    loop_end > loop_start) {
+    v128_t scale = wasm_f32x4_make(
+        gainL * env, gainR * env,
+        gainL * env, gainR * env);
+    int rendered = 0;
+    int pi = (int)pos;
+    while (rendered < frames) {
+        if (pi >= loop_end) pi = loop_start;
+        int todo = loop_end - pi;
+        if (todo > frames - rendered) todo = frames - rendered;
+        int vec4 = todo & ~3;
+        int j = 0;
+        for (; j < vec4; j += 4) {
+            v128_t s32 = wasm_i32x4_load16x4(data + pi + j);
+            v128_t vf = wasm_f32x4_convert_i32x4(s32);
+            int o = (rendered + j) * 2;
+            v128_t lanes_lo = wasm_v32x4_shuffle(vf, vf, 0, 0, 1, 1);
+            v128_t lanes_hi = wasm_v32x4_shuffle(vf, vf, 2, 2, 3, 3);
+            wasm_v128_store(
+                mix + o,
+                wasm_f32x4_relaxed_madd(lanes_lo, scale, wasm_v128_load(mix + o)));
+            wasm_v128_store(
+                mix + o + 4,
+                wasm_f32x4_relaxed_madd(lanes_hi, scale, wasm_v128_load(mix + o + 4)));
+        }
+        for (; j < todo; ++j) {
+            float sample_value = (float)data[pi + j];
+            int o = (rendered + j) * 2;
+            mix[o] += sample_value * gainL * env;
+            mix[o + 1] += sample_value * gainR * env;
+        }
+        rendered += todo;
+        pi += todo;
+    }
+    if (pi >= loop_end) pi = loop_start;
+    pos = (float)pi;
+    f_start = frames;
+}
+
+// Looped sustain, stereo sample -> stereo output, no interp. WASM SIMD128
+// equivalent of the AVX2 s_ch == 2 loop-wrapping path near line 4544.
+if (vor_fast_ok && f_start == 0 && pending_note_off_samples < 0 &&
+    channels == 2 && s_ch == 2 && no_interp &&
+    env_state == ENV_SUSTAIN && !filter_enabled && loop_active &&
+    loop_end > loop_start) {
+    v128_t scale = wasm_f32x4_make(
+        gainL * env, gainR * env,
+        gainL * env, gainR * env);
+    int rendered = 0;
+    int pi = (int)pos;
+    while (rendered < frames) {
+        if (pi >= loop_end) pi = loop_start;
+        int todo = loop_end - pi;
+        if (todo > frames - rendered) todo = frames - rendered;
+        int vec4 = todo & ~3;
+        int j = 0;
+        for (; j < vec4; j += 4) {
+            const int16_t *src = data + ((pi + j) * 2);
+            v128_t s16 = wasm_v128_load(src);
+            v128_t lo = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_low_i16x8(s16));
+            v128_t hi = wasm_f32x4_convert_i32x4(
+                wasm_i32x4_extend_high_i16x8(s16));
+            int o = (rendered + j) * 2;
+            wasm_v128_store(
+                mix + o,
+                wasm_f32x4_relaxed_madd(lo, scale, wasm_v128_load(mix + o)));
+            wasm_v128_store(
+                mix + o + 4,
+                wasm_f32x4_relaxed_madd(hi, scale, wasm_v128_load(mix + o + 4)));
+        }
+        for (; j < todo; ++j) {
+            int src = (pi + j) * 2;
+            int o = (rendered + j) * 2;
+            mix[o] += (float)data[src] * gainL * env;
+            mix[o + 1] += (float)data[src + 1] * gainR * env;
+        }
+        rendered += todo;
+        pi += todo;
+    }
+    if (pi >= loop_end) pi = loop_start;
+    pos = (float)pi;
+    f_start = frames;
+}
 #endif
 if (f_start >= frames && env_state == ENV_SUSTAIN && pending_note_off_samples < 0 &&
 !v->note_off_received && !v->kill_now && startup_samples == 0) {
+InterlockedAdd(&g_path_simd_voice_voices, 1);
 v->position = pos;
 #ifdef VOR
 v->vor_gain_scale = vor_gain_scale;
@@ -6452,9 +6558,11 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
 g_path_fast_last = g_path_fast_voices;
 g_path_scalar_last = g_path_scalar_voices;
 g_worker_busy_last = g_worker_busy_us;
+g_path_simd_voice_last = g_path_simd_voice_voices;
 g_path_fast_voices = 0;
 g_path_scalar_voices = 0;
 g_worker_busy_us = 0;
+g_path_simd_voice_voices = 0;
 
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
                                                                                                                                                                                                                                                                 logger_log("voice_render_float: Entered with num_frames=%d.\n", num_frames);

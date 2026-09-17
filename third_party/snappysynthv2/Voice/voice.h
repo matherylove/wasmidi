@@ -108,6 +108,7 @@ int voice_get_detected_cores(void);
 int voice_get_path_fast(void);
 int voice_get_path_scalar(void);
 int voice_get_worker_busy_us(void);
+int voice_get_path_simd_voice(void);
 void voice_init(AudioConfig* config);
 void voice_init_with_count(long voice_count, AudioConfig* config);
 void voice_request_stop(void);

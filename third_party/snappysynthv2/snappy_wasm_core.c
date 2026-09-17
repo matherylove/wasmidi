@@ -1090,6 +1090,7 @@ int ssw_detected_cores(void) { return voice_get_detected_cores(); }
  */
 int ssw_path_fast_voices(void) { return voice_get_path_fast(); }
 int ssw_path_scalar_voices(void) { return voice_get_path_scalar(); }
+int ssw_path_simd_voice_voices(void) { return voice_get_path_simd_voice(); }
 /*
  * Summed busy time across workers for the last cycle. Compared against the
  * block's own wall clock this says whether the pool actually overlaps: near the

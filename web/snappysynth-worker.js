@@ -106,6 +106,8 @@ function postState(type, extra = {}) {
             coreReady && Module ? Module._ssw_path_fast_voices() : 0,
         pathScalarVoices:
             coreReady && Module ? Module._ssw_path_scalar_voices() : 0,
+        pathSimdVoiceVoices:
+            coreReady && Module ? Module._ssw_path_simd_voice_voices() : 0,
         workerBusyMs:
             coreReady && Module ? Module._ssw_worker_busy_us() / 1000 : 0,
         renderBudget:
