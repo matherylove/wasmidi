@@ -31,6 +31,9 @@ static double g_last_render_us = 0.0;
  * they are measured apart.
  */
 static double g_last_dispatch_us = 0.0;
+/* Controller events dropped because a later value in the same dispatch run
+ * supersedes them. Cumulative. */
+static int g_controllers_collapsed = 0;
 static double g_dispatch_accum_us = 0.0;
 static int g_ready = 0;
 static int g_max_voices = 16384;
@@ -392,6 +395,83 @@ static void dispatch_sysex_data_at_qpc(const unsigned char* data, int length,
         voice_set_drum_part_at(part, mode, timestamp_qpc);
         return;
     }
+}
+
+/*
+ * Controller admission, matching what the native engine actually receives.
+ *
+ * voice.c is byte-for-byte identical to the original here: same CC coalescing
+ * in enqueue_event(), same vor_break_channel_sequence() on every non-note
+ * event. Identical code on an identical stream cannot behave differently, so
+ * the stall on controller-dense material has to come from the stream itself.
+ *
+ * The native engine is fed one event at a time as it arrives, and its render
+ * thread drains the queue continuously in between, so a burst of controller
+ * events on one channel collapses against the previous queued event long before
+ * a block's worth has accumulated. This port schedules ahead and hands the
+ * engine every event of a block in one go, so that collapse never gets the
+ * chance to happen and the engine sees the full, uncollapsed burst.
+ *
+ * This pass restores the aggregate the native engine would have seen: within
+ * one dispatch run, a controller value that is immediately superseded by
+ * another value of the same channel and controller, with no note in between on
+ * that channel, is dropped. The last value still lands, at its own timestamp.
+ * The engine is untouched.
+ *
+ * The exclusions match enqueue_event()'s own list exactly: controllers where a
+ * repeat is a second real action rather than a newer value.
+ */
+#ifndef SSW_COLLAPSE_CONTROLLER_BURSTS
+#define SSW_COLLAPSE_CONTROLLER_BURSTS 1
+#endif
+
+static int ssw_cc_is_collapsible(uint32_t cc) {
+    switch (cc & 0x7fu) {
+        case 6: case 38: case 98: case 99: case 100: case 101:
+        case 120: case 121: case 123:
+            return 0;
+        default:
+            return 1;
+    }
+}
+
+/*
+ * True when this event is superseded later in the same dispatch run. `events`
+ * is the remaining run in submission order; scanning stops at the first note on
+ * the same channel, because the native queue's collapse stops there too.
+ */
+static int ssw_controller_is_superseded(
+    const ssw_scheduled_event* events,
+    size_t index,
+    size_t count,
+    int64_t block_end_frame) {
+
+    const uint32_t message = events[index].message;
+    const uint32_t command = message & 0xf0u;
+    const uint32_t channel = message & 0x0fu;
+
+    if (command == 0xb0u && !ssw_cc_is_collapsible((message >> 8) & 0x7fu))
+        return 0;
+    if (command != 0xb0u && command != 0xe0u)
+        return 0;
+
+    for (size_t i = index + 1; i < count; ++i) {
+        const uint32_t other = events[i].message;
+        if (events[i].sample_frame >= block_end_frame)
+            return 0;
+        if ((other & 0x0fu) != channel)
+            continue;
+        const uint32_t other_command = other & 0xf0u;
+        if (other_command == 0x90u || other_command == 0x80u)
+            return 0;
+        if (other_command != command)
+            continue;
+        if (command == 0xb0u &&
+            ((other >> 8) & 0x7fu) != ((message >> 8) & 0x7fu))
+            continue;
+        return 1;
+    }
+    return 0;
 }
 
 static void dispatch_short_at_qpc(uint32_t msg, int64_t timestamp_qpc) {
@@ -1015,6 +1095,16 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                 }
 
                 {
+#if SSW_COLLAPSE_CONTROLLER_BURSTS
+                    /* Skip a controller value that a later one in this same run
+                     * supersedes, which is the collapse the native engine gets
+                     * for free by being fed in real time. */
+                    if (ssw_controller_is_superseded(
+                            block->events, block->index, block->count,
+                            block_end_frame)) {
+                        ++g_controllers_collapsed;
+                    } else
+#endif
                     dispatch_short_at_qpc(
                         event->message,
                         g_render_cursor + (frame - segment_start));
@@ -1148,6 +1238,7 @@ int ssw_alloc_us(void) { return voice_get_alloc_us(); }
  * first-load slowdown: unpresampled regions resample at run time inside the
  * render loop.
  */
+int ssw_controllers_collapsed(void) { return g_controllers_collapsed; }
 int ssw_presample_seen(void) { return g_presample_regions_seen; }
 int ssw_presample_skipped(void) { return g_presample_regions_skipped; }
 int ssw_presample_resampled(void) { return g_presample_regions_resampled; }

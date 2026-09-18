@@ -897,6 +897,18 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Controller events dropped because a later value in
+                        // the same dispatch run superseded them. This is the
+                        // collapse the native engine gets for free by being fed
+                        // in real time. Zero here on controller-dense material
+                        // means the collapse is not firing and the theory is
+                        // wrong.
+                        text: "CCOL " + root.formatInteger(root.mainWindow.synthCcCollapsed)
+                        color: "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         // Presampling outcome of the last soundfont load.
                         // Regions skipped, or zero resampled on the first load
                         // where a reload reports many, means voices resample at

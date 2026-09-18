@@ -1154,6 +1154,11 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
 // Presampling outcome packed for one readout: resampled << 16 | skipped.
 // Skipped regions, or zero resampled on the first load where a reload reports
 // many, is the first-load slowdown.
+EM_JS(int, wasmidi_snappy_cc_collapsed, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.controllersCollapsed) | 0) : 0;
+});
+
 EM_JS(int, wasmidi_snappy_presample, (), {
     const b = globalThis.WasmidiSnappyBridge;
     if (!b || !b.state) return 0;
@@ -4020,6 +4025,7 @@ void MainWindow::pollSynthState()
     synthWorkersActive_ = wasmidi_snappy_workers_active();
     synthAllocMs_ = wasmidi_snappy_alloc_x10() / 10.0;
     synthFreeRatio_ = wasmidi_snappy_free_ratio();
+    synthCcCollapsed_ = wasmidi_snappy_cc_collapsed();
     {
         const int packed = wasmidi_snappy_presample();
         synthPresampleResampled_ = (packed >> 16) & 0xffff;

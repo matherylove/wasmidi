@@ -109,6 +109,8 @@ function postState(type, extra = {}) {
         workersParticipating:
             coreReady && Module ? Module._ssw_workers_participating() : 0,
         allocMs: coreReady && Module ? Module._ssw_alloc_us() / 1000 : 0,
+        controllersCollapsed:
+            coreReady && Module ? Module._ssw_controllers_collapsed() : 0,
         presampleSeen: coreReady && Module ? Module._ssw_presample_seen() : 0,
         presampleSkipped: coreReady && Module ? Module._ssw_presample_skipped() : 0,
         presampleResampled: coreReady && Module ? Module._ssw_presample_resampled() : 0,
