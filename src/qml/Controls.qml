@@ -897,6 +897,19 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Controller number carrying most of the controller
+                        // dispatch time, with its share and event count. No CC
+                        // case is expensive on its own, so a dominant number
+                        // means the cost is indirect and points at which one.
+                        visible: root.mainWindow.synthCcHotPercent > 0
+                        text: "CC#" + root.formatInteger(root.mainWindow.synthCcHotNumber) +
+                              " " + root.formatInteger(root.mainWindow.synthCcHotPercent) + "% " +
+                              root.formatInteger(root.mainWindow.synthCcHotCount)
+                        color: "#f59e0b"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         // Controller events dropped because a later value in
                         // the same dispatch run superseded them. This is the
                         // collapse the native engine gets for free by being fed

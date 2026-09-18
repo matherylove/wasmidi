@@ -1,7 +1,55 @@
 # WASMIDI — Handoff
 
-**Revisión 29.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 30.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 30 (leer primero)
+
+### Intento fallido: colapso de ráfagas de controlador
+
+Se implementó un pase que, antes de despachar los eventos de un bloque,
+descarta un valor de controlador que otro posterior del mismo canal y
+controlador supersede. Idea: restaurar el agregado que el motor nativo recibe,
+ya que allá los eventos llegan de a uno y la cola los colapsa contra el evento
+previo mucho antes de acumular un bloque.
+
+**Resultado numérico:** bueno. `CCOL 1.149.605` de 3.988.966 CC del archivo,
+`ALLOC` bajó de ~32x `BUSY` a **8x**, y `UNDERRUNS 0` con NPS 687.872 y
+CC/s 74.668.
+
+**Resultado sonoro:** malo. El usuario reportó la respuesta de CC como
+claramente menos precisa que la del SSv2 original. **Desactivado por defecto**
+(`SSW_COLLAPSE_CONTROLLER_BURSTS` ahora es 0).
+
+**Por qué falló, que es lo importante:** no es la misma operación que hace el
+nativo. La fusión nativa exige que el CC anterior esté en el slot
+**inmediatamente previo** de la cola, así que solo colapsa ráfagas realmente
+consecutivas y **conserva los pasos intermedios de una rampa**. El pase
+implementado escanea hacia adelante por toda la tanda y descarta cualquier valor
+superseded, deteniéndose solo en una nota del mismo canal, así que una rampa de
+expresión repartida a lo largo de un bloque pierde todos los pasos salvo el
+último de cada tramo. Es un colapso a nivel **bloque** haciendo de sustituto de
+uno a nivel **adyacencia**, y se oye como automatización escalonada.
+
+**Para quien retome esto:** la dirección es correcta (8x contra 32x es una
+mejora real y medida), el mecanismo no. Una versión fiel tendría que reproducir
+**adyacencia**, no supersesión: colapsar solo cuando dos CC del mismo canal y
+controlador son consecutivos en el flujo de despacho sin ningún otro evento de
+ese canal en medio. Eso conserva las rampas y sigue matando el spam de valores
+repetidos.
+
+### Lo que sigue abierto
+
+- **Primera carga de SF2 lenta.** Sin causa identificada. `PRESMP 0/0` en ambas
+  cargas descartó el presampleo, que era la única hipótesis viva.
+- **Stall con CC densos.** El motor es byte por byte idéntico al original, así
+  que la causa está en cómo el port entrega los eventos. El intento de esta
+  revisión confirma que ahí está el costo, pero no encontró la forma fiel de
+  reducirlo.
+- `ALLOC` sigue en ~32x `BUSY` con el colapso apagado: el pool saturado y el
+  robo fallido siguen dominando el bloque en material con CC.
+
+---
 
 ## 0. Estado en la revisión 29 (leer primero)
 

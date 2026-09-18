@@ -109,6 +109,8 @@ function postState(type, extra = {}) {
         workersParticipating:
             coreReady && Module ? Module._ssw_workers_participating() : 0,
         allocMs: coreReady && Module ? Module._ssw_alloc_us() / 1000 : 0,
+        ccHotspot: coreReady && Module ? Module._ssw_cc_hotspot() : 0,
+        ccHotspotCount: coreReady && Module ? Module._ssw_cc_hotspot_count() : 0,
         controllersCollapsed:
             coreReady && Module ? Module._ssw_controllers_collapsed() : 0,
         presampleSeen: coreReady && Module ? Module._ssw_presample_seen() : 0,

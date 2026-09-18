@@ -2714,6 +2714,29 @@ static volatile LONG g_workers_participating = 0;
 int voice_get_notes_started(void) { return (int)g_notes_started_total; }
 int voice_get_voices_recycled(void) { return (int)g_voices_recycled_total; }
 
+/*
+ * Per-controller profile.
+ *
+ * Read statically, no single CC case is expensive: a switch, a store into
+ * channel_state, and one InterlockedExchange on the channel dirty flag, whose
+ * consumer is itself guarded. So if controller-dense material stalls, the cost
+ * is indirect -- sheer event volume through the queue, or the knock-on effect
+ * on voice stacking -- and which controller carries it cannot be read off the
+ * source. Count events and dispatch time per controller number and let the file
+ * say.
+ */
+static volatile LONG g_cc_count[128];
+static volatile LONG g_cc_us[128];
+static volatile LONG g_cc_count_last[128];
+static volatile LONG g_cc_us_last[128];
+
+int voice_get_cc_count(int cc) {
+    return (cc >= 0 && cc < 128) ? (int)g_cc_count_last[cc] : 0;
+}
+int voice_get_cc_us(int cc) {
+    return (cc >= 0 && cc < 128) ? (int)g_cc_us_last[cc] : 0;
+}
+
 static volatile LONG g_alloc_us = 0;
 static volatile LONG g_alloc_last = 0;
 
@@ -4064,6 +4087,9 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
                                                                                                                                                                                                                                                                 process_note_off_event(wd, &e, cached_release_delay);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_CONTROL_CHANGE) {
+LARGE_INTEGER ss_cc_begin, ss_cc_end, ss_cc_freq;
+QueryPerformanceFrequency(&ss_cc_freq);
+QueryPerformanceCounter(&ss_cc_begin);
                                                                                                                                                                                                                                                                 int cc = e.key & 0x7F; int val = e.value & 0x7F;
                                                                                                                                                                                                                                                                 channel_state *cs = &g_channels[e.ch];
                                                                                                                                                                                                                                                                 int invoke_data_entry = 0;
@@ -4222,7 +4248,15 @@ break;
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 after_cc:;
-                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                
+InterlockedAdd(&g_cc_count[cc], 1);
+QueryPerformanceCounter(&ss_cc_end);
+if (ss_cc_freq.QuadPart > 0) {
+InterlockedAdd(&g_cc_us[cc],
+(LONG)(((ss_cc_end.QuadPart - ss_cc_begin.QuadPart) * 1000000)
+/ ss_cc_freq.QuadPart));
+}
+}
                                                                                                                                                                                                                                                                 else if (e.type == EVT_PITCH_BEND) {
                                                                                                                                                                                                                                                                 int raw14 = e.value & 0x3FFF;
                                                                                                                                                                                                                                                                 g_channels[e.ch].bend14 = raw14; // single-writer
@@ -6773,6 +6807,12 @@ g_workers_participating_last = g_workers_participating;
 g_workers_participating = 0;
 g_alloc_last = g_alloc_us;
 g_alloc_us = 0;
+for (int i = 0; i < 128; ++i) {
+g_cc_count_last[i] = g_cc_count[i];
+g_cc_us_last[i] = g_cc_us[i];
+g_cc_count[i] = 0;
+g_cc_us[i] = 0;
+}
 
 g_path_simd_voice_last = g_path_simd_voice_voices;
 g_miss_interp_last = g_miss_interp;

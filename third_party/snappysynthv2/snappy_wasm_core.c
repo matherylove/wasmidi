@@ -421,8 +421,26 @@ static void dispatch_sysex_data_at_qpc(const unsigned char* data, int length,
  * The exclusions match enqueue_event()'s own list exactly: controllers where a
  * repeat is a second real action rather than a newer value.
  */
+/*
+ * OFF by default: this changes how controllers sound and the change is audible.
+ *
+ * It was tried at 1 and the user reported controller response as clearly less
+ * accurate than the native engine. The reason is that it is not the same
+ * operation the native engine performs. Native coalescing in enqueue_event()
+ * requires the previous CC to sit in the IMMEDIATELY preceding queue slot, so
+ * it only ever collapses genuinely consecutive bursts and keeps the
+ * intermediate steps of a ramp. This pass scans forward across the whole
+ * dispatch run and drops any value superseded later, stopping only at a note on
+ * the same channel, so an expression ramp spread across a block loses every
+ * step but the last of each stretch. That is a block-level collapse standing in
+ * for an adjacency-level one, and the audible result is stepped automation.
+ *
+ * It did reduce ALLOC from roughly 32x BUSY to 8x on controller-dense material,
+ * so the direction is right and the cost is in the wrong place. A faithful
+ * version would have to reproduce adjacency, not supersession.
+ */
 #ifndef SSW_COLLAPSE_CONTROLLER_BURSTS
-#define SSW_COLLAPSE_CONTROLLER_BURSTS 1
+#define SSW_COLLAPSE_CONTROLLER_BURSTS 0
 #endif
 
 static int ssw_cc_is_collapsible(uint32_t cc) {
@@ -1239,6 +1257,33 @@ int ssw_alloc_us(void) { return voice_get_alloc_us(); }
  * render loop.
  */
 int ssw_controllers_collapsed(void) { return g_controllers_collapsed; }
+
+/*
+ * Dominant controller of the last cycle, packed: number << 16 | percent of the
+ * controller dispatch time it accounts for. Read statically no CC case is
+ * expensive, so if one number dominates the cost is indirect and this says
+ * which one to chase.
+ */
+int ssw_cc_hotspot(void) {
+    int best = -1;
+    int best_us = 0;
+    int total_us = 0;
+    for (int cc = 0; cc < 128; ++cc) {
+        const int us = voice_get_cc_us(cc);
+        total_us += us;
+        if (us > best_us) { best_us = us; best = cc; }
+    }
+    if (best < 0 || total_us <= 0) return 0;
+    return ((best & 0x7f) << 16) | ((best_us * 100) / total_us);
+}
+int ssw_cc_hotspot_count(void) {
+    int best = -1, best_us = 0;
+    for (int cc = 0; cc < 128; ++cc) {
+        const int us = voice_get_cc_us(cc);
+        if (us > best_us) { best_us = us; best = cc; }
+    }
+    return best < 0 ? 0 : voice_get_cc_count(best);
+}
 int ssw_presample_seen(void) { return g_presample_regions_seen; }
 int ssw_presample_skipped(void) { return g_presample_regions_skipped; }
 int ssw_presample_resampled(void) { return g_presample_regions_resampled; }

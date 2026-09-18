@@ -73,6 +73,9 @@ class MainWindow : public QObject {
     Q_PROPERTY(double synthAllocMs READ synthAllocMs NOTIFY synthStateChanged)
     Q_PROPERTY(int synthFreeRatio READ synthFreeRatio NOTIFY synthStateChanged)
     Q_PROPERTY(int synthCcCollapsed READ synthCcCollapsed NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthCcHotNumber READ synthCcHotNumber NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthCcHotPercent READ synthCcHotPercent NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthCcHotCount READ synthCcHotCount NOTIFY synthStateChanged)
     Q_PROPERTY(int synthPresampleResampled READ synthPresampleResampled NOTIFY synthStateChanged)
     Q_PROPERTY(int synthPresampleSkipped READ synthPresampleSkipped NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMissReason READ synthMissReason NOTIFY synthStateChanged)
@@ -161,6 +164,9 @@ public:
     double synthAllocMs() const { return synthAllocMs_; }
     int synthFreeRatio() const { return synthFreeRatio_; }
     int synthCcCollapsed() const { return synthCcCollapsed_; }
+    int synthCcHotNumber() const { return synthCcHotNumber_; }
+    int synthCcHotPercent() const { return synthCcHotPercent_; }
+    int synthCcHotCount() const { return synthCcHotCount_; }
     int synthPresampleResampled() const { return synthPresampleResampled_; }
     int synthPresampleSkipped() const { return synthPresampleSkipped_; }
     int synthMissReason() const { return synthMissReason_; }
@@ -459,6 +465,9 @@ private:
     double synthAllocMs_ = 0.0;
     int synthFreeRatio_ = 100;
     int synthCcCollapsed_ = 0;
+    int synthCcHotNumber_ = 0;
+    int synthCcHotPercent_ = 0;
+    int synthCcHotCount_ = 0;
     int synthPresampleResampled_ = 0;
     int synthPresampleSkipped_ = 0;
     int synthMissReason_ = 0;
