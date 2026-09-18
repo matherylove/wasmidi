@@ -23,7 +23,8 @@ let synthChannels = 2;
 let bitsPerSample = 32;
 let realtimePriority = 1;
 
-let requestedWorkers = 0;     // 0 = original automatic policy
+let requestedWorkers = 0;
+let debugMetrics = false;     // 0 = original automatic policy
 let noteSharding = 0;         // 0 auto, 1 channel, 2 hash
 let stealScoreCache = true;   // source default ON
 let fastNoteOff = true;       // source default ON
@@ -103,14 +104,14 @@ function postState(type, extra = {}) {
                 ? Module._ssw_last_dispatch_us() / 1000
                 : 0,
         pathFastVoices:
-            coreReady && Module ? Module._ssw_path_fast_voices() : 0,
+            coreReady && Module && debugMetrics ? Module._ssw_path_fast_voices() : 0,
         pathScalarVoices:
-            coreReady && Module ? Module._ssw_path_scalar_voices() : 0,
+            coreReady && Module && debugMetrics ? Module._ssw_path_scalar_voices() : 0,
         workersParticipating:
-            coreReady && Module ? Module._ssw_workers_participating() : 0,
-        allocMs: coreReady && Module ? Module._ssw_alloc_us() / 1000 : 0,
-        ccHotspot: coreReady && Module ? Module._ssw_cc_hotspot() : 0,
-        ccHotspotCount: coreReady && Module ? Module._ssw_cc_hotspot_count() : 0,
+            coreReady && Module && debugMetrics ? Module._ssw_workers_participating() : 0,
+        allocMs: coreReady && Module && debugMetrics ? Module._ssw_alloc_us() / 1000 : 0,
+        ccHotspot: coreReady && Module && debugMetrics ? Module._ssw_cc_hotspot() : 0,
+        ccHotspotCount: coreReady && Module && debugMetrics ? Module._ssw_cc_hotspot_count() : 0,
         controllersCollapsed:
             coreReady && Module ? Module._ssw_controllers_collapsed() : 0,
         presampleSeen: coreReady && Module ? Module._ssw_presample_seen() : 0,
@@ -118,10 +119,10 @@ function postState(type, extra = {}) {
         presampleResampled: coreReady && Module ? Module._ssw_presample_resampled() : 0,
         notesStarted: coreReady && Module ? Module._ssw_notes_started() : 0,
         voicesRecycled: coreReady && Module ? Module._ssw_voices_recycled() : 0,
-        missInterp: coreReady && Module ? Module._ssw_miss_interp() : 0,
-        missLoop: coreReady && Module ? Module._ssw_miss_loop() : 0,
-        missFilter: coreReady && Module ? Module._ssw_miss_filter() : 0,
-        missOther: coreReady && Module ? Module._ssw_miss_other() : 0,
+        missInterp: coreReady && Module && debugMetrics ? Module._ssw_miss_interp() : 0,
+        missLoop: coreReady && Module && debugMetrics ? Module._ssw_miss_loop() : 0,
+        missFilter: coreReady && Module && debugMetrics ? Module._ssw_miss_filter() : 0,
+        missOther: coreReady && Module && debugMetrics ? Module._ssw_miss_other() : 0,
         pathSimdVoiceVoices:
             coreReady && Module ? Module._ssw_path_simd_voice_voices() : 0,
         workerBusyMs:
@@ -590,6 +591,7 @@ function initCore() {
         return;
 
     resetStealRate();
+    if (Module._ssw_set_debug_metrics) Module._ssw_set_debug_metrics(debugMetrics ? 1 : 0);
 
     Module._ssw_init_ex(
         sampleRateHz,
@@ -1349,6 +1351,12 @@ onmessage = async event => {
                 data.realtimePriority
                     ? 1
                     : 0;
+
+            if (typeof data.debugMetrics === "boolean") {
+                debugMetrics = data.debugMetrics;
+                if (coreReady && Module && Module._ssw_set_debug_metrics)
+                    Module._ssw_set_debug_metrics(debugMetrics ? 1 : 0);
+            }
 
             requestedWorkers =
                 Math.max(

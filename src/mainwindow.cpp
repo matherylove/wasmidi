@@ -1364,6 +1364,7 @@ EM_JS(void, wasmidi_snappy_configure,
        int workers,
        int noteSharding,
        int stealScoreCache,
+       int debugMetrics,
        int fastNoteOff,
        int validateState,
        int softClip), {
@@ -1384,6 +1385,7 @@ EM_JS(void, wasmidi_snappy_configure,
         workers,
         noteSharding,
         stealScoreCache: !!stealScoreCache,
+        debugMetrics: !!debugMetrics,
         fastNoteOff: !!fastNoteOff,
         validateState: !!validateState,
         softClip: !!softClip
@@ -2561,6 +2563,7 @@ void MainWindow::applySynthConfig()
         synthWorkers_,
         synthNoteSharding_,
         synthStealScoreCache_ ? 1 : 0,
+        synthDebugMetrics_ ? 1 : 0,
         synthFastNoteOff_ ? 1 : 0,
         synthValidateState_ ? 1 : 0,
         synthSoftClip_ ? 1 : 0);
@@ -2836,6 +2839,20 @@ void MainWindow::setSynthValidateState(bool enabled)
 
     synthValidateState_ = enabled;
     WASMIDI_PERSIST_SETTING("synthValidateState", synthValidateState_ ? 1 : 0);
+    emit synthConfigChanged();
+    applySynthConfig();
+}
+
+void MainWindow::setSynthDebugMetrics(bool enabled)
+{
+    if (synthDebugMetrics_ == enabled)
+        return;
+
+    // Off by default. The gated counters cost two clock reads per controller
+    // event and an atomic add per voice per block, which is worth paying while
+    // diagnosing and pure waste otherwise.
+    synthDebugMetrics_ = enabled;
+    WASMIDI_PERSIST_SETTING("synthDebugMetrics", synthDebugMetrics_ ? 1 : 0);
     emit synthConfigChanged();
     applySynthConfig();
 }

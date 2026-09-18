@@ -878,6 +878,10 @@ Item {
                 Flow {
                     Layout.fillWidth: true
                     spacing: 7
+                    // Diagnostics only. Hidden unless debug metrics are
+                    // on, and the counters behind them are not even collected
+                    // in that case.
+                    visible: root.mainWindow.synthDebugMetrics
                     // No visibility gate. Hiding the row until the synth is
                     // ready made half the counters vanish while the ones in the
                     // row above stayed at zero, and made the panel jump when
@@ -1232,6 +1236,19 @@ Item {
                         spacing: 4
 
                         FlatButton {
+                            Layout.preferredWidth: 78
+                            implicitHeight: 21
+                            // Toggleable during playback: the counters are only useful while
+                            // something is actually stressing the engine.
+                            enabled: true
+                            text: "Debug"
+                            normalColor: root.mainWindow.synthDebugMetrics ? "#2a194b" : "#110e20"
+                            borderColor: root.mainWindow.synthDebugMetrics ? "#6b48a8" : "#352550"
+                            textColor: root.mainWindow.synthDebugMetrics ? "#c4b5fd" : "#746a87"
+                            onClicked: root.mainWindow.synthDebugMetrics =
+                                !root.mainWindow.synthDebugMetrics
+                        }
+                    FlatButton {
                             Layout.preferredWidth: 78
                             implicitHeight: 21
                             enabled: !root.mainWindow.isPlaying

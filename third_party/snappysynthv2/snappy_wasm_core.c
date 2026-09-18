@@ -422,25 +422,24 @@ static void dispatch_sysex_data_at_qpc(const unsigned char* data, int length,
  * repeat is a second real action rather than a newer value.
  */
 /*
- * OFF by default: this changes how controllers sound and the change is audible.
+ * Reproduces the coalescing the native engine performs in its own event queue.
  *
- * It was tried at 1 and the user reported controller response as clearly less
- * accurate than the native engine. The reason is that it is not the same
- * operation the native engine performs. Native coalescing in enqueue_event()
- * requires the previous CC to sit in the IMMEDIATELY preceding queue slot, so
- * it only ever collapses genuinely consecutive bursts and keeps the
- * intermediate steps of a ramp. This pass scans forward across the whole
- * dispatch run and drops any value superseded later, stopping only at a note on
- * the same channel, so an expression ramp spread across a block loses every
- * step but the last of each stretch. That is a block-level collapse standing in
- * for an adjacency-level one, and the audible result is stepped automation.
+ * voice.c is byte-for-byte identical to the original, so identical code on an
+ * identical stream cannot behave differently. The difference is the stream: the
+ * native engine is fed one event at a time and its queue absorbs a controller
+ * into the next one of the same channel and number, while this port schedules
+ * ahead and hands over a whole block at once, so that absorption never happens
+ * and the engine sees every step of every burst.
  *
- * It did reduce ALLOC from roughly 32x BUSY to 8x on controller-dense material,
- * so the direction is right and the cost is in the wrong place. A faithful
- * version would have to reproduce adjacency, not supersession.
+ * History worth keeping: a first version collapsed by SUPERSESSION (drop any
+ * value a later one overrides, stopping at notes). It cut ALLOC from ~32x BUSY
+ * to 8x, but automation came out stepped and the user reported controller
+ * response as clearly worse than the original -- it was throwing away the
+ * intermediate steps of ramps. The rule is adjacency and notes do not break it;
+ * see ssw_controller_absorbed_by_next().
  */
 #ifndef SSW_COLLAPSE_CONTROLLER_BURSTS
-#define SSW_COLLAPSE_CONTROLLER_BURSTS 0
+#define SSW_COLLAPSE_CONTROLLER_BURSTS 1
 #endif
 
 static int ssw_cc_is_collapsible(uint32_t cc) {
@@ -454,11 +453,25 @@ static int ssw_cc_is_collapsible(uint32_t cc) {
 }
 
 /*
- * True when this event is superseded later in the same dispatch run. `events`
- * is the remaining run in submission order; scanning stops at the first note on
- * the same channel, because the native queue's collapse stops there too.
+ * True when the native engine's own queue coalescing would have absorbed this
+ * controller into the next one.
+ *
+ * The rule is adjacency, not supersession, and it ignores notes. enqueue_event()
+ * routes note events with g_note_worker_map[ch][key] and channel events with
+ * g_channel_worker_map[ch], so notes and controllers land in DIFFERENT worker
+ * queues: a note never sits between two controllers in the channel queue and
+ * never breaks their adjacency. What native collapses is two controllers of the
+ * same channel and number that are consecutive in the channel event stream.
+ *
+ * An earlier attempt got this wrong in both directions at once -- it stopped at
+ * notes, which native does not do, and it scanned forward without limit, which
+ * native also does not do. The result dropped the intermediate steps of
+ * automation ramps and the controller response was audibly worse than the
+ * original. This version drops a controller only when the very next channel
+ * event on that channel is the same controller, which is exactly what the
+ * native queue does and leaves ramps intact.
  */
-static int ssw_controller_is_superseded(
+static int ssw_controller_absorbed_by_next(
     const ssw_scheduled_event* events,
     size_t index,
     size_t count,
@@ -468,9 +481,9 @@ static int ssw_controller_is_superseded(
     const uint32_t command = message & 0xf0u;
     const uint32_t channel = message & 0x0fu;
 
-    if (command == 0xb0u && !ssw_cc_is_collapsible((message >> 8) & 0x7fu))
+    if (command != 0xb0u)
         return 0;
-    if (command != 0xb0u && command != 0xe0u)
+    if (!ssw_cc_is_collapsible((message >> 8) & 0x7fu))
         return 0;
 
     for (size_t i = index + 1; i < count; ++i) {
@@ -479,15 +492,18 @@ static int ssw_controller_is_superseded(
             return 0;
         if ((other & 0x0fu) != channel)
             continue;
+
         const uint32_t other_command = other & 0xf0u;
+        /* Notes live in a different queue; they cannot separate two
+         * controllers as far as the coalescing is concerned. */
         if (other_command == 0x90u || other_command == 0x80u)
-            return 0;
-        if (other_command != command)
             continue;
-        if (command == 0xb0u &&
-            ((other >> 8) & 0x7fu) != ((message >> 8) & 0x7fu))
-            continue;
-        return 1;
+
+        /* This is the next channel event on this channel. It absorbs the
+         * current one only if it is the same controller. Anything else ends
+         * the adjacency, exactly as it would in the native queue. */
+        return other_command == 0xb0u &&
+               ((other >> 8) & 0x7fu) == ((message >> 8) & 0x7fu);
     }
     return 0;
 }
@@ -1117,7 +1133,7 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                     /* Skip a controller value that a later one in this same run
                      * supersedes, which is the collapse the native engine gets
                      * for free by being fed in real time. */
-                    if (ssw_controller_is_superseded(
+                    if (ssw_controller_absorbed_by_next(
                             block->events, block->index, block->count,
                             block_end_frame)) {
                         ++g_controllers_collapsed;
@@ -1256,6 +1272,18 @@ int ssw_alloc_us(void) { return voice_get_alloc_us(); }
  * first-load slowdown: unpresampled regions resample at run time inside the
  * render loop.
  */
+/*
+ * Turns the diagnostic counters on and off at runtime. Off by default: the
+ * per-controller profile costs two clock reads per controller event and the
+ * path counters an atomic add per voice per block, which is worth paying while
+ * chasing something and pure waste otherwise. The numbers a normal user sees
+ * (rate, active, free, workers, underruns) are engine state and never gated.
+ */
+int ssw_set_debug_metrics(int enabled) {
+    voice_set_debug_metrics(enabled);
+    return 1;
+}
+
 int ssw_controllers_collapsed(void) { return g_controllers_collapsed; }
 
 /*

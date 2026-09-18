@@ -2725,6 +2725,28 @@ int voice_get_voices_recycled(void) { return (int)g_voices_recycled_total; }
  * source. Count events and dispatch time per controller number and let the file
  * say.
  */
+/*
+ * Debug metrics gate.
+ *
+ * The diagnostic counters are not free. The per-controller profile takes two
+ * clock reads per controller event, and on this material that is hundreds of
+ * thousands per second; the SIMD/miss counters take an atomic add per voice per
+ * block. That is fine while chasing a problem and pure waste the rest of the
+ * time, so every hot counter is behind this flag and costs one relaxed load
+ * when it is off.
+ *
+ * Counters that run once per load or once per block (presampling, worker count,
+ * region count) are not gated: they are already free.
+ */
+static volatile LONG g_debug_metrics = 0;
+
+void voice_set_debug_metrics(int enabled) {
+    InterlockedExchange(&g_debug_metrics, enabled ? 1 : 0);
+}
+static inline int debug_metrics_on(void) {
+    return load_relaxed_long(&g_debug_metrics) != 0;
+}
+
 static volatile LONG g_cc_count[128];
 static volatile LONG g_cc_us[128];
 static volatile LONG g_cc_count_last[128];
@@ -3634,8 +3656,9 @@ worker_data *wd = &g_workers[widx];
 
                                                                                                                                                                                                                                                                 for (;;) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
+const int ss_profile = debug_metrics_on();
 LARGE_INTEGER ss_cycle_begin;
-QueryPerformanceCounter(&ss_cycle_begin);
+if (ss_profile) QueryPerformanceCounter(&ss_cycle_begin);
                                                                                                                                                                                                                                                                 if (load_relaxed_long(&g_quit_flag)) break;
                                                                                                                                                                                                                                                                 int frames_this_block = (g_worker_mix_cap_frames != NULL) ? g_worker_mix_cap_frames[widx] : 0;
                                                                                                                                                                                                                                                                 LONG render_cycle = load_relaxed_long(&g_cycle_id);
@@ -4087,9 +4110,12 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
                                                                                                                                                                                                                                                                 process_note_off_event(wd, &e, cached_release_delay);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_CONTROL_CHANGE) {
+const int ss_cc_profile = debug_metrics_on();
 LARGE_INTEGER ss_cc_begin, ss_cc_end, ss_cc_freq;
+if (ss_cc_profile) {
 QueryPerformanceFrequency(&ss_cc_freq);
 QueryPerformanceCounter(&ss_cc_begin);
+}
                                                                                                                                                                                                                                                                 int cc = e.key & 0x7F; int val = e.value & 0x7F;
                                                                                                                                                                                                                                                                 channel_state *cs = &g_channels[e.ch];
                                                                                                                                                                                                                                                                 int invoke_data_entry = 0;
@@ -4249,12 +4275,14 @@ break;
 
                                                                                                                                                                                                                                                                 after_cc:;
                                                                                                                                                                                                                                                                 
+if (ss_cc_profile) {
 InterlockedAdd(&g_cc_count[cc], 1);
 QueryPerformanceCounter(&ss_cc_end);
 if (ss_cc_freq.QuadPart > 0) {
 InterlockedAdd(&g_cc_us[cc],
 (LONG)(((ss_cc_end.QuadPart - ss_cc_begin.QuadPart) * 1000000)
 / ss_cc_freq.QuadPart));
+}
 }
 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_PITCH_BEND) {
@@ -4407,9 +4435,11 @@ LONG render_size = load_relaxed_long(&g_render_size);
 }
 int ss_worker_counted = 0;
 LARGE_INTEGER ss_busy_begin, ss_busy_end, ss_busy_freq;
+if (ss_profile) {
 QueryPerformanceFrequency(&ss_busy_freq);
 QueryPerformanceCounter(&ss_busy_begin);
-if (ss_busy_freq.QuadPart > 0) {
+}
+if (ss_profile && ss_busy_freq.QuadPart > 0) {
 InterlockedAdd(&g_alloc_us,
 (LONG)(((ss_busy_begin.QuadPart - ss_cycle_begin.QuadPart) * 1000000)
 / ss_busy_freq.QuadPart));
@@ -4418,8 +4448,8 @@ for (;;) {
 if (load_relaxed_long(&g_quit_flag)) return 0;
 LONG idx = InterlockedAdd(&g_render_pop, pop_chunk) - pop_chunk;
 if (idx >= render_size) {
-QueryPerformanceCounter(&ss_busy_end);
-if (ss_busy_freq.QuadPart > 0) {
+if (ss_profile) QueryPerformanceCounter(&ss_busy_end);
+if (ss_profile && ss_busy_freq.QuadPart > 0) {
 InterlockedAdd(&g_worker_busy_us,
 (LONG)(((ss_busy_end.QuadPart - ss_busy_begin.QuadPart) * 1000000)
 / ss_busy_freq.QuadPart));
@@ -4427,7 +4457,7 @@ InterlockedAdd(&g_worker_busy_us,
 break;
 }
 LONG end = idx + pop_chunk; if (end > render_size) end = render_size;
-if (!ss_worker_counted) { ss_worker_counted = 1; InterlockedAdd(&g_workers_participating, 1); }
+if (ss_profile && !ss_worker_counted) { ss_worker_counted = 1; InterlockedAdd(&g_workers_participating, 1); }
 for (LONG k = idx; k < end; ++k) {
 #if defined(__AVX2__) || defined(__wasm_simd128__)
 int fast_batch = 0;
@@ -4441,11 +4471,11 @@ fast_batch = render_fast_stereo_sustain_batch_wasm(
 #endif
 }
 if (fast_batch > 0) {
-InterlockedAdd(&g_path_fast_voices, (LONG)fast_batch);
+if (debug_metrics_on()) InterlockedAdd(&g_path_fast_voices, (LONG)fast_batch);
 k += (LONG)fast_batch - 1;
 continue;
 }
-InterlockedAdd(&g_path_scalar_voices, 1);
+if (debug_metrics_on()) InterlockedAdd(&g_path_scalar_voices, 1);
 #endif
                                                                                                                                                                                                                                                                 int vid = g_render_queue[k];
                                                                                                                                                                                                                                                                 if (vid < 0 || vid >= max_voices) continue;
@@ -5167,10 +5197,12 @@ if (f_start < frames && env_state == ENV_SUSTAIN) {
 /* Attribute the miss to the first blocking condition, in the order the
  * guards test them, so the counts partition the voices rather than
  * overlapping. */
+if (debug_metrics_on()) {
 if (!no_interp) InterlockedAdd(&g_miss_interp, 1);
 else if (loop_active) InterlockedAdd(&g_miss_loop, 1);
 else if (filter_enabled) InterlockedAdd(&g_miss_filter, 1);
 else InterlockedAdd(&g_miss_other, 1);
+}
 }
 if (f_start >= frames && env_state == ENV_SUSTAIN && pending_note_off_samples < 0 &&
 !v->note_off_received && !v->kill_now && startup_samples == 0) {

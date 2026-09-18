@@ -70,6 +70,7 @@
         workerCount: 0,        // actual source-selected worker count
         noteSharding: 0,       // 0 auto, 1 channel, 2 hash
         stealScoreCache: true,
+        debugMetrics: false,
         fastNoteOff: true,
         validateState: false,
 
@@ -410,6 +411,8 @@
                         state.noteSharding = Math.max(0, Math.min(2, Math.round(data.noteSharding)));
                     if (typeof data.stealScoreCache === "boolean")
                         state.stealScoreCache = data.stealScoreCache;
+                    if (typeof data.debugMetrics === "boolean")
+                        state.debugMetrics = data.debugMetrics;
                     if (typeof data.fastNoteOff === "boolean")
                         state.fastNoteOff = data.fastNoteOff;
                     if (typeof data.validateState === "boolean")
@@ -502,6 +505,8 @@
                     state.noteSharding,
                 stealScoreCache:
                     state.stealScoreCache,
+                debugMetrics:
+                    state.debugMetrics,
                 fastNoteOff:
                     state.fastNoteOff,
                 validateState:
@@ -999,6 +1004,8 @@
         if (typeof options.stealScoreCache === "boolean")
             state.stealScoreCache =
                 options.stealScoreCache;
+        if (typeof options.debugMetrics === "boolean")
+            state.debugMetrics = options.debugMetrics;
 
         if (typeof options.fastNoteOff === "boolean")
             state.fastNoteOff =
@@ -1067,6 +1074,8 @@
                     state.noteSharding,
                 stealScoreCache:
                     state.stealScoreCache,
+                debugMetrics:
+                    state.debugMetrics,
                 fastNoteOff:
                     state.fastNoteOff,
                 validateState:

@@ -107,6 +107,7 @@ int voice_get_worker_thread_failures(void);
 int voice_get_detected_cores(void);
 int voice_get_path_fast(void);
 void voice_refresh_all_region_caches(void);
+void voice_set_debug_metrics(int enabled);
 int voice_get_alloc_us(void);
 int voice_get_cc_count(int cc);
 int voice_get_cc_us(int cc);

@@ -100,6 +100,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthWorkerCount READ synthWorkerCount NOTIFY synthStateChanged)
     Q_PROPERTY(int synthNoteSharding READ synthNoteSharding WRITE setSynthNoteSharding NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthStealScoreCache READ synthStealScoreCache WRITE setSynthStealScoreCache NOTIFY synthConfigChanged)
+    Q_PROPERTY(bool synthDebugMetrics READ synthDebugMetrics WRITE setSynthDebugMetrics NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthFastNoteOff READ synthFastNoteOff WRITE setSynthFastNoteOff NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthValidateState READ synthValidateState WRITE setSynthValidateState NOTIFY synthConfigChanged)
     Q_PROPERTY(bool synthSoftClip READ synthSoftClip WRITE setSynthSoftClip NOTIFY synthConfigChanged)
@@ -167,6 +168,8 @@ public:
     int synthCcHotNumber() const { return synthCcHotNumber_; }
     int synthCcHotPercent() const { return synthCcHotPercent_; }
     int synthCcHotCount() const { return synthCcHotCount_; }
+    bool synthDebugMetrics() const { return synthDebugMetrics_; }
+    void setSynthDebugMetrics(bool value);
     int synthPresampleResampled() const { return synthPresampleResampled_; }
     int synthPresampleSkipped() const { return synthPresampleSkipped_; }
     int synthMissReason() const { return synthMissReason_; }
@@ -468,6 +471,7 @@ private:
     int synthCcHotNumber_ = 0;
     int synthCcHotPercent_ = 0;
     int synthCcHotCount_ = 0;
+    bool synthDebugMetrics_ = false;
     int synthPresampleResampled_ = 0;
     int synthPresampleSkipped_ = 0;
     int synthMissReason_ = 0;
