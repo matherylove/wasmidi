@@ -1148,6 +1148,18 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
 // Dominant reason voices missed the vectorized path, encoded for one readout:
 // 0 none, 1 interpolation, 2 looping, 3 filter, 4 other. Low byte is the
 // percentage that reason accounts for.
+// Voices freed as a percentage of note-offs consumed in the last cycle. Below
+// 100 sustained means voices are not coming back and the pool stays pinned at
+// the pressure line where the steal guards start failing.
+EM_JS(int, wasmidi_snappy_free_ratio, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (!b || !b.state) return 100;
+    const offs = Number(b.state.noteOffsSeen) || 0;
+    const freed = Number(b.state.voicesFreed) || 0;
+    if (offs <= 0) return 100;
+    return Math.round((freed * 100) / offs);
+});
+
 EM_JS(int, wasmidi_snappy_alloc_x10, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? Math.round((Number(b.state.allocMs) || 0) * 10) : 0;
@@ -3996,6 +4008,7 @@ void MainWindow::pollSynthState()
     synthSimdPercent_ = wasmidi_snappy_path_simd_percent();
     synthWorkersActive_ = wasmidi_snappy_workers_active();
     synthAllocMs_ = wasmidi_snappy_alloc_x10() / 10.0;
+    synthFreeRatio_ = wasmidi_snappy_free_ratio();
     {
         const int packed = wasmidi_snappy_miss_reason();
         synthMissReason_ = packed >> 8;

@@ -1,7 +1,79 @@
 # WASMIDI — Handoff
 
-**Revisión 25.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 26.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 26 (leer primero)
+
+### El costo NO está en el DSP. Está en asignar voces.
+
+Medido en zona densa, 16 workers, 8192 voces:
+
+| | |
+|---|---|
+| ALLOC | **1.735 ms** |
+| BUSY | **56 ms** |
+| BLOCK | 106,9 ms |
+| WACT | 16 de 16 |
+| FREE | 48 |
+| STEALS/s | 21.218 |
+| DROPPED | 192.736 |
+
+**31× más tiempo asignando que renderizando.** 1.735 ms repartidos en 16 hilos
+son ~108 ms cada uno, que es exactamente el `BLOCK`: los workers pasan el bloque
+entero escaneando en busca de víctimas de robo.
+
+Esto invalida tres líneas de trabajo que estuvieron sobre la mesa:
+
+- **Vectorizar el DSP no serviría de nada.** El trabajo no está ahí.
+- **El bloque de mezcla desacoplado (7.4) tampoco ataca esto**, porque no es
+  costo fijo por llamada.
+- La hipótesis de voces-por-worker ya se había caído: el hardware de referencia
+  del repo de SSv2 es un 3700X (16 hilos), pero el usuario corre un 5900X (24),
+  así que el nativo en su máquina usaría el mismo conteo de workers y las mismas
+  voces por worker. La fragmentación no explica la diferencia.
+
+### El mecanismo del acantilado
+
+`steal_voice_fast()` recorre `wd->active[]` con esta guarda:
+
+```c
+if (!low_cap_steal && v->env_state != ENV_RELEASE && !v->note_off_received &&
+    (v->owner_channel != ch || v->key != new_note_key) &&
+    victim_priority >= incoming_priority) { saltar }
+```
+
+En material denso casi todas las voces tienen volumen parecido, así que la
+condición se cumple para casi todas y la función devuelve −1. Encima
+`probe_cap` cae a 128 cuando la presión pasa el percentil 99. Cada note-on
+fallido paga hasta 128 sondeos **para no encontrar nada**: con 21.218 robos por
+segundo más 192.736 fallos, son millones de sondeos inútiles por segundo.
+
+**El original hace exactamente lo mismo y también descarta la nota** — no tiene
+fallback. Se verificó en `alloc_voice()`/`steal_voice_fast()` del árbol
+original. Por lo tanto **agregar un fallback sería apartarse del original, no
+corregirlo**, y el usuario pidió fidelidad. NO tocar el stealer.
+
+### Lo que falta explicar, y el instrumento de esta revisión
+
+Si el stealer, el conteo de workers y las voces por worker son idénticos al
+nativo, algo alimenta la presión más rápido acá. Es un lazo: menos throughput →
+las voces no se liberan a tiempo → la presión queda sobre el percentil 99 →
+`probe_cap` en 128 → el robo falla → más descartes → más presión.
+
+Candidato directo, y es un problema introducido por el port: la coalescencia de
+eventos con agendado por lotes (ver 7.10). Si los note-offs se fusionan o se
+aplican al inicio del bloque en vez de a su offset, **las voces viven de más**.
+
+**Instrumento agregado:** `FREED %`, voces efectivamente liberadas como
+porcentaje de note-offs consumidos en el ciclo. Rojo bajo 90%.
+
+| FREED | Conclusión |
+|---|---|
+| < 90% sostenido | Los note-offs no liberan voces. La fuga está en esa ruta, el stealer es víctima y no causa. Arreglar ahí y el acantilado desaparece solo. |
+| ~100% | Las voces sí vuelven y la presión viene del volumen de notas puro. Entonces el techo es throughput general y hay que volver a §4. |
+
+---
 
 ## 0. Estado en la revisión 25 (leer primero)
 

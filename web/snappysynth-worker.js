@@ -109,6 +109,8 @@ function postState(type, extra = {}) {
         workersParticipating:
             coreReady && Module ? Module._ssw_workers_participating() : 0,
         allocMs: coreReady && Module ? Module._ssw_alloc_us() / 1000 : 0,
+        noteOffsSeen: coreReady && Module ? Module._ssw_noteoffs_seen() : 0,
+        voicesFreed: coreReady && Module ? Module._ssw_voices_freed() : 0,
         missInterp: coreReady && Module ? Module._ssw_miss_interp() : 0,
         missLoop: coreReady && Module ? Module._ssw_miss_loop() : 0,
         missFilter: coreReady && Module ? Module._ssw_miss_filter() : 0,

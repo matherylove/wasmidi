@@ -897,6 +897,16 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Voices freed as a share of note-offs consumed. Below
+                        // 100 sustained means voices are not coming back, which
+                        // is what pins the pool at the pressure line where the
+                        // steal guards start rejecting every candidate.
+                        text: "FREED " + root.formatInteger(root.mainWindow.synthFreeRatio) + "%"
+                        color: root.mainWindow.synthFreeRatio < 90 ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         // Summed time across workers spent draining events,
                         // allocating voices and stealing, before any rendering.
                         // BUSY excludes this phase; BLOCK includes it, so a

@@ -71,6 +71,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthSimdPercent READ synthSimdPercent NOTIFY synthStateChanged)
     Q_PROPERTY(int synthWorkersActive READ synthWorkersActive NOTIFY synthStateChanged)
     Q_PROPERTY(double synthAllocMs READ synthAllocMs NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthFreeRatio READ synthFreeRatio NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMissReason READ synthMissReason NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMissPercent READ synthMissPercent NOTIFY synthStateChanged)
     Q_PROPERTY(double synthWorkerBusyMs READ synthWorkerBusyMs NOTIFY synthStateChanged)
@@ -155,6 +156,7 @@ public:
     int synthSimdPercent() const { return synthSimdPercent_; }
     int synthWorkersActive() const { return synthWorkersActive_; }
     double synthAllocMs() const { return synthAllocMs_; }
+    int synthFreeRatio() const { return synthFreeRatio_; }
     int synthMissReason() const { return synthMissReason_; }
     int synthMissPercent() const { return synthMissPercent_; }
     double synthWorkerBusyMs() const { return synthWorkerBusyMs_; }
@@ -449,6 +451,7 @@ private:
     int synthSimdPercent_ = 0;
     int synthWorkersActive_ = 0;
     double synthAllocMs_ = 0.0;
+    int synthFreeRatio_ = 100;
     int synthMissReason_ = 0;
     int synthMissPercent_ = 0;
     double synthWorkerBusyMs_ = 0.0;

@@ -1130,6 +1130,11 @@ int ssw_path_scalar_voices(void) { return voice_get_path_scalar(); }
 /* Summed time across workers spent draining events, allocating voices and
  * stealing, before any rendering. BUSY excludes this; BLOCK includes it. */
 int ssw_alloc_us(void) { return voice_get_alloc_us(); }
+/* Note-offs consumed and voices actually freed in the last cycle. Frees
+ * trailing note-offs means voices are not coming back, which is what keeps the
+ * pool pinned above the pressure line where the steal guards start failing. */
+int ssw_noteoffs_seen(void) { return voice_get_noteoffs_seen(); }
+int ssw_voices_freed(void) { return voice_get_voices_freed(); }
 int ssw_workers_participating(void) { return voice_get_workers_participating(); }
 int ssw_miss_interp(void) { return voice_get_miss_interp(); }
 int ssw_miss_loop(void) { return voice_get_miss_loop(); }
