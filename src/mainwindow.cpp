@@ -1148,16 +1148,16 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
 // Dominant reason voices missed the vectorized path, encoded for one readout:
 // 0 none, 1 interpolation, 2 looping, 3 filter, 4 other. Low byte is the
 // percentage that reason accounts for.
-// Voices freed as a percentage of note-offs consumed in the last cycle. Below
-// 100 sustained means voices are not coming back and the pool stays pinned at
-// the pressure line where the steal guards start failing.
+// Voices recycled as a percentage of note-ons that got a voice, cumulative.
+// Trails 100 by roughly the voices currently sounding; drifting steadily
+// downward over time means voices are not coming back at all.
 EM_JS(int, wasmidi_snappy_free_ratio, (), {
     const b = globalThis.WasmidiSnappyBridge;
     if (!b || !b.state) return 100;
-    const offs = Number(b.state.noteOffsSeen) || 0;
-    const freed = Number(b.state.voicesFreed) || 0;
-    if (offs <= 0) return 100;
-    return Math.round((freed * 100) / offs);
+    const started = Number(b.state.notesStarted) || 0;
+    const recycled = Number(b.state.voicesRecycled) || 0;
+    if (started <= 0) return 100;
+    return Math.round((recycled * 100) / started);
 });
 
 EM_JS(int, wasmidi_snappy_alloc_x10, (), {

@@ -897,12 +897,13 @@ Item {
                         font.bold: true
                     }
                     Text {
-                        // Voices freed as a share of note-offs consumed. Below
-                        // 100 sustained means voices are not coming back, which
-                        // is what pins the pool at the pressure line where the
-                        // steal guards start rejecting every candidate.
-                        text: "FREED " + root.formatInteger(root.mainWindow.synthFreeRatio) + "%"
-                        color: root.mainWindow.synthFreeRatio < 90 ? "#ef4444" : "#70667e"
+                        // Voices recycled as a share of note-ons that got a
+                        // voice, cumulative. Sits just under 100 in healthy
+                        // playback, trailing by the voices currently sounding.
+                        // Drifting steadily downward means voices are not
+                        // coming back.
+                        text: "RECYC " + root.formatInteger(root.mainWindow.synthFreeRatio) + "%"
+                        color: root.mainWindow.synthFreeRatio < 80 ? "#ef4444" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true
                     }

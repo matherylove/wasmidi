@@ -1057,6 +1057,10 @@ static inline voice* vor_find_overlap_voice(int ch, int key, sfz_region *region,
 static inline float estimate_voice_steal_score(const voice *v);
 static inline void update_voice_steal_score(int vid, const voice *v);
 static inline void free_push(worker_data *wd, int vid);
+/* Cumulative voice lifecycle; see the accessors further down for why this is
+ * cumulative and not a per-cycle ratio. */
+static volatile LONG g_notes_started_total = 0;
+static volatile LONG g_voices_recycled_total = 0;
                                                                                                                                                                                  static inline int free_pop(worker_data *wd);
                                                                                                                                                                                  static inline int advance_voice_sample_state(voice *v,
                                                                                                                                                                                                                               int sustain_down,
@@ -2468,6 +2472,7 @@ static inline int releasepool_take(worker_data *wd, float incoming_x08, int inco
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 static inline void free_push(worker_data *wd, int vid) {
+InterlockedAdd(&g_voices_recycled_total, 1);
                                                                                                                                                                                                                                                                 if (wd->free_top+1 >= wd->free_cap) free_reserve(wd, wd->free_top+2);
                                                                                                                                                                                                                                                                 // Keep the duplicate scan only for validation builds. In the normal path,
                                                                                                                                                                                                                                                                 // free ownership is single-writer per worker and this linear scan is costly.
@@ -2610,24 +2615,24 @@ static volatile LONG g_workers_participating = 0;
  * where the wall clock can go without BUSY ever showing it.
  */
 /*
- * Voice lifecycle accounting, per render cycle.
+ * Voice lifecycle accounting, CUMULATIVE.
  *
- * ALLOC dwarfing BUSY says the workers spend the block hunting for steal
- * victims rather than rendering. The steal guards only bite that hard while the
- * pool stays above the 99th-percentile pressure line, and the pool only stays
- * there if voices are not coming back. So count the two sides directly:
- * note-offs admitted versus voices actually freed. If frees lag note-offs
- * across cycles, the leak is in the note-off path and the stealer is a victim,
- * not the cause -- which matters because the stealer is identical to the native
- * engine and must stay that way.
+ * The first attempt compared note-offs against frees within one render cycle
+ * and reported 0%, which was wrong twice over. Wrong placement: the counter sat
+ * in free_voice(), but the normal recycling path is the post-render sweep in
+ * publish_worker_done(), which calls free_push() directly. Wrong shape: a voice
+ * is not freed when its note-off arrives, it is freed when the release envelope
+ * finishes falling, one or more blocks later, and later still under sustain. A
+ * per-cycle ratio between the two is meaningless in any single block.
+ *
+ * So count both sides cumulatively and on every recycling path. If frees track
+ * note-ons over time the pool is simply too small for the material and there is
+ * no leak; if frees fall behind and stay behind, voices are not coming back and
+ * that is what pins the pool at the pressure line where the steal guards start
+ * rejecting every candidate.
  */
-static volatile LONG g_noteoffs_seen = 0;
-static volatile LONG g_voices_freed = 0;
-static volatile LONG g_noteoffs_last = 0;
-static volatile LONG g_voices_freed_last = 0;
-
-int voice_get_noteoffs_seen(void) { return (int)g_noteoffs_last; }
-int voice_get_voices_freed(void) { return (int)g_voices_freed_last; }
+int voice_get_notes_started(void) { return (int)g_notes_started_total; }
+int voice_get_voices_recycled(void) { return (int)g_voices_recycled_total; }
 
 static volatile LONG g_alloc_us = 0;
 static volatile LONG g_alloc_last = 0;
@@ -3136,7 +3141,6 @@ v->voice_age = 0;
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 static void free_voice(worker_data *wd, int vid) {
-InterlockedAdd(&g_voices_freed, 1);
                                                                                                                                                                                                                                                                 (void)wd;
                                                                                                                                                                                                                                                                 if (vid < 0 || vid >= max_voices) return;
 
@@ -3728,6 +3732,7 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
 
                                                                                                                                                                                                                                                                 #pragma message("NOTE: using legacy allocation-first steal flow")
                                                                                                                                                                                                                                                                 vid = alloc_voice(wd, e.ch, widx);
+if (vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
                                                                                                                                                                                                                                                                 logger_log("NOTE_ON: ch=%d key=%d vel=%d layer=%d alloc_voice -> vid=%d\n",
                                                                                                                                                                                                                                                                 e.ch, e.key, e.value, layer_index, vid);
@@ -3976,8 +3981,7 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
                                                                                                                                                                                                                                                                 cached_noteoff_qpc = e.timestamp_qpc;
                                                                                                                                                                                                                                                                 cached_release_delay = qpc_to_sample_offset_clamped(e.timestamp_qpc, frames_this_block);
                                                                                                                                                                                                                                                                 }
-                                                                                                                                                                                                                                                                InterlockedAdd(&g_noteoffs_seen, 1);
-process_note_off_event(wd, &e, cached_release_delay);
+                                                                                                                                                                                                                                                                process_note_off_event(wd, &e, cached_release_delay);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_CONTROL_CHANGE) {
                                                                                                                                                                                                                                                                 int cc = e.key & 0x7F; int val = e.value & 0x7F;
@@ -6688,10 +6692,7 @@ g_workers_participating_last = g_workers_participating;
 g_workers_participating = 0;
 g_alloc_last = g_alloc_us;
 g_alloc_us = 0;
-g_noteoffs_last = g_noteoffs_seen;
-g_voices_freed_last = g_voices_freed;
-g_noteoffs_seen = 0;
-g_voices_freed = 0;
+
 g_path_simd_voice_last = g_path_simd_voice_voices;
 g_miss_interp_last = g_miss_interp;
 g_miss_loop_last = g_miss_loop;

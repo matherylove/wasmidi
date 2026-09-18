@@ -1,7 +1,61 @@
 # WASMIDI — Handoff
 
-**Revisión 26.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 27.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 27 (leer primero)
+
+### El hallazgo firme: el costo está en asignar voces, no en el DSP
+
+Zona densa, 8192 voces: `ALLOC 2.243 ms` contra `BUSY 68 ms`. **33× más tiempo
+asignando que renderizando.** Con `FREE 95`, `STEALS/s 21.505` y
+`DROPPED 282.666`, los workers pasan el bloque entero sondeando en busca de
+víctimas de robo que la guarda de prioridad rechaza.
+
+Esto descarta, con medición: vectorizar el DSP, el bloque de mezcla desacoplado
+(7.4), y la hipótesis de voces-por-worker.
+
+**El stealer NO se toca.** Se verificó en el árbol original que `alloc_voice()`
+también descarta la nota cuando el robo falla, sin fallback. Agregar uno sería
+apartarse del original, y el usuario pidió fidelidad.
+
+### Error corregido en esta revisión: el contador `FREED` mentía
+
+`FREED 0%` fue un falso positivo. Estaba mal de dos formas:
+
+- **Mal ubicado.** El contador vivía en `free_voice()`, que tiene una sola
+  llamada en todo el archivo. La ruta **normal** de reciclado es el barrido
+  posterior al render en `publish_worker_done()`, que llama a `free_push()`
+  directamente. Las voces sí volvían, por un camino no instrumentado.
+- **Mal planteado.** Una voz no se libera cuando llega su note-off, sino cuando
+  la envolvente de release termina de caer, uno o varios bloques después, y más
+  tarde aún con pedal de sustain. Un porcentaje por ciclo entre note-offs y
+  liberaciones no significa nada en ningún bloque aislado.
+
+El indicio que lo delataba estaba en la misma captura: `FREE 95` estable. Si de
+verdad no se liberara ninguna voz, `FREE` habría caído a 0 en el primer segundo
+y se habría quedado ahí.
+
+**Es el segundo contador mal planteado de la sesión**, después de `GAP`
+invertido. Lección repetida: una métrica nueva se valida contra un caso donde se
+conozca la respuesta esperada, antes de sacar conclusiones de ella.
+
+### Reemplazo: `RECYC %`, acumulativo
+
+Ahora cuenta en `free_push()`, o sea en **ambas** rutas de reciclado, y compara
+acumulados: voces recicladas contra note-ons que consiguieron voz.
+
+| RECYC | Conclusión |
+|---|---|
+| Justo bajo 100, estable | Las voces vuelven bien. El retraso es simplemente las voces sonando ahora. El pool no alcanza para el material y el nativo con el mismo cap haría lo mismo: no hay fuga. |
+| Bajando sostenidamente | Las voces no vuelven. Ahí sí hay fuga, y el candidato es la coalescencia de eventos con agendado por lotes (7.10). |
+
+**Comprobación más barata antes de instrumentar nada más:** `PK POLY` en el
+panel de información del archivo dice cuántas voces simultáneas pide el material
+de verdad. Si supera 8192, el pool simplemente no alcanza y no hay nada que
+arreglar en el motor.
+
+---
 
 ## 0. Estado en la revisión 26 (leer primero)
 

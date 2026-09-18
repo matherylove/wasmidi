@@ -1133,8 +1133,17 @@ int ssw_alloc_us(void) { return voice_get_alloc_us(); }
 /* Note-offs consumed and voices actually freed in the last cycle. Frees
  * trailing note-offs means voices are not coming back, which is what keeps the
  * pool pinned above the pressure line where the steal guards start failing. */
-int ssw_noteoffs_seen(void) { return voice_get_noteoffs_seen(); }
-int ssw_voices_freed(void) { return voice_get_voices_freed(); }
+/*
+ * Cumulative voice lifecycle. Note-ons that actually got a voice, and voices
+ * returned to a free stack by either recycling path. Cumulative rather than a
+ * per-cycle ratio because a voice is freed when its release envelope finishes,
+ * not when its note-off arrives, so comparing the two inside one block is
+ * meaningless. If recycled tracks started over time the pool is simply too
+ * small for the material; if it falls behind and stays behind, voices are not
+ * coming back.
+ */
+int ssw_notes_started(void) { return voice_get_notes_started(); }
+int ssw_voices_recycled(void) { return voice_get_voices_recycled(); }
 int ssw_workers_participating(void) { return voice_get_workers_participating(); }
 int ssw_miss_interp(void) { return voice_get_miss_interp(); }
 int ssw_miss_loop(void) { return voice_get_miss_loop(); }
