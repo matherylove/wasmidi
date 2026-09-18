@@ -1,7 +1,74 @@
 # WASMIDI — Handoff
 
-**Revisión 27.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 28.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 28 (leer primero)
+
+### La causa real, aislada por el usuario
+
+Dos pruebas suyas delimitaron el problema mejor que toda la instrumentación:
+
+- MIDI de millones de notas por segundo, 8192 voces saturadas, cientos de miles
+  de robos por segundo: **no lagea**.
+- MIDI con cientos de miles de **CC** por segundo: **lagea**.
+- En ese MIDI, `ACTIVE` sube y baja siguiendo la música: **no hay fuga de voces**.
+
+Eso descarta, definitivamente: el DSP, el stealer, las barreras, el bloque de
+mezcla desacoplado, el pool de voces y la ruta de note-off. Todo lo que se
+persiguió antes eran síntomas de un pool legítimamente saturado.
+
+### El mecanismo
+
+```c
+static inline uint16_t vor_current_event_token(int ch, int key) {
+    return (uint16_t)(g_vor_key_generation[ch][key] ^
+                      (uint16_t)(g_vor_channel_generation[ch] * 257u));
+}
+static inline void vor_break_channel_sequence(int ch) { ++g_vor_channel_generation[ch]; }
+```
+
+VOR apila note-ons idénticos en una sola voz, y es lo que permite que millones
+de notas por segundo quepan en 8192 voces. Dos note-on solo se apilan si
+comparten `vor_token`, y ese token mezcla la generación **del canal**.
+
+En `enqueue_event()`, **todo** evento que no sea nota llamaba a
+`vor_break_channel_sequence()`. Un solo CC entre dos note-on idénticos les da
+tokens distintos y **el apilado no ocurre**. Con CC densos, VOR queda desactivado
+de hecho: cada nota repetida se lleva su propia voz, el pool satura, el robo se
+dispara y `ALLOC` domina el bloque.
+
+### El arreglo
+
+Romper es correcto cuando el CC cambia algo: dos notas separadas por un cambio
+real de volumen o pan no son idénticas y no deben apilarse. Es inútil cuando el
+valor es el que el canal ya tenía.
+
+`vor_event_is_redundant()` en `voice.c` suprime el break solo para CC y pitch
+bend que repiten su valor actual. **Fiel por construcción:** si el estado del
+canal no cambió, las notas realmente son idénticas y se apilan igual que sin el
+evento. Los CC de secuencia (6, 38, 98-101, 120-127) nunca son redundantes,
+porque repetirlos es una segunda acción real, no un no-op.
+
+    python3 tools/extract_vor_redundancy_logic.py
+    cc -O1 -Wall -o /tmp/vor tools/vor_redundancy_check.c && /tmp/vor
+
+11 grupos, incluidos independencia por canal y por controlador, sustain on/off,
+pitch bend y limpieza en reset. El test extrae el código real de `voice.c`, no
+una copia.
+
+### Limitación, y cómo se mide
+
+**Esto solo ayuda si los CC son redundantes.** El test 11 lo deja explícito: una
+rampa de 128 valores distintos sigue rompiendo 128 veces. Si el archivo del
+usuario tiene CC que cambian de verdad a esa densidad, el apilado se rompe igual
+y hace falta otra respuesta — probablemente cuantizar el break a la grilla de
+render en vez de por evento.
+
+Si tras esta revisión el MIDI con CC sigue lageando, esa es la conclusión y no
+hay que volver a mirar voces, stealer ni DSP.
+
+---
 
 ## 0. Estado en la revisión 27 (leer primero)
 

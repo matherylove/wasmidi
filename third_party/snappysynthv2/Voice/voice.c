@@ -467,6 +467,82 @@ static inline void vor_break_key_sequence(int ch, int key) {
     ++g_vor_key_generation[ch][key];
 }
 
+/*
+ * Last value admitted per (channel, controller) and per-channel pitch bend, as
+ * seen at enqueue time.
+ *
+ * Every non-note event used to bump g_vor_channel_generation, and the VOR token
+ * of a note-on mixes that generation in, so a single controller event between
+ * two otherwise identical note-ons gave them different tokens and stopped them
+ * from stacking. On material with hundreds of thousands of controller events
+ * per second that disables voice stacking entirely: every repeated note takes
+ * its own voice, the pool saturates, stealing explodes and allocation dominates
+ * the block. The same file with the controllers removed plays millions of notes
+ * per second without trouble, which is exactly this.
+ *
+ * Breaking on a controller is correct when the controller actually changes
+ * something: two notes separated by a real volume or pan change are not
+ * identical and must not be stacked. It is pointless when the value is the one
+ * the channel already had. Suppressing only the redundant ones is faithful by
+ * construction -- the channel state is unchanged, so the notes really are
+ * identical and stack exactly as they would have without the event.
+ *
+ * Written only from enqueue_event(), which is the single admission point.
+ */
+static unsigned char g_last_cc_value[MIDI_CHANNEL_COUNT][128];
+static unsigned char g_last_cc_seen[MIDI_CHANNEL_COUNT][128];
+static int g_last_bend_value[MIDI_CHANNEL_COUNT];
+static unsigned char g_last_bend_seen[MIDI_CHANNEL_COUNT];
+
+static void vor_reset_redundancy_shadow(void) {
+    memset(g_last_cc_value, 0, sizeof(g_last_cc_value));
+    memset(g_last_cc_seen, 0, sizeof(g_last_cc_seen));
+    memset(g_last_bend_value, 0, sizeof(g_last_bend_value));
+    memset(g_last_bend_seen, 0, sizeof(g_last_bend_seen));
+}
+
+/*
+ * Does this event leave the channel exactly as it found it? Only a plain
+ * controller or pitch bend repeating its current value qualifies. Anything that
+ * carries sequence meaning rather than a value -- RPN/NRPN selects, data entry,
+ * the all-notes-off family -- always breaks, because a repeat of those is a
+ * second real action, not a no-op.
+ */
+static int vor_event_is_redundant(int ch, const ch_event *e) {
+    if (e->type == EVT_CONTROL_CHANGE) {
+        const int cc = e->key & 0x7f;
+        switch (cc) {
+            case 6: case 38: case 98: case 99: case 100: case 101:
+            case 120: case 121: case 122: case 123:
+            case 124: case 125: case 126: case 127:
+                return 0;
+            default:
+                break;
+        }
+        if (!g_last_cc_seen[ch][cc]) {
+            g_last_cc_seen[ch][cc] = 1;
+            g_last_cc_value[ch][cc] = (unsigned char)(e->value & 0x7f);
+            return 0;
+        }
+        if (g_last_cc_value[ch][cc] == (unsigned char)(e->value & 0x7f))
+            return 1;
+        g_last_cc_value[ch][cc] = (unsigned char)(e->value & 0x7f);
+        return 0;
+    }
+    if (e->type == EVT_PITCH_BEND) {
+        if (!g_last_bend_seen[ch]) {
+            g_last_bend_seen[ch] = 1;
+            g_last_bend_value[ch] = e->value;
+            return 0;
+        }
+        if (g_last_bend_value[ch] == e->value)
+            return 1;
+        g_last_bend_value[ch] = e->value;
+        return 0;
+    }
+    return 0;
+}
+
 static inline void vor_break_channel_sequence(int ch) {
     ++g_vor_channel_generation[ch];
 }
@@ -1224,6 +1300,10 @@ e.vor_token = vor_current_event_token(qch, e.key);
 vor_break_key_sequence(qch, e.key);
 e.vor_token = 0;
 } else {
+/* Only break the stacking sequence when the event actually changes the
+ * channel; a controller repeating its current value leaves the notes
+ * around it identical. See vor_event_is_redundant(). */
+if (!vor_event_is_redundant(qch, &e))
 vor_break_channel_sequence(qch);
 e.vor_token = 0;
 }
@@ -6255,6 +6335,7 @@ if (desired < 1) desired = 1;
  */
 if (!workers_requested_explicitly && desired > cores) desired = cores;
 if (desired > max_voices) desired = max_voices;
+vor_reset_redundancy_shadow();
 update_worker_freelist_refill(desired);
 setup_workers(desired);
 repair_worker_maps_after_thread_failure();
