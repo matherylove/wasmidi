@@ -34,6 +34,9 @@
         pathScalarVoices: 0,
         workersParticipating: 0,
         allocMs: 0,
+        presampleSeen: 0,
+        presampleSkipped: 0,
+        presampleResampled: 0,
         notesStarted: 0,
         voicesRecycled: 0,
         missInterp: 0,
@@ -295,7 +298,7 @@
                     state.pathFastVoices = data.pathFastVoices;
                 if (Number.isFinite(data.pathScalarVoices))
                     state.pathScalarVoices = data.pathScalarVoices;
-                for (const k of ["missInterp","missLoop","missFilter","missOther","workersParticipating","allocMs","notesStarted","voicesRecycled"])
+                for (const k of ["missInterp","missLoop","missFilter","missOther","workersParticipating","allocMs","notesStarted","voicesRecycled","presampleSeen","presampleSkipped","presampleResampled"])
                     if (Number.isFinite(data[k])) state[k] = data[k];
                 if (Number.isFinite(data.pathSimdVoiceVoices))
                     state.pathSimdVoiceVoices = data.pathSimdVoiceVoices;

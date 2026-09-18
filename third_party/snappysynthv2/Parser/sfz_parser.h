@@ -124,6 +124,10 @@ void sfz_invalidate_region_cache(sfz_instrument* inst);
 
 // PRE-RESAMPLING OPTIMIZATION
 void sfz_apply_presampling(sfz_instrument* inst, int target_sample_rate);
+/* Outcome of the last presampling pass; see the definition for why. */
+extern int g_presample_regions_seen;
+extern int g_presample_regions_skipped;
+extern int g_presample_regions_resampled;
 sfz_region* sfz_find_region(sfz_instrument* inst, int key, int vel);
 sfz_region* sfz_find_region_for_program(sfz_instrument* inst, int key, int vel,
                                         int midi_bank_combined, int midi_bank_msb,

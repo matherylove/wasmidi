@@ -109,6 +109,9 @@ function postState(type, extra = {}) {
         workersParticipating:
             coreReady && Module ? Module._ssw_workers_participating() : 0,
         allocMs: coreReady && Module ? Module._ssw_alloc_us() / 1000 : 0,
+        presampleSeen: coreReady && Module ? Module._ssw_presample_seen() : 0,
+        presampleSkipped: coreReady && Module ? Module._ssw_presample_skipped() : 0,
+        presampleResampled: coreReady && Module ? Module._ssw_presample_resampled() : 0,
         notesStarted: coreReady && Module ? Module._ssw_notes_started() : 0,
         voicesRecycled: coreReady && Module ? Module._ssw_voices_recycled() : 0,
         missInterp: coreReady && Module ? Module._ssw_miss_interp() : 0,

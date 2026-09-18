@@ -897,6 +897,17 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Presampling outcome of the last soundfont load.
+                        // Regions skipped, or zero resampled on the first load
+                        // where a reload reports many, means voices resample at
+                        // run time inside the render loop.
+                        text: "PRESMP " + root.formatInteger(root.mainWindow.synthPresampleResampled) +
+                              "/" + root.formatInteger(root.mainWindow.synthPresampleSkipped) + " skip"
+                        color: root.mainWindow.synthPresampleSkipped > 0 ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         // Voices recycled as a share of note-ons that got a
                         // voice, cumulative. Sits just under 100 in healthy
                         // playback, trailing by the voices currently sounding.

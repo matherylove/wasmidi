@@ -1639,7 +1639,26 @@ static wav_data* resample_wav_data(wav_data* original, int target_sample_rate) {
 }
 
 // Apply pre-resampling to all regions in an instrument
+/*
+ * Outcome of the last presampling pass, for diagnosis.
+ *
+ * On the first soundfont load the synth runs roughly 120x slower per voice than
+ * after any reload, with the same voice count: BUSY 609 ms against 5 ms. That is
+ * the render loop itself, not allocation, so the voices must be taking a
+ * different data path -- the obvious candidate being that they resample at run
+ * time because the regions were never presampled. These counters say whether
+ * that is what happens instead of leaving it to inference: regions seen,
+ * regions skipped for want of sample data or a cache entry, and regions that
+ * ended up actually resampled.
+ */
+int g_presample_regions_seen = 0;
+int g_presample_regions_skipped = 0;
+int g_presample_regions_resampled = 0;
+
 void sfz_apply_presampling(sfz_instrument* inst, int target_sample_rate) {
+    g_presample_regions_seen = 0;
+    g_presample_regions_skipped = 0;
+    g_presample_regions_resampled = 0;
     if (!inst) return;
 
     logger_log("Applying pre-resampling to %d regions (target: %d Hz)\n",
@@ -1647,7 +1666,8 @@ void sfz_apply_presampling(sfz_instrument* inst, int target_sample_rate) {
 
     for (int i = 0; i < inst->num_regions; i++) {
         sfz_region* region = &inst->regions[i];
-        if (!region->sample_data || !region->cache_entry) continue;
+        ++g_presample_regions_seen;
+    if (!region->sample_data || !region->cache_entry) { ++g_presample_regions_skipped; continue; }
 
         region->original_sample_rate = (float)region->sample_data->sample_rate;
         sfz_sample_cache_entry* entry = region->cache_entry;
@@ -1662,6 +1682,7 @@ void sfz_apply_presampling(sfz_instrument* inst, int target_sample_rate) {
             region->resampled_data = entry->resampled;
         }
         region->is_resampled = (region->resampled_data != region->sample_data);
+    if (region->is_resampled) ++g_presample_regions_resampled;
 
         if (region->is_resampled) {
             logger_log("Region %d: Pre-resampled %s (%d->%d Hz)\n",

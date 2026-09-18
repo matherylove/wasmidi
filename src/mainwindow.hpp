@@ -72,6 +72,8 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthWorkersActive READ synthWorkersActive NOTIFY synthStateChanged)
     Q_PROPERTY(double synthAllocMs READ synthAllocMs NOTIFY synthStateChanged)
     Q_PROPERTY(int synthFreeRatio READ synthFreeRatio NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthPresampleResampled READ synthPresampleResampled NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthPresampleSkipped READ synthPresampleSkipped NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMissReason READ synthMissReason NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMissPercent READ synthMissPercent NOTIFY synthStateChanged)
     Q_PROPERTY(double synthWorkerBusyMs READ synthWorkerBusyMs NOTIFY synthStateChanged)
@@ -157,6 +159,8 @@ public:
     int synthWorkersActive() const { return synthWorkersActive_; }
     double synthAllocMs() const { return synthAllocMs_; }
     int synthFreeRatio() const { return synthFreeRatio_; }
+    int synthPresampleResampled() const { return synthPresampleResampled_; }
+    int synthPresampleSkipped() const { return synthPresampleSkipped_; }
     int synthMissReason() const { return synthMissReason_; }
     int synthMissPercent() const { return synthMissPercent_; }
     double synthWorkerBusyMs() const { return synthWorkerBusyMs_; }
@@ -452,6 +456,8 @@ private:
     int synthWorkersActive_ = 0;
     double synthAllocMs_ = 0.0;
     int synthFreeRatio_ = 100;
+    int synthPresampleResampled_ = 0;
+    int synthPresampleSkipped_ = 0;
     int synthMissReason_ = 0;
     int synthMissPercent_ = 0;
     double synthWorkerBusyMs_ = 0.0;

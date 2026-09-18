@@ -1151,6 +1151,17 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
 // Voices recycled as a percentage of note-ons that got a voice, cumulative.
 // Trails 100 by roughly the voices currently sounding; drifting steadily
 // downward over time means voices are not coming back at all.
+// Presampling outcome packed for one readout: resampled << 16 | skipped.
+// Skipped regions, or zero resampled on the first load where a reload reports
+// many, is the first-load slowdown.
+EM_JS(int, wasmidi_snappy_presample, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (!b || !b.state) return 0;
+    const res = Number(b.state.presampleResampled) || 0;
+    const skip = Number(b.state.presampleSkipped) || 0;
+    return ((res & 0xffff) << 16) | (skip & 0xffff);
+});
+
 EM_JS(int, wasmidi_snappy_free_ratio, (), {
     const b = globalThis.WasmidiSnappyBridge;
     if (!b || !b.state) return 100;
@@ -4009,6 +4020,11 @@ void MainWindow::pollSynthState()
     synthWorkersActive_ = wasmidi_snappy_workers_active();
     synthAllocMs_ = wasmidi_snappy_alloc_x10() / 10.0;
     synthFreeRatio_ = wasmidi_snappy_free_ratio();
+    {
+        const int packed = wasmidi_snappy_presample();
+        synthPresampleResampled_ = (packed >> 16) & 0xffff;
+        synthPresampleSkipped_ = packed & 0xffff;
+    }
     {
         const int packed = wasmidi_snappy_miss_reason();
         synthMissReason_ = packed >> 8;

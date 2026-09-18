@@ -1142,6 +1142,16 @@ int ssw_alloc_us(void) { return voice_get_alloc_us(); }
  * small for the material; if it falls behind and stays behind, voices are not
  * coming back.
  */
+/*
+ * Result of the last presampling pass. If the first soundfont load reports
+ * regions skipped, or zero resampled where a reload reports many, that is the
+ * first-load slowdown: unpresampled regions resample at run time inside the
+ * render loop.
+ */
+int ssw_presample_seen(void) { return g_presample_regions_seen; }
+int ssw_presample_skipped(void) { return g_presample_regions_skipped; }
+int ssw_presample_resampled(void) { return g_presample_regions_resampled; }
+
 int ssw_notes_started(void) { return voice_get_notes_started(); }
 int ssw_voices_recycled(void) { return voice_get_voices_recycled(); }
 int ssw_workers_participating(void) { return voice_get_workers_participating(); }
