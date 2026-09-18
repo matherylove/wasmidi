@@ -708,6 +708,15 @@ static int sfz_drum_bucket_index(int midi_is_drum) {
 
 static void sfz_free_selector_cache_unlocked(sfz_instrument* inst) {
     if (!inst) return;
+
+    /* Reset only after the null guard. Resetting on entry meant a later call
+     * with no instrument -- ssw_init_ex() makes one on every reconfigure --
+     * wiped the result of the real load and reported 0/0, which reads as "no
+     * regions walked" when it actually means "the counts were erased". */
+    g_presample_regions_seen = 0;
+    g_presample_regions_skipped = 0;
+    g_presample_regions_resampled = 0;
+
     for (int d = 0; d < 3; ++d) {
         for (int p = 0; p < SFZ_SELECTOR_PROGRAM_BUCKETS; ++p) {
             free(inst->selector_buckets[d][p].indices);
@@ -1656,9 +1665,6 @@ int g_presample_regions_skipped = 0;
 int g_presample_regions_resampled = 0;
 
 void sfz_apply_presampling(sfz_instrument* inst, int target_sample_rate) {
-    g_presample_regions_seen = 0;
-    g_presample_regions_skipped = 0;
-    g_presample_regions_resampled = 0;
     if (!inst) return;
 
     logger_log("Applying pre-resampling to %d regions (target: %d Hz)\n",
