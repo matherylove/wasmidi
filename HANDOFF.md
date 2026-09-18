@@ -1,7 +1,70 @@
 # WASMIDI — Handoff
 
-**Revisión 28.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 29.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 29 (leer primero)
+
+### Stall con CC densos: el motor NO es la causa
+
+Se comparó el árbol original contra el port línea por línea. **La fusión de CC en
+`enqueue_event()` y el break de VOR son byte por byte idénticos.** Mismo código,
+mismas exclusiones (CC 6, 38, 98-101, 120, 121, 123), misma rotura de secuencia
+por canal para todo evento que no sea nota.
+
+Si el mismo código recibe el mismo flujo produce el mismo resultado, así que el
+stall **se origina antes de `enqueue_event`**: el port le entrega al motor un
+flujo distinto del que recibe el original. Esa es la parte que el port cambió —
+el original recibe eventos uno por uno en tiempo real vía `SendDirectData`,
+mientras el port agenda por lotes y despacha el bloque entero antes de renderizar.
+
+Dos diferencias posibles y distinguibles:
+
+- **Volumen:** que lleguen más eventos CC al motor de los que el archivo
+  contiene, por duplicación o falta de filtrado en la ruta parser → worker.
+- **Orden:** que el intercalado por timestamp rompa la adyacencia que la fusión
+  necesita. Objeción a esta idea: si el original reprodujera el mismo archivo
+  vería la misma secuencia, salvo que su player filtre antes de entregar.
+
+**El número que decide:** eventos CC por segundo que entran a `enqueue_event`,
+contra los que el archivo tiene por segundo. Iguales → el flujo es el mismo y
+hay que buscar en otro lado. Órdenes de magnitud más → ahí está el stall, y
+corregirlo es fiel por definición porque devuelve el flujo a lo que el original
+recibe. **NO tocar el motor.**
+
+El filtro de redundancia de VOR de la rev. 28 no cambió el cuadro
+(`ALLOC 1.930 ms` contra `BUSY 66 ms`, 29x), lo cual confirma lo anticipado en
+esa revisión: los CC de este archivo cambian de valor de verdad, no son
+redundantes.
+
+### Primera carga de SF2: sigue sin resolverse
+
+`PRESMP 0/0 skip` en **ambas** cargas, con `REGIONS 11`. Ni resampleadas ni
+salteadas significa que el bucle de `sfz_apply_presampling()` no recorrió
+ninguna región: o `num_regions` era 0 o `inst` era NULL en el momento de
+llamar. Como `REGIONS 11` sí aparece en el panel, las regiones existen después.
+
+**Descartado:** el presampleo no es la diferencia entre primera y segunda carga,
+porque da 0/0 en las dos. La hipótesis del `cache_entry` sin poblar tampoco se
+sostiene: habría dado `skipped > 0`, no 0/0.
+
+Lo que sí está medido y es la pista firme: con las mismas voces activas,
+`BUSY` 996 ms en primera carga contra 316 ms en segunda, y `BLOCK` 32,5 ms
+contra 3,5 ms. **El trabajo real de render difiere ~3x con el mismo número de
+voces**, así que las voces recorren otro camino de datos.
+
+**Advertencia sobre esos números:** `BUSY` y `BLOCK` no cuadran aritméticamente
+entre sí (316 ms sumados dentro de un bloque de 3,5 ms serían 90 workers con 24
+configurados), así que uno de los dos no está midiendo el ciclo que se cree.
+Verificar la sincronización de los snapshots antes de construir nada encima.
+
+**Siguiente paso sugerido:** instrumentar `ssw_load_sf2()` directamente —
+`instrument` nulo o no, y `instrument->num_regions` justo antes de llamar a
+`sfz_apply_presampling()`, en ambas cargas. Hay dos call sites de esa función
+(uno en `ssw_init_ex`, otro en la carga) y conviene saber cuál corre último,
+porque el segundo pisa los contadores del primero.
+
+---
 
 ## 0. Estado en la revisión 28 (leer primero)
 
