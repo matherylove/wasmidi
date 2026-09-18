@@ -1127,6 +1127,9 @@ int ssw_path_scalar_voices(void) { return voice_get_path_scalar(); }
 /* Distinct workers that consumed at least one render-queue chunk last cycle.
  * Read together with BUSY: 24 here with BUSY at 0 means the timer is wrong;
  * 1 or 2 here means the pool is not sharing the queue. */
+/* Summed time across workers spent draining events, allocating voices and
+ * stealing, before any rendering. BUSY excludes this; BLOCK includes it. */
+int ssw_alloc_us(void) { return voice_get_alloc_us(); }
 int ssw_workers_participating(void) { return voice_get_workers_participating(); }
 int ssw_miss_interp(void) { return voice_get_miss_interp(); }
 int ssw_miss_loop(void) { return voice_get_miss_loop(); }

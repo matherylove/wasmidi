@@ -2602,6 +2602,17 @@ static volatile LONG g_worker_busy_us = 0;
  * the pool is not sharing the queue and that is the real bug.
  */
 static volatile LONG g_workers_participating = 0;
+/*
+ * Time each worker spends BEFORE the render-queue consumer loop: draining its
+ * channel event queues, allocating voices, and stealing. BUSY starts at the
+ * consumer loop, so all of that was invisible to it while still inside BLOCK.
+ * With the pool exhausted and tens of thousands of steals per second, this is
+ * where the wall clock can go without BUSY ever showing it.
+ */
+static volatile LONG g_alloc_us = 0;
+static volatile LONG g_alloc_last = 0;
+
+int voice_get_alloc_us(void) { return (int)g_alloc_last; }
 static volatile LONG g_workers_participating_last = 0;
 static volatile LONG g_render_queue_size_last = 0;
 
@@ -3495,6 +3506,8 @@ worker_data *wd = &g_workers[widx];
 
                                                                                                                                                                                                                                                                 for (;;) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
+LARGE_INTEGER ss_cycle_begin;
+QueryPerformanceCounter(&ss_cycle_begin);
                                                                                                                                                                                                                                                                 if (load_relaxed_long(&g_quit_flag)) break;
                                                                                                                                                                                                                                                                 int frames_this_block = (g_worker_mix_cap_frames != NULL) ? g_worker_mix_cap_frames[widx] : 0;
                                                                                                                                                                                                                                                                 LONG render_cycle = load_relaxed_long(&g_cycle_id);
@@ -4256,6 +4269,11 @@ int ss_worker_counted = 0;
 LARGE_INTEGER ss_busy_begin, ss_busy_end, ss_busy_freq;
 QueryPerformanceFrequency(&ss_busy_freq);
 QueryPerformanceCounter(&ss_busy_begin);
+if (ss_busy_freq.QuadPart > 0) {
+InterlockedAdd(&g_alloc_us,
+(LONG)(((ss_busy_begin.QuadPart - ss_cycle_begin.QuadPart) * 1000000)
+/ ss_busy_freq.QuadPart));
+}
 for (;;) {
 if (load_relaxed_long(&g_quit_flag)) return 0;
 LONG idx = InterlockedAdd(&g_render_pop, pop_chunk) - pop_chunk;
@@ -6646,6 +6664,8 @@ g_path_scalar_last = g_path_scalar_voices;
 g_worker_busy_last = g_worker_busy_us;
 g_workers_participating_last = g_workers_participating;
 g_workers_participating = 0;
+g_alloc_last = g_alloc_us;
+g_alloc_us = 0;
 g_path_simd_voice_last = g_path_simd_voice_voices;
 g_miss_interp_last = g_miss_interp;
 g_miss_loop_last = g_miss_loop;

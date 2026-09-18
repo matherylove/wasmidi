@@ -1148,6 +1148,11 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
 // Dominant reason voices missed the vectorized path, encoded for one readout:
 // 0 none, 1 interpolation, 2 looping, 3 filter, 4 other. Low byte is the
 // percentage that reason accounts for.
+EM_JS(int, wasmidi_snappy_alloc_x10, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? Math.round((Number(b.state.allocMs) || 0) * 10) : 0;
+});
+
 EM_JS(int, wasmidi_snappy_workers_active, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? (Number(b.state.workersParticipating) | 0) : 0;
@@ -3990,6 +3995,7 @@ void MainWindow::pollSynthState()
     synthDispatchMs_ = wasmidi_snappy_dispatch_x100() / 100.0;
     synthSimdPercent_ = wasmidi_snappy_path_simd_percent();
     synthWorkersActive_ = wasmidi_snappy_workers_active();
+    synthAllocMs_ = wasmidi_snappy_alloc_x10() / 10.0;
     {
         const int packed = wasmidi_snappy_miss_reason();
         synthMissReason_ = packed >> 8;

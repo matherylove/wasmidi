@@ -897,6 +897,19 @@ Item {
                         font.bold: true
                     }
                     Text {
+                        // Summed time across workers spent draining events,
+                        // allocating voices and stealing, before any rendering.
+                        // BUSY excludes this phase; BLOCK includes it, so a
+                        // large ALLOC with a small BUSY means the cost is in
+                        // voice allocation, not in the DSP.
+                        text: "ALLOC " + root.formatNumber(root.mainWindow.synthAllocMs, 0) + "ms"
+                        color: root.mainWindow.synthAllocMs >
+                                   root.mainWindow.synthWorkerBusyMs
+                            ? "#ef4444" : "#70667e"
+                        font.pixelSize: 7
+                        font.bold: true
+                    }
+                    Text {
                         // Distinct workers that consumed at least one chunk of
                         // the render queue last cycle. BUSY says how much work
                         // happened; this says how many threads it was spread

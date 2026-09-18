@@ -1,7 +1,60 @@
 # WASMIDI — Handoff
 
-**Revisión 24.** Escrito para alguien que llega sin contexto previo. Si vas a
+**Revisión 25.** Escrito para alguien que llega sin contexto previo. Si vas a
 continuar este trabajo, leé las secciones 1 a 4 completas antes de tocar código.
+
+## 0. Estado en la revisión 25 (leer primero)
+
+### El reparto de la cola NO es el problema
+
+`WACT 23` de 24 workers en zona densa. Mi sospecha sobre `pop_chunk` queda
+descartada: el pool sí participa.
+
+Pero eso hace que el resto de los números digan algo nuevo:
+
+| | Zona densa, post-recarga |
+|---|---|
+| ACTIVE | 8.090 |
+| WACT | 23 de 24 |
+| BUSY | 63 ms |
+| BLOCK | 85,2 ms |
+| STEALS/s | 29.774 |
+| DROPPED | 219.220 |
+| FREE | 92 |
+
+23 workers participan pero suman apenas 63 ms de trabajo mientras el bloque
+tarda 85,2 ms de reloj. Repartidos en 23 hilos eso serían ~2,7 ms de pared.
+**Faltan ~82 ms sin explicar.**
+
+### Dónde están esos 82 ms
+
+`BUSY` arranca **justo antes del bucle de consumo de la cola de render**, o sea
+que **no cuenta la fase de eventos**: drenar las colas de canal, asignar voces y
+robar. Con el pool agotado (`FREE 92`) y 29.774 robos por segundo, esa fase hace
+un trabajo enorme que es invisible para `BUSY` pero está entero dentro de
+`BLOCK`.
+
+**Instrumento agregado en esta revisión:** `ALLOC`, tiempo sumado entre workers
+en esa fase previa. Se pone rojo cuando supera a `BUSY`. Lectura:
+
+| ALLOC vs BUSY | Conclusión |
+|---|---|
+| ALLOC >> BUSY | El costo está en asignación de voces y robo, no en el DSP. Atacar el stealer y el agotamiento del pool, no vectorizar. |
+| ALLOC ~ 0 | El tiempo está en las barreras y el trabajo fijo por llamada. Ahí sí entra el bloque de mezcla desacoplado (7.4). |
+
+Si `ALLOC` resulta dominante, notar que **vectorizar el DSP no serviría de
+nada**: el trabajo no está ahí. Sería la tercera pista que se descarta midiendo.
+
+### Sigue abierto
+
+**El bug de primera carga NO está resuelto.** El arreglo de la rev. 23
+(`voice_refresh_all_region_caches`) es correcto en sí mismo pero no era la
+causa. Reportado por el usuario tras probar la rev. 24. Sospechoso vigente:
+`sfz_apply_presampling`. Verificación pendiente: contador de regiones con
+`is_resampled` verdadero tras cada carga; si la primera da 0 y la segunda da
+todas, confirmado.
+
+---
 
 ## 0. Estado en la revisión 24 (leer primero)
 
