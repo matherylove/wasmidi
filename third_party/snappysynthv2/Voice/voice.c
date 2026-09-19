@@ -2781,6 +2781,51 @@ static volatile LONG g_render_queue_size_last = 0;
  * The pitch multiplier is also what sets playback rate, so this is a correctness
  * fix as much as a performance one.
  */
+/*
+ * Warm the worker-local note/region caches after a soundfont is loaded.
+ *
+ * The engine's own optimization notes list "single-region note caches",
+ * "worker-local note/region caches" and a fast lookup for exact-overlap VOR.
+ * Those fill in as notes are actually played, so the cold path -- a full
+ * selector and region scan -- is paid once per (channel, key) combination the
+ * music touches. That is why the first pass over a file is slow, why repeating
+ * the same file keeps getting faster, and why switching soundfont makes it slow
+ * again: the entries are validated against the instrument pointer and the
+ * channel selector version, so a new soundfont invalidates all of them.
+ *
+ * Doing the same lookups up front moves that cost to load time. It changes
+ * nothing about what the caches return, only when they are filled, so neither
+ * the sound nor the timing of anything changes.
+ *
+ * Runs on the loading thread with no render in flight, which is the same thread
+ * that drives pump(), so the worker-local arrays are not being touched
+ * concurrently. Velocity 100 is used as the probe: the single-region cache is
+ * keyed by channel and key, and the single-region case is exactly the one those
+ * caches exist to accelerate.
+ */
+void voice_prewarm_note_caches(void) {
+    if (!instrument || !g_workers || g_worker_count <= 0)
+        return;
+
+    sfz_region *probe[NOTE_REGION_CACHE_MAX_REGIONS];
+    for (int w = 0; w < g_worker_count; ++w) {
+        worker_data *wd = &g_workers[w];
+        if (!wd->note_region_cache && !wd->note_single_region_cache)
+            continue;
+        for (int ch = 0; ch < MIDI_CHANNEL_COUNT; ++ch) {
+            int program = 0, combined = 0, msb = 0, lsb = 0, is_drum = 0;
+            worker_get_channel_selector(wd, ch, &program, &combined,
+                                        &msb, &lsb, &is_drum);
+            for (int key = 0; key < MIDI_KEY_COUNT; ++key) {
+                collect_note_regions_cached(wd, ch, key, 100,
+                                            program, combined, msb, lsb,
+                                            is_drum, probe,
+                                            NOTE_REGION_CACHE_MAX_REGIONS);
+            }
+        }
+    }
+}
+
 void voice_refresh_all_region_caches(void) {
     if (!instrument) return;
     for (int i = 0; i < instrument->num_regions; ++i)

@@ -694,6 +694,19 @@ int ssw_load_sf2(const char* path) {
      * fix as much as a performance one.
      */
     voice_refresh_all_region_caches();
+    /*
+     * Fill the worker-local note/region caches now rather than letting the
+     * music fill them one key at a time. The engine's own notes list these as
+     * "single-region note caches" and "worker-local note/region caches"; they
+     * validate against the instrument pointer and the channel selector version,
+     * so a soundfont load invalidates every entry. Leaving them cold is why the
+     * first pass over a file is slow, why repeating the same file keeps getting
+     * faster, and why switching soundfont makes it slow again.
+     *
+     * This only moves when the lookups happen, not what they return, so the
+     * sound and the timing are unaffected.
+     */
+    voice_prewarm_note_caches();
     return instrument->num_regions;
 }
 
