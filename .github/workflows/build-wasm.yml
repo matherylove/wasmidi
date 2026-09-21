@@ -65,6 +65,9 @@ jobs:
           python3 tools/extract_voice_rebalance_logic.py
           cc -O1 -Wall -pthread -o /tmp/borrow tools/worker_freelist_borrow_check.c
           /tmp/borrow
+          python3 tools/extract_vor_redundancy_logic.py
+          cc -O1 -Wall -o /tmp/vor tools/vor_redundancy_check.c
+          /tmp/vor
           node tools/pump_slice_sim.mjs
           c++ -O2 -std=c++17 -Isrc/renderer -o /tmp/compositor \
             tools/note_raster_compositor_check.cpp \
