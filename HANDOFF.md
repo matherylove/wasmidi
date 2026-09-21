@@ -1,6 +1,6 @@
 # WASMIDI — Handoff completo
 
-**Revisión 37.** Escrito para alguien que llega sin ningún contexto. Leé las
+**Revisión 38.** Escrito para alguien que llega sin ningún contexto. Leé las
 secciones 1 a 5 antes de tocar código. La sección 5 es la más importante: dice
 dónde está el problema hoy.
 
@@ -183,12 +183,13 @@ Solo con Debug:
 | `SIMD %` / `MISS <razón>` | porción de voces en el camino vectorizado y por qué fallan |
 | `CC#n x% cnt` | controlador que se lleva más tiempo de despacho |
 | `CCOL` | controladores colapsados por adyacencia (ver §8) |
-| `PRESMP r/s skip` | regiones resampleadas / salteadas en el último presampleo |
+| `PRESMP seen/resmp/skip` | regiones recorridas / realmente resampleadas / no materializadas en el último presampleo |
 | `STEALS/s`, `DROPPED` | robos por segundo, note-ons descartados |
 | `RING %`, `LATE ms` | ocupación del ring de audio, retraso del pump |
 
-**Contadores con defectos conocidos, no confiar en ellos:**
-`RECYC` está contaminado por el rebalanceo de voces libres (da más de 100%).
+`RECYC` fue corregido en la rev. 38: se recoge **solo con Debug** y cuenta una
+voz cuando el barrido post-render realmente retira un `ENV_OFF`. Los movimientos
+internos de freelists (refill/rebalance) ya no cuentan como reciclaje.
 
 ---
 
@@ -197,48 +198,48 @@ Solo con Debug:
 Hay **dos problemas distintos**. Se trataron como uno durante mucho tiempo y eso
 causó la mayor parte de los errores de la sesión.
 
-### Problema A — Carga inicial: la soundfont NO se precarga
+### Problema A — Carga inicial: materialización de la soundfont
 
-**Síntoma:** tras cargar el SF2 por primera vez, el render va muy lento aunque
-haya pocas voces. Empeora mientras suena el MIDI. Mejora al repetir el MIDI. Se
-vuelve a romper al cambiar de soundfont. A veces desaparece al recargar la
-página y vuelve después.
+**Síntoma que sigue siendo la referencia de navegador:** tras cargar el SF2 por
+primera vez, el render puede ir muy lento con pocas voces; repetir el MIDI mejora
+y cambiar de soundfont puede reintroducirlo.
 
-**Evidencia firme, en tres capturas del usuario con página recargada sin
-cookies:**
+**Corrección importante de la rev. 38:** la lectura anterior de `PRESMP 0/0
+skip` era inválida. El contador C ya tenía `g_presample_regions_seen`, pero el
+panel mostraba únicamente `resampled/skipped`. Una región cuyo sample ya está a
+la frecuencia destino se recorre correctamente y puede dejar ambos en cero. Por
+tanto, aquella captura **no demostraba `num_regions == 0`**. El panel ahora muestra
+`PRESMP <seen> seen <resmp> resmp / <skip> skip`. La condición útil es
+`seen == REGIONS` y `skip == 0`; `resmp` puede ser 0 legítimamente.
 
-- Con **30 voces activas** y 2.396 NPS: `LOAD 210%`, `BLOCK 33.5 ms`. Treinta
-  voces no deberían costar nada.
-- En ese estado **`ALLOC 3 ms`**, o sea que la fase de asignación no es el
-  problema. **El tiempo está en el render** (`BUSY` domina).
-- **En idle, con el SF2 cargado y `REGIONS 11`: `PRESMP 0/0 skip`.** El
-  presampleo no recorre ninguna región — ni las procesa ni las saltea.
+**Bug real encontrado al revisar el código:** `resample_wav_data()` devuelve el
+buffer original tanto cuando no hace falta convertir como cuando falla una
+reserva. `sfz_apply_presampling()` marcaba en ambos casos `resampled_rate =
+target_sample_rate`. Si la reserva había fallado con sample rates distintos, el
+cache quedaba envenenado: las pasadas posteriores creían que el sample ya estaba
+preparado y no reintentaban. En rev. 38 ese caso deja el cache sin preparar,
+incrementa `skip` y la carga falla en vez de entrar a reproducción a medias.
 
-**Qué significa:** `sfz_apply_presampling()` corre con `inst->num_regions == 0`,
-aunque después `ssw_region_count()` (que lee la misma variable) reporta 11.
-Ninguna región recibe `resampled_data`, todas quedan con `is_resampled` falso,
-y **cada voz resamplea en tiempo de render** contra el sample original. Eso
-explica todo el síntoma.
+**Contrato de carga nuevo (rev. 38):**
 
-**Principio del usuario, que manda sobre la solución:** *todo lo relacionado a
-la soundfont debe estar precargado y precacheado en RAM antes de que arranque el
-MIDI, incluida la soundfont completa.* Hoy la carga dice "SF2 ready" y deja
-trabajo pendiente. **La carga no puede declararse terminada hasta que todo esté
-materializado:** samples decodificados y resampleados, cachés de región
-poblados.
+- La capa recién parseada se presamplea **antes** de incorporarse al instrumento
+  vivo.
+- Cada región debe tener `cache_entry`, PCM decodificado válido y, cuando el
+  sample rate de origen difiere del synth, un `resampled_data` real a la tasa
+  destino.
+- `ssw_init_ex()` vuelve a validar/materializar la fuente existente cuando cambia
+  la configuración del synth.
+- Después se ejecutan `voice_refresh_all_region_caches()` y
+  `voice_prewarm_note_caches()`.
+- Si la condición no se cumple, `ssw_load_sf2()`/`ssw_init_ex()` devuelven fallo y
+  el worker **no puede anunciar “SF2 ready”**.
 
-**Siguiente paso concreto:** encontrar por qué `num_regions` es 0 cuando corre
-el presampleo. La llamada está al final de `ssw_load_sf2()` en
-`snappy_wasm_core.c`, después de `instrument = next`, y
-`sf2_load_as_instrument()` falla si no cargó regiones, así que el orden parece
-correcto y algo no cuadra. Hay **dos call sites** de `sfz_apply_presampling`
-(uno en `ssw_init_ex`, otro en la carga); conviene saber cuál corre último. Una
-vez arreglado, la predicción falsable es: `PRESMP` pasa a `11/0` y `SIMD` deja
-de ser 0%.
-
-Ya existe `voice_prewarm_note_caches()` (precalienta los cachés note/region al
-cargar). No resolvió el problema, pero es parte del principio de "todo
-precargado" y conviene dejarlo.
+Esto implementa el principio del usuario: todo el trabajo de la soundfont debe
+quedar en RAM antes de comenzar el MIDI. **Aún falta validarlo en navegador**; no
+se puede declarar resuelto desde este entorno. La prueba decisiva de rev. 38 es:
+primera carga con `PRESMP seen == REGIONS`, `skip == 0`, y comparar `LOAD/BLOCK/
+BUSY` en la primera reproducción contra la segunda. Si esas invariantes se cumplen
+y la primera sigue siendo lenta, el presampleo deja de ser la hipótesis principal.
 
 ### Problema B — Zona densa con CC: el pool se satura
 
@@ -267,6 +268,27 @@ mejora, la fase queda descartada entera. Frentes, por margen real:
 2. **Drenado de eventos.** Trabajo por evento que sea invariante del lote.
 3. **Asignación.** Ampliar cobertura de los cachés note/region existentes.
 4. **Robo.** Margen mínimo; casi todo cambia qué voz muere.
+
+**Rev. 38 — primer pase seguro aplicado, pendiente de A/B en navegador:**
+
+- `ssw_queue_events()` ya no obliga a `malloc/free` por cada lote. Mantiene un
+  pool acotado de slabs reutilizables y conserva los más grandes para los lotes
+  de 262.144 eventos. Rollback conjunto de esta frontera:
+  `-DSSW_REV38_EVENT_HOTPATH=0`.
+- La conversión `seconds -> frame` para timestamps no negativos usa el mismo
+  redondeo de `llround()` (`floor(x + 0.5)` para este dominio) sin pagar la llamada
+  matemática por evento. El mismo define restaura `llround()`.
+- La instrumentación de `RECYC`, notas iniciadas y cobertura SIMD dejó de hacer
+  atómicos globales por nota/voz cuando Debug está apagado. `worker_thread` toma
+  una sola instantánea de la compuerta por ciclo. Esto elimina trabajo añadido
+  por el port que no existe en el motor musical y no cambia ninguna decisión de
+  voz.
+- No se tocó `steal_voice_fast`, `alloc_voice`, selección de regiones, VOR,
+  fronteras de selector ni el orden/timestamp de eventos.
+
+Si `ALLOC` sigue dominando después de este pase, continuar dentro de
+`worker_thread`: drenado/rebalance/cache locality. No modificar la política del
+stealer sin una medición que lo exija.
 
 ---
 
@@ -339,8 +361,12 @@ mejora, la fase queda descartada entera. Frentes, por margen real:
 | Filtro de redundancia VOR | activo | suprime el break solo si el CC repite su valor; no ayudó en el MIDI de prueba porque sus CC cambian de verdad |
 | Colapso de CC por adyacencia | **activo** | `SSW_COLLAPSE_CONTROLLER_BURSTS=1`; regla nativa; colapsó 1,78M sin mejorar |
 | Rebalanceo de voces libres | activo | hecho por GPT, verificado |
-| Prewarm de cachés note/region | activo | no resolvió el problema A |
-| `voice_refresh_all_region_caches` | activo | bug real del multiplicador de pitch, pero no era el problema A |
+| Pool de slabs de eventos | **activo rev. 38** | evita malloc/free por lote; rollback `SSW_REV38_EVENT_HOTPATH=0` |
+| Redondeo rápido de timestamps | **activo rev. 38** | equivalente a `llround` para tiempos admitidos no negativos; mismo rollback |
+| Validación de materialización SF | **activo rev. 38** | no declara lista una capa con PCM/cache/resample incompleto |
+| Telemetría hot solo con Debug | **corregido rev. 38** | sin atómicos por note-on/voz en reproducción normal |
+| Prewarm de cachés note/region | activo | ahora corre después de validar/materializar la carga |
+| `voice_refresh_all_region_caches` | activo | bug real del multiplicador de pitch; se conserva |
 | Cadencia del pump | activo | underruns 4.770 → 82, medido |
 | Culler visual | **no conectado** | `src/renderer/note_raster_compositor.*`, verificado celda por celda pero cuesta más de un frame sin un caché de tiles en segundo plano |
 
@@ -1588,3 +1614,75 @@ Campos actuales: `LOAD %`, `BLOCK ms`, `EVT ms`, `SIMD %`, `BUSY ms`, `RING %`,
   archivos, no entregar diffs ni parches para aplicar a mano.
 - Con cada update, actualizar este documento: qué se hizo, qué sigue, qué falta a
   largo plazo, y qué necesita saber quien continúe.
+
+---
+
+## 15. Revisión 38 — materialización de SF y costo agregado por el port
+
+Esta revisión es el primer pase de arreglo sobre el estado descrito en §5. No se
+reclama mejora de navegador hasta recibir una A/B del usuario; Qt6 y emsdk no
+están disponibles en el entorno de edición.
+
+### 15.1 Soundfont: no entrar a realtime con trabajo pendiente
+
+Se corrigió la interpretación de `PRESMP`: `resampled == 0` no implica que no se
+hayan recorrido regiones. La UI ahora expone `seen`. Además se corrigió el caso
+en que un fallo de reserva durante `resample_wav_data()` quedaba cacheado como si
+hubiera producido datos a la tasa destino.
+
+`ssw_load_sf2()` presamplea y valida la capa entrante antes de mezclarla;
+`ssw_init_ex()` valida también el instrumento existente al reinicializar el audio.
+Una región sólo pasa como materializada si tiene PCM/cache válidos y, cuando la
+tasa difiere, un buffer resampleado real. Fallar esa comprobación devuelve error
+al worker en lugar de publicar `SF2 ready`.
+
+### 15.2 Frontera de eventos
+
+`ssw_queue_events()` reutiliza slabs en un pool acotado en lugar de reservar y
+liberar un bloque por mensaje. Para timestamps no negativos, la conversión a frame
+usa `x + 0.5` + conversión entera, la misma regla de `llround()` en ese dominio.
+Ambas optimizaciones se revierten juntas con:
+
+```text
+-DSSW_REV38_EVENT_HOTPATH=0
+```
+
+No cambian el orden de eventos, la frontera de selector ni el timestamp resultante.
+
+### 15.3 Telemetría que estaba dentro del hot path
+
+La instrumentación había reintroducido trabajo global por voz incluso con Debug
+apagado. `g_notes_started_total` se incrementaba por cada voz admitida y el
+reciclaje se contaba en `free_push()`, donde además se mezclaban refill/rebalance
+con liberaciones reales. Los contadores de cobertura SIMD tenían el mismo patrón.
+
+Ahora `worker_thread` toma `g_debug_metrics` una sola vez por ciclo. Los atómicos
+de diagnóstico sólo se ejecutan cuando Debug está activo, y `RECYC` cuenta la
+retirada real de `ENV_OFF` en el barrido post-render. Al prender Debug se reinicia
+el baseline de lifecycle para que el porcentaje siga siendo interpretable.
+
+### 15.4 Archivos tocados
+
+- `third_party/snappysynthv2/snappy_wasm_core.c`
+- `third_party/snappysynthv2/Parser/sfz_parser.c`
+- `third_party/snappysynthv2/Voice/voice.c`
+- `web/snappysynth-worker.js`
+- `src/mainwindow.cpp`
+- `src/mainwindow.hpp`
+- `src/qml/Controls.qml`
+- `tools/ssw_schedule_harness.c`
+- `HANDOFF.md`
+- `MANIFEST.sha256` (regenerar al cerrar la revisión)
+
+### 15.5 Validación local de rev. 38
+
+Disponible y ejecutada: sintaxis C de `voice.c`, `snappy_wasm_core.c` y
+`sfz_parser.c`; sintaxis Node de worker/bridge; harness de scheduler; harness de
+rebalance; harness de redundancia VOR; freelist share; simulación del pump.
+
+No disponible aquí: build Qt6, build Emscripten completo, ejecución en Brave ni
+prueba audible. La prueba del usuario debe comprobar primero `PRESMP seen ==
+REGIONS`, `skip == 0` y después comparar primera vs segunda reproducción del mismo
+MIDI/SF con Debug apagado. Para el caso CC, comparar `ALLOC`, `BLOCK`, underruns y
+respuesta audible con exactamente el mismo MIDI/configuración.
+

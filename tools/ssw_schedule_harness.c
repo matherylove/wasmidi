@@ -26,10 +26,15 @@ static double g_dispatch_accum_us = 0.0;
 
 typedef struct { int64_t sample_frame; uint32_t message; } ssw_scheduled_event;
 typedef struct ssw_event_block {
-    struct ssw_event_block* next; size_t index, count; ssw_scheduled_event events[];
+    struct ssw_event_block* next; size_t index, count, capacity; ssw_scheduled_event events[];
 } ssw_event_block;
 static ssw_event_block* g_event_head = NULL;
 static ssw_event_block* g_event_tail = NULL;
+
+/* The production core recycles consumed schedule slabs. Scheduling semantics
+ * do not depend on that allocator policy, so the host harness can simply free
+ * each slab while exercising the extracted control flow. */
+static void ssw_event_block_release(ssw_event_block* block) { free(block); }
 
 /* ---- instrumentation ---- */
 static int   t_render_calls;
@@ -83,7 +88,7 @@ static void dispatch_short_at_qpc(uint32_t msg, int64_t ts) {
 /* ---- helpers ---- */
 static void queue(const ssw_scheduled_event* evs, int n) {
     ssw_event_block* b = malloc(sizeof(ssw_event_block) + (size_t)n * sizeof(ssw_scheduled_event));
-    b->next = NULL; b->index = 0; b->count = (size_t)n;
+    b->next = NULL; b->index = 0; b->count = (size_t)n; b->capacity = (size_t)n;
     memcpy(b->events, evs, (size_t)n * sizeof(ssw_scheduled_event));
     if (g_event_tail) g_event_tail->next = b; else g_event_head = b;
     g_event_tail = b;

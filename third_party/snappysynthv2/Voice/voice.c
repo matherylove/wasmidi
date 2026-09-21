@@ -2552,7 +2552,6 @@ static inline int releasepool_take(worker_data *wd, float incoming_x08, int inco
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 static inline void free_push(worker_data *wd, int vid) {
-InterlockedAdd(&g_voices_recycled_total, 1);
                                                                                                                                                                                                                                                                 if (wd->free_top+1 >= wd->free_cap) free_reserve(wd, wd->free_top+2);
                                                                                                                                                                                                                                                                 // Keep the duplicate scan only for validation builds. In the normal path,
                                                                                                                                                                                                                                                                 // free ownership is single-writer per worker and this linear scan is costly.
@@ -2705,11 +2704,11 @@ static volatile LONG g_workers_participating = 0;
  * finishes falling, one or more blocks later, and later still under sustain. A
  * per-cycle ratio between the two is meaningless in any single block.
  *
- * So count both sides cumulatively and on every recycling path. If frees track
- * note-ons over time the pool is simply too small for the material and there is
- * no leak; if frees fall behind and stay behind, voices are not coming back and
- * that is what pins the pool at the pressure line where the steal guards start
- * rejecting every candidate.
+ * Both counters are diagnostic-only and collected only while Debug is enabled.
+ * A started voice is counted after allocation/steal succeeds; a recycled voice
+ * is counted only when the post-render sweep actually retires an ENV_OFF voice.
+ * Freelist refill/rebalance traffic is deliberately excluded, so RECYC no
+ * longer measures internal ownership transfers as if they were finished voices.
  */
 int voice_get_notes_started(void) { return (int)g_notes_started_total; }
 int voice_get_voices_recycled(void) { return (int)g_voices_recycled_total; }
@@ -2732,16 +2731,29 @@ int voice_get_voices_recycled(void) { return (int)g_voices_recycled_total; }
  * clock reads per controller event, and on this material that is hundreds of
  * thousands per second; the SIMD/miss counters take an atomic add per voice per
  * block. That is fine while chasing a problem and pure waste the rest of the
- * time, so every hot counter is behind this flag and costs one relaxed load
- * when it is off.
+ * time, so every hot counter is behind this flag. worker_thread snapshots the
+ * flag once per cycle and its hot loops reuse that local value; Debug-off does
+ * not pay an atomic counter update per event or per rendered voice.
  *
  * Counters that run once per load or once per block (presampling, worker count,
- * region count) are not gated: they are already free.
+ * region count) are not gated: they are already negligible.
  */
 static volatile LONG g_debug_metrics = 0;
+/* Set when profiling is enabled. voice_render_float() owns the full metric
+ * reset because several diagnostic globals are declared later in this file. */
+static volatile LONG g_debug_metrics_reset_pending = 0;
 
 void voice_set_debug_metrics(int enabled) {
-    InterlockedExchange(&g_debug_metrics, enabled ? 1 : 0);
+    const LONG was_enabled = InterlockedExchange(&g_debug_metrics, enabled ? 1 : 0);
+    if (enabled && !was_enabled) {
+        /* Lifecycle counters are already in scope here and are useful outside
+         * the per-render snapshot. The rest are reset at the next render. */
+        InterlockedExchange(&g_notes_started_total, 0);
+        InterlockedExchange(&g_voices_recycled_total, 0);
+        InterlockedExchange(&g_debug_metrics_reset_pending, 1);
+    } else if (!enabled) {
+        InterlockedExchange(&g_debug_metrics_reset_pending, 0);
+    }
 }
 static inline int debug_metrics_on(void) {
     return load_relaxed_long(&g_debug_metrics) != 0;
@@ -3903,7 +3915,6 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
 
                                                                                                                                                                                                                                                                 #pragma message("NOTE: using legacy allocation-first steal flow")
                                                                                                                                                                                                                                                                 vid = alloc_voice(wd, e.ch, widx);
-if (vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
                                                                                                                                                                                                                                                                 logger_log("NOTE_ON: ch=%d key=%d vel=%d layer=%d alloc_voice -> vid=%d\n",
                                                                                                                                                                                                                                                                 e.ch, e.key, e.value, layer_index, vid);
@@ -3913,6 +3924,7 @@ if (vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
 vid = steal_voice_fast(wd, e.ch, widx, incoming_loudness, original_volume_unit, e.key);
                                                                                                                                                                                                                                                                 if (vid >= 0) stolen = true;
                                                                                                                                                                                                                                                                 }
+if (ss_profile && vid >= 0) InterlockedAdd(&g_notes_started_total, 1);
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
                                                                                                                                                                                                                                                                 if (stolen) logger_log("NOTE_ON: ch=%d key=%d vel=%d layer=%d GOT_STOLEN_VID=%d\n",
                                                                                                                                                                                                                                                                 e.ch, e.key, e.value, layer_index, vid);
@@ -4155,7 +4167,7 @@ wd->vor_fast_input_velocity[e.ch][e.key] = (uint8_t)e.value;
                                                                                                                                                                                                                                                                 process_note_off_event(wd, &e, cached_release_delay);
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 else if (e.type == EVT_CONTROL_CHANGE) {
-const int ss_cc_profile = debug_metrics_on();
+const int ss_cc_profile = ss_profile;
 LARGE_INTEGER ss_cc_begin, ss_cc_end, ss_cc_freq;
 if (ss_cc_profile) {
 QueryPerformanceFrequency(&ss_cc_freq);
@@ -4516,11 +4528,11 @@ fast_batch = render_fast_stereo_sustain_batch_wasm(
 #endif
 }
 if (fast_batch > 0) {
-if (debug_metrics_on()) InterlockedAdd(&g_path_fast_voices, (LONG)fast_batch);
+if (ss_profile) InterlockedAdd(&g_path_fast_voices, (LONG)fast_batch);
 k += (LONG)fast_batch - 1;
 continue;
 }
-if (debug_metrics_on()) InterlockedAdd(&g_path_scalar_voices, 1);
+if (ss_profile) InterlockedAdd(&g_path_scalar_voices, 1);
 #endif
                                                                                                                                                                                                                                                                 int vid = g_render_queue[k];
                                                                                                                                                                                                                                                                 if (vid < 0 || vid >= max_voices) continue;
@@ -5242,7 +5254,7 @@ if (f_start < frames && env_state == ENV_SUSTAIN) {
 /* Attribute the miss to the first blocking condition, in the order the
  * guards test them, so the counts partition the voices rather than
  * overlapping. */
-if (debug_metrics_on()) {
+if (ss_profile) {
 if (!no_interp) InterlockedAdd(&g_miss_interp, 1);
 else if (loop_active) InterlockedAdd(&g_miss_loop, 1);
 else if (filter_enabled) InterlockedAdd(&g_miss_filter, 1);
@@ -5251,7 +5263,7 @@ else InterlockedAdd(&g_miss_other, 1);
 }
 if (f_start >= frames && env_state == ENV_SUSTAIN && pending_note_off_samples < 0 &&
 !v->note_off_received && !v->kill_now && startup_samples == 0) {
-InterlockedAdd(&g_path_simd_voice_voices, 1);
+if (ss_profile) InterlockedAdd(&g_path_simd_voice_voices, 1);
 v->position = pos;
 #ifdef VOR
 v->vor_gain_scale = vor_gain_scale;
@@ -5858,6 +5870,7 @@ wd->release_best_idx = -1;
                                                                                                                                                                                                                                                                 voice *v = &voices[vid];
                                                                                                                                                                                                                                                                 if (v->env_state == ENV_OFF) {
                                                                                                                                                                                                                                                                 active_remove_swap(wd, i);
+if (ss_profile) InterlockedAdd(&g_voices_recycled_total, 1);
                                                                                                                                                                                                                                                                 free_voice(wd, vid);
 } else {
 if (refresh_steal_scores && voice_steal_score_needs_refresh(v)) update_voice_steal_score(vid, v);
@@ -6876,34 +6889,56 @@ InterlockedExchange(&g_channel_render_dirty[ch], 1);
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 void voice_render_float(float *out_buffer, int num_frames) {
-/* Snapshot the previous cycle's split before clearing it for this one. */
-g_path_fast_last = g_path_fast_voices;
-g_path_scalar_last = g_path_scalar_voices;
-g_worker_busy_last = g_worker_busy_us;
-g_workers_participating_last = g_workers_participating;
-g_workers_participating = 0;
-g_alloc_last = g_alloc_us;
-g_alloc_us = 0;
-for (int i = 0; i < 128; ++i) {
-g_cc_count_last[i] = g_cc_count[i];
-g_cc_us_last[i] = g_cc_us[i];
-g_cc_count[i] = 0;
-g_cc_us[i] = 0;
+/* Debug-off must not maintain diagnostics in the audio path. Snapshot and
+ * clear these only while a user is actively profiling. The first render after
+ * enabling Debug clears both halves instead of publishing stale pre-toggle data. */
+if (debug_metrics_on()) {
+    const int reset_debug_baseline =
+        InterlockedExchange(&g_debug_metrics_reset_pending, 0) != 0;
+    if (reset_debug_baseline) {
+        g_path_fast_last = g_path_fast_voices = 0;
+        g_path_scalar_last = g_path_scalar_voices = 0;
+        g_worker_busy_last = g_worker_busy_us = 0;
+        g_workers_participating_last = g_workers_participating = 0;
+        g_alloc_last = g_alloc_us = 0;
+        g_path_simd_voice_last = g_path_simd_voice_voices = 0;
+        g_miss_interp_last = g_miss_interp = 0;
+        g_miss_loop_last = g_miss_loop = 0;
+        g_miss_filter_last = g_miss_filter = 0;
+        g_miss_other_last = g_miss_other = 0;
+        for (int i = 0; i < 128; ++i) {
+            g_cc_count_last[i] = g_cc_count[i] = 0;
+            g_cc_us_last[i] = g_cc_us[i] = 0;
+        }
+    } else {
+        g_path_fast_last = g_path_fast_voices;
+        g_path_scalar_last = g_path_scalar_voices;
+        g_worker_busy_last = g_worker_busy_us;
+        g_workers_participating_last = g_workers_participating;
+        g_alloc_last = g_alloc_us;
+        g_path_simd_voice_last = g_path_simd_voice_voices;
+        g_miss_interp_last = g_miss_interp;
+        g_miss_loop_last = g_miss_loop;
+        g_miss_filter_last = g_miss_filter;
+        g_miss_other_last = g_miss_other;
+        for (int i = 0; i < 128; ++i) {
+            g_cc_count_last[i] = g_cc_count[i];
+            g_cc_us_last[i] = g_cc_us[i];
+            g_cc_count[i] = 0;
+            g_cc_us[i] = 0;
+        }
+        g_workers_participating = 0;
+        g_alloc_us = 0;
+        g_miss_interp = 0;
+        g_miss_loop = 0;
+        g_miss_filter = 0;
+        g_miss_other = 0;
+        g_path_fast_voices = 0;
+        g_path_scalar_voices = 0;
+        g_worker_busy_us = 0;
+        g_path_simd_voice_voices = 0;
+    }
 }
-
-g_path_simd_voice_last = g_path_simd_voice_voices;
-g_miss_interp_last = g_miss_interp;
-g_miss_loop_last = g_miss_loop;
-g_miss_filter_last = g_miss_filter;
-g_miss_other_last = g_miss_other;
-g_miss_interp = 0;
-g_miss_loop = 0;
-g_miss_filter = 0;
-g_miss_other = 0;
-g_path_fast_voices = 0;
-g_path_scalar_voices = 0;
-g_worker_busy_us = 0;
-g_path_simd_voice_voices = 0;
 
                                                                                                                                                                                                                                                                 #if defined(VOICEDEBUG)
                                                                                                                                                                                                                                                                 logger_log("voice_render_float: Entered with num_frames=%d.\n", num_frames);

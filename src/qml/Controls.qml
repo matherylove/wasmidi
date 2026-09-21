@@ -926,12 +926,13 @@ Item {
                         font.bold: true
                     }
                     Text {
-                        // Presampling outcome of the last soundfont load.
-                        // Regions skipped, or zero resampled on the first load
-                        // where a reload reports many, means voices resample at
-                        // run time inside the render loop.
-                        text: "PRESMP " + root.formatInteger(root.mainWindow.synthPresampleResampled) +
-                              "/" + root.formatInteger(root.mainWindow.synthPresampleSkipped) + " skip"
+                        // Presampling outcome of the complete live soundfont.
+                        // A same-rate sample is valid without a resampled copy,
+                        // so "0 resmp" is not a failure by itself. The useful
+                        // invariant is seen == REGIONS and skip == 0.
+                        text: "PRESMP " + root.formatInteger(root.mainWindow.synthPresampleSeen) + " seen " +
+                              root.formatInteger(root.mainWindow.synthPresampleResampled) + " resmp / " +
+                              root.formatInteger(root.mainWindow.synthPresampleSkipped) + " skip"
                         color: root.mainWindow.synthPresampleSkipped > 0 ? "#ef4444" : "#70667e"
                         font.pixelSize: 7
                         font.bold: true

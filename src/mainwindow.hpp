@@ -76,6 +76,7 @@ class MainWindow : public QObject {
     Q_PROPERTY(int synthCcHotNumber READ synthCcHotNumber NOTIFY synthStateChanged)
     Q_PROPERTY(int synthCcHotPercent READ synthCcHotPercent NOTIFY synthStateChanged)
     Q_PROPERTY(int synthCcHotCount READ synthCcHotCount NOTIFY synthStateChanged)
+    Q_PROPERTY(int synthPresampleSeen READ synthPresampleSeen NOTIFY synthStateChanged)
     Q_PROPERTY(int synthPresampleResampled READ synthPresampleResampled NOTIFY synthStateChanged)
     Q_PROPERTY(int synthPresampleSkipped READ synthPresampleSkipped NOTIFY synthStateChanged)
     Q_PROPERTY(int synthMissReason READ synthMissReason NOTIFY synthStateChanged)
@@ -170,6 +171,7 @@ public:
     int synthCcHotCount() const { return synthCcHotCount_; }
     bool synthDebugMetrics() const { return synthDebugMetrics_; }
     void setSynthDebugMetrics(bool value);
+    int synthPresampleSeen() const { return synthPresampleSeen_; }
     int synthPresampleResampled() const { return synthPresampleResampled_; }
     int synthPresampleSkipped() const { return synthPresampleSkipped_; }
     int synthMissReason() const { return synthMissReason_; }
@@ -472,6 +474,7 @@ private:
     int synthCcHotPercent_ = 0;
     int synthCcHotCount_ = 0;
     bool synthDebugMetrics_ = false;
+    int synthPresampleSeen_ = 0;
     int synthPresampleResampled_ = 0;
     int synthPresampleSkipped_ = 0;
     int synthMissReason_ = 0;

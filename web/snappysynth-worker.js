@@ -117,8 +117,10 @@ function postState(type, extra = {}) {
         presampleSeen: coreReady && Module ? Module._ssw_presample_seen() : 0,
         presampleSkipped: coreReady && Module ? Module._ssw_presample_skipped() : 0,
         presampleResampled: coreReady && Module ? Module._ssw_presample_resampled() : 0,
-        notesStarted: coreReady && Module ? Module._ssw_notes_started() : 0,
-        voicesRecycled: coreReady && Module ? Module._ssw_voices_recycled() : 0,
+        notesStarted:
+            coreReady && Module && debugMetrics ? Module._ssw_notes_started() : 0,
+        voicesRecycled:
+            coreReady && Module && debugMetrics ? Module._ssw_voices_recycled() : 0,
         missInterp: coreReady && Module && debugMetrics ? Module._ssw_miss_interp() : 0,
         missLoop: coreReady && Module && debugMetrics ? Module._ssw_miss_loop() : 0,
         missFilter: coreReady && Module && debugMetrics ? Module._ssw_miss_filter() : 0,
@@ -593,7 +595,7 @@ function initCore() {
     resetStealRate();
     if (Module._ssw_set_debug_metrics) Module._ssw_set_debug_metrics(debugMetrics ? 1 : 0);
 
-    Module._ssw_init_ex(
+    const initialized = Module._ssw_init_ex(
         sampleRateHz,
         synthChannels,
         bitsPerSample,
@@ -608,6 +610,9 @@ function initCore() {
         fastNoteOff ? 1 : 0,
         validateState ? 1 : 0,
         softClip ? 1 : 0);
+
+    if (!initialized)
+        throw new Error("SnappySynthV2 could not materialize the current soundfont at this sample rate.");
 
     applyCoreSettings();
     coreReady = true;
@@ -1086,9 +1091,9 @@ onmessage = async event => {
                 soundfontFiles.pop();
                 try { Module.FS.unmount(mount); } catch (_) {}
                 throw new Error(
-                    "SnappySynthV2 SF2 parser returned 0 regions for " +
+                    "SnappySynthV2 could not parse and fully materialize " +
                     (file.name || "soundfont.sf2") +
-                    " (" + Number(file.size || 0) + " bytes).");
+                    " before playback (" + Number(file.size || 0) + " bytes).");
             }
 
             soundfontLoaded = true;

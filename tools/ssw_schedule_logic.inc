@@ -211,6 +211,16 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
                 }
 
                 {
+#if SSW_COLLAPSE_CONTROLLER_BURSTS
+                    /* Skip a controller value that a later one in this same run
+                     * supersedes, which is the collapse the native engine gets
+                     * for free by being fed in real time. */
+                    if (ssw_controller_absorbed_by_next(
+                            block->events, block->index, block->count,
+                            block_end_frame)) {
+                        ++g_controllers_collapsed;
+                    } else
+#endif
                     dispatch_short_at_qpc(
                         event->message,
                         g_render_cursor + (frame - segment_start));
@@ -224,7 +234,7 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 
         g_event_head = block->next;
         if (!g_event_head) g_event_tail = NULL;
-        free(block);
+        ssw_event_block_release(block);
     }
 
 events_done:

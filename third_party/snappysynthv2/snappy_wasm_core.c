@@ -56,19 +56,153 @@ typedef struct ssw_event_block {
     struct ssw_event_block* next;
     size_t index;
     size_t count;
+    size_t capacity;
     ssw_scheduled_event events[];
 } ssw_event_block;
 
 static ssw_event_block* g_event_head = NULL;
 static ssw_event_block* g_event_tail = NULL;
+static ssw_event_block* g_event_free = NULL;
+static int g_event_free_count = 0;
 static double g_song_time_seconds = 0.0;
 static int64_t g_song_frame = 0;
+
+/* Keep a small set of the largest schedule slabs alive. Browser playback feeds
+ * the synth in large fixed-size batches, so malloc/free on every producer
+ * message needlessly re-enters the shared WASM allocator and can trigger a
+ * memory.grow synchronization across all pthreads. Reusing the exact same slab
+ * changes no event ordering or timing; it only moves allocation out of the hot
+ * producer/render loop. */
+#ifndef SSW_EVENT_BLOCK_POOL_MAX
+#define SSW_EVENT_BLOCK_POOL_MAX 8
+#endif
+
+/* Roll back both event-frontier optimizations with one compile define:
+ *   -DSSW_REV38_EVENT_HOTPATH=0
+ * This intentionally leaves soundfont correctness/materialization fixes and
+ * Debug-metric gating enabled; those are independent bug fixes. */
+#ifndef SSW_REV38_EVENT_HOTPATH
+#define SSW_REV38_EVENT_HOTPATH 1
+#endif
+
+static ssw_event_block* ssw_event_block_acquire(size_t capacity) {
+#if SSW_REV38_EVENT_HOTPATH
+    ssw_event_block** link = &g_event_free;
+    ssw_event_block* best = NULL;
+    ssw_event_block** best_link = NULL;
+
+    while (*link) {
+        ssw_event_block* block = *link;
+        if (block->capacity >= capacity &&
+            (!best || block->capacity < best->capacity)) {
+            best = block;
+            best_link = link;
+            if (block->capacity == capacity) break;
+        }
+        link = &block->next;
+    }
+
+    if (best) {
+        *best_link = best->next;
+        --g_event_free_count;
+        best->next = NULL;
+        best->index = 0;
+        best->count = 0;
+        return best;
+    }
+#endif
+
+    if (capacity > (SIZE_MAX - sizeof(ssw_event_block)) /
+                       sizeof(ssw_scheduled_event)) {
+        return NULL;
+    }
+    const size_t bytes = sizeof(ssw_event_block) +
+        capacity * sizeof(ssw_scheduled_event);
+    ssw_event_block* block = (ssw_event_block*)malloc(bytes);
+    if (!block) return NULL;
+    block->next = NULL;
+    block->index = 0;
+    block->count = 0;
+    block->capacity = capacity;
+    return block;
+}
+
+static void ssw_event_block_release(ssw_event_block* block) {
+    if (!block) return;
+#if !SSW_REV38_EVENT_HOTPATH
+    free(block);
+    return;
+#else
+    block->index = 0;
+    block->count = 0;
+
+    if (g_event_free_count >= SSW_EVENT_BLOCK_POOL_MAX) {
+        /* The producer normally uses a stable large batch size, but seeks and
+         * tail batches can be much smaller. Keep the largest slabs so a run of
+         * tiny batches cannot evict the allocation that matters on the next
+         * dense passage. */
+        ssw_event_block** smallest_link = &g_event_free;
+        ssw_event_block** link = &g_event_free;
+        size_t smallest_capacity = SIZE_MAX;
+        while (*link) {
+            if ((*link)->capacity < smallest_capacity) {
+                smallest_capacity = (*link)->capacity;
+                smallest_link = link;
+            }
+            link = &(*link)->next;
+        }
+        if (block->capacity <= smallest_capacity) {
+            free(block);
+            return;
+        }
+        ssw_event_block* evicted = *smallest_link;
+        *smallest_link = evicted->next;
+        free(evicted);
+        /* Count remains at the pool maximum; insert the larger replacement. */
+        block->next = g_event_free;
+        g_event_free = block;
+        return;
+    }
+
+    block->next = g_event_free;
+    g_event_free = block;
+    ++g_event_free_count;
+#endif
+}
+
+static void ssw_free_event_block_pool(void) {
+    ssw_event_block* block = g_event_free;
+    while (block) {
+        ssw_event_block* next = block->next;
+        free(block);
+        block = next;
+    }
+    g_event_free = NULL;
+    g_event_free_count = 0;
+}
+
+/* llround() is surprisingly expensive in WASM. All scheduler times are
+ * non-negative after clamping, so +0.5 followed by an integer conversion is
+ * exactly the same rounding rule as llround() for every valid input we admit. */
+static inline int64_t ssw_seconds_to_frame(double seconds) {
+    const int rate = g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100;
+    double scaled;
+    if (!isfinite(seconds) || seconds <= 0.0) return 0;
+    scaled = seconds * (double)rate;
+    if (!isfinite(scaled) || scaled >= (double)INT64_MAX - 0.5)
+        return INT64_MAX;
+#if SSW_REV38_EVENT_HOTPATH
+    return (int64_t)(scaled + 0.5);
+#else
+    return (int64_t)llround(scaled);
+#endif
+}
 
 void ssw_clear_events(void) {
     ssw_event_block* block = g_event_head;
     while (block) {
         ssw_event_block* next = block->next;
-        free(block);
+        ssw_event_block_release(block);
         block = next;
     }
     g_event_head = NULL;
@@ -78,21 +212,14 @@ void ssw_clear_events(void) {
 void ssw_set_song_time(double seconds) {
     if (!isfinite(seconds) || seconds < 0.0) seconds = 0.0;
     g_song_time_seconds = seconds;
-    g_song_frame = (int64_t)llround(
-        seconds * (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100));
+    g_song_frame = ssw_seconds_to_frame(seconds);
 }
 
 int ssw_queue_events(const uint32_t* messages, const double* times, int count) {
     if (!messages || !times || count <= 0) return count == 0 ? 1 : 0;
 
     const size_t incoming = (size_t)count;
-    if (incoming > (SIZE_MAX - sizeof(ssw_event_block)) /
-                       sizeof(ssw_scheduled_event)) {
-        return 0;
-    }
-    const size_t bytes = sizeof(ssw_event_block) +
-        incoming * sizeof(ssw_scheduled_event);
-    ssw_event_block* block = (ssw_event_block*)malloc(bytes);
+    ssw_event_block* block = ssw_event_block_acquire(incoming);
     if (!block) return 0;
     block->next = NULL;
     block->index = 0;
@@ -101,8 +228,7 @@ int ssw_queue_events(const uint32_t* messages, const double* times, int count) {
     for (size_t i = 0; i < incoming; ++i) {
         double t = times[i];
         if (!isfinite(t) || t < 0.0) t = 0.0;
-        block->events[i].sample_frame = (int64_t)llround(
-            t * (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100));
+        block->events[i].sample_frame = ssw_seconds_to_frame(t);
         block->events[i].message = messages[i];
     }
 
@@ -222,6 +348,37 @@ static int append_instrument_regions(sfz_instrument* existing, sfz_instrument* i
            (size_t)incoming->num_regions * sizeof(sfz_region));
     existing->num_regions = total;
     sfz_invalidate_region_cache(existing);
+    return 1;
+}
+
+/* A soundfont is not "ready" merely because the parser produced regions.
+ * Every region must already own decoded PCM and, when its source rate differs
+ * from the synth rate, a target-rate buffer. Otherwise the first notes silently
+ * fall back to the expensive interpolating path and loading work leaks into
+ * realtime playback. */
+static int ssw_instrument_is_materialized(const sfz_instrument* inst,
+                                          int target_sample_rate) {
+    if (!inst || inst->num_regions <= 0 || target_sample_rate <= 0)
+        return 0;
+
+    for (int i = 0; i < inst->num_regions; ++i) {
+        const sfz_region* region = &inst->regions[i];
+        const wav_data* source = region->sample_data;
+        if (!region->cache_entry || !source || !source->data ||
+            source->num_samples <= 0 || source->num_channels <= 0 ||
+            source->sample_rate <= 0) {
+            return 0;
+        }
+
+        if (source->sample_rate != target_sample_rate) {
+            const wav_data* prepared = region->resampled_data;
+            if (!region->is_resampled || !prepared || prepared == source ||
+                !prepared->data || prepared->num_samples <= 0 ||
+                prepared->sample_rate != target_sample_rate) {
+                return 0;
+            }
+        }
+    }
     return 1;
 }
 
@@ -552,6 +709,7 @@ int ssw_init_ex(int sample_rate,
                 int validate_state,
                 int soft_clip) {
     if (g_ready) voice_shutdown();
+    g_ready = 0;
 
     g_cfg.sample_rate = sample_rate > 0 ? sample_rate : 44100;
     g_cfg.num_channels = channels > 0 ? channels : 2;
@@ -614,10 +772,17 @@ int ssw_init_ex(int sample_rate,
 
     gs_reset_part_map(0);
 
-    if (instrument)
+    if (instrument) {
         sfz_apply_presampling(
             instrument,
             g_cfg.sample_rate);
+        if (!ssw_instrument_is_materialized(instrument, g_cfg.sample_rate)) {
+            voice_shutdown();
+            return 0;
+        }
+        voice_refresh_all_region_caches();
+        voice_prewarm_note_caches();
+    }
 
     g_render_cursor = 1;
     g_song_time_seconds = 0.0;
@@ -652,6 +817,16 @@ int ssw_load_sf2(const char* path) {
     sfz_instrument* next = sf2_load_as_instrument(path);
     if (!next) return 0;
 
+    /* Finish every load-time sample transformation before exposing this layer
+     * to the live instrument. This also makes failure atomic: an allocation
+     * failure during pre-resampling leaves the currently playing soundfont
+     * untouched instead of installing a half-prepared layer. */
+    sfz_apply_presampling(next, g_cfg.sample_rate);
+    if (!ssw_instrument_is_materialized(next, g_cfg.sample_rate)) {
+        sfz_free(next);
+        return 0;
+    }
+
     if (!instrument) {
         instrument = next;
     } else {
@@ -675,7 +850,12 @@ int ssw_load_sf2(const char* path) {
     }
 
     ++g_soundfont_layers;
+    /* Re-run the cheap cache-binding pass on the merged instrument so the
+     * diagnostic counters describe the complete live font. All expensive
+     * resampling for the incoming layer was already completed above. */
     sfz_apply_presampling(instrument, g_cfg.sample_rate);
+    if (!ssw_instrument_is_materialized(instrument, g_cfg.sample_rate))
+        return 0;
     /*
      * Re-apply the per-region runtime cache now that the regions exist.
      *
@@ -728,6 +908,13 @@ int ssw_warmup(void) {
         msg |= (0u << 16);
         dispatch_short_at_qpc(msg, 0);
     }
+
+    /* Those CC120 messages live in the synth's internal worker queues, not in
+     * g_event_head, so ssw_clear_events() cannot remove them. The old warmup
+     * returned here and made the first real playback block drain the cleanup
+     * from loading. Finish the cleanup while we are still in the load phase. */
+    voice_render_float(scratch, frames);
+
     free(scratch);
     return 1;
 }
@@ -1165,7 +1352,7 @@ int ssw_render_queued_into(uintptr_t out_ptr, int frames) {
 
         g_event_head = block->next;
         if (!g_event_head) g_event_tail = NULL;
-        free(block);
+        ssw_event_block_release(block);
     }
 
 events_done:
@@ -1352,6 +1539,7 @@ void ssw_shutdown(void) {
     g_soundfont_layers = 0;
     free(g_out); g_out = NULL; g_out_capacity_frames = 0;
     ssw_clear_events();
+    ssw_free_event_block_pool();
     g_song_time_seconds = 0.0;
     g_song_frame = 0;
 }

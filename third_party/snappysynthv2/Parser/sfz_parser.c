@@ -1680,12 +1680,31 @@ void sfz_apply_presampling(sfz_instrument* inst, int target_sample_rate) {
         if (entry->resampled && entry->resampled_rate == target_sample_rate) {
             region->resampled_data = entry->resampled;
         } else {
+            wav_data* prepared;
             if (entry->resampled && entry->resampled != entry->original) {
                 wav_free(entry->resampled);
             }
-            entry->resampled = resample_wav_data(entry->original, target_sample_rate);
+            entry->resampled = NULL;
+            entry->resampled_rate = 0;
+            prepared = resample_wav_data(entry->original, target_sample_rate);
+
+            /* resample_wav_data() intentionally returns the original buffer
+             * when no conversion is needed, but historically it also returned
+             * the original buffer when allocation failed. Do not mark that
+             * failure as a successfully cached target-rate sample: doing so
+             * poisoned the cache and made every later presampling pass believe
+             * the slow runtime-resampling path was already prepared. */
+            if (entry->original->sample_rate != target_sample_rate &&
+                prepared == entry->original) {
+                region->resampled_data = NULL;
+                region->is_resampled = 0;
+                ++g_presample_regions_skipped;
+                continue;
+            }
+
+            entry->resampled = prepared;
             entry->resampled_rate = target_sample_rate;
-            region->resampled_data = entry->resampled;
+            region->resampled_data = prepared;
         }
         region->is_resampled = (region->resampled_data != region->sample_data);
     if (region->is_resampled) ++g_presample_regions_resampled;

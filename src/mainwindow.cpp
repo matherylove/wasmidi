@@ -1182,6 +1182,11 @@ EM_JS(int, wasmidi_snappy_presample, (), {
     return ((res & 0xffff) << 16) | (skip & 0xffff);
 });
 
+EM_JS(int, wasmidi_snappy_presample_seen, (), {
+    const b = globalThis.WasmidiSnappyBridge;
+    return b && b.state ? (Number(b.state.presampleSeen) | 0) : 0;
+});
+
 EM_JS(int, wasmidi_snappy_free_ratio, (), {
     const b = globalThis.WasmidiSnappyBridge;
     if (!b || !b.state) return 100;
@@ -4075,6 +4080,7 @@ void MainWindow::pollSynthState()
     }
     {
         const int packed = wasmidi_snappy_presample();
+        synthPresampleSeen_ = wasmidi_snappy_presample_seen();
         synthPresampleResampled_ = (packed >> 16) & 0xffff;
         synthPresampleSkipped_ = packed & 0xffff;
     }
