@@ -71,6 +71,41 @@ def main():
         current = open(OUT, encoding="utf-8").read() if os.path.exists(OUT) else ""
         if current != text:
             print("MANIFEST.sha256 is stale; run tools/regen_manifest.py")
+
+            # Make CI failures actionable.  The old check only said that the
+            # manifest was stale, which made it impossible to tell whether the
+            # committed source tree, the workflow itself, or line-ending
+            # normalization differed from the packaged drop.
+            recorded = {}
+            malformed = []
+            for raw in current.splitlines():
+                if "  " not in raw:
+                    if raw.strip():
+                        malformed.append(raw)
+                    continue
+                sha, rel = raw.split("  ", 1)
+                recorded[rel] = sha
+
+            changed = 0
+            for rel in FILES:
+                actual = digest(rel)
+                old_sha = recorded.get(rel)
+                if old_sha != actual:
+                    changed += 1
+                    print("MISMATCH: %s" % rel)
+                    print("  manifest: %s" % (old_sha if old_sha is not None else "<missing>"))
+                    print("  current:  %s" % actual)
+
+            extras = sorted(set(recorded) - set(FILES))
+            for rel in extras:
+                changed += 1
+                print("EXTRA manifest entry: %s" % rel)
+            for raw in malformed:
+                changed += 1
+                print("MALFORMED manifest line: %s" % raw)
+
+            if changed == 0:
+                print("Hashes match, but manifest formatting/order differs from canonical output.")
             sys.exit(1)
         print("MANIFEST.sha256 ok (%d files)" % len(FILES))
         return

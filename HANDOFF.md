@@ -1,6 +1,6 @@
 # WASMIDI — Handoff completo
 
-**Revisión 38.** Escrito para alguien que llega sin ningún contexto. Leé las
+**Revisión 39.** Escrito para alguien que llega sin ningún contexto. Leé las
 secciones 1 a 5 antes de tocar código. La sección 5 es la más importante: dice
 dónde está el problema hoy.
 
@@ -1686,3 +1686,90 @@ REGIONS`, `skip == 0` y después comparar primera vs segunda reproducción del m
 MIDI/SF con Debug apagado. Para el caso CC, comparar `ALLOC`, `BLOCK`, underruns y
 respuesta audible con exactamente el mismo MIDI/configuración.
 
+
+
+---
+
+## 16. Revisión 38.1 — diagnóstico reproducible del manifest en CI
+
+GitHub Actions reportó `MANIFEST.sha256 is stale` después de que todos los tests
+de host pasaran. El ZIP de rev. 38, ejecutando localmente el bloque exacto
+`Host tests (engine logic, no Emscripten)` del workflow, sí pasa
+`regen_manifest.py --check` y `sha256sum -c`. Eso demuestra que el fallo aparece
+cuando el árbol que llega al commit no coincide byte por byte con el drop
+empaquetado (por ejemplo, un archivo subido selectivamente o una versión previa
+del workflow).
+
+`tools/regen_manifest.py --check` ahora imprime cada archivo cuyo SHA difiere,
+mostrando hash registrado y hash actual, además de entradas faltantes, extra o
+malformadas. No se cambió código de runtime, audio, MIDI, renderer, VOR ni
+stealing en esta revisión. `MANIFEST.sha256` se regeneró después de este cambio.
+
+
+---
+
+## 17. Revisión 39 — hot path del stealer bajo saturación CC
+
+La prueba real de rev. 38 confirmó dos cosas distintas. Primero, la preparación de
+la SF2 ya recorre las 11 regiones (`PRESMP seen 11`) sin skips en idle. Segundo,
+el caso CC sigue siendo el cuello principal: con 24 workers y 8192 voces la
+captura mostró `ACTIVE 8112`, `FREE 80`, `ALLOC 1974 ms`, `BUSY 59 ms`,
+`STEALS/s 18285`, `DROPPED 310290`, `BLOCK 89.3 ms`, `LOAD 751%`, `RING 6%` y
+`LATE 77 ms`. Es decir, el tiempo sigue concentrado en la fase de admisión/robo,
+no en el DSP.
+
+### 17.1 Workers=0 en navegador
+
+Se encontró un bug independiente: en algunas configuraciones Chromium/Brave el
+`GetSystemInfo()` emulado dentro del módulo devolvía un procesador, por lo que
+`Workers=0` terminaba creando un único worker (`WORKERS 1`, `VOICES/WKR 8192`).
+El worker JS ahora resuelve Auto en el límite del navegador usando
+`navigator.hardwareConcurrency` y entrega ese valor explícitamente a
+`ssw_init_ex()`. Un valor manual continúa pasando sin recortarse, porque Brave
+puede farblear el conteo reportado.
+
+### 17.2 Adyacencia de CC en O(n) por lote
+
+La reproducción browser-side del colapso nativo de CC por adyacencia buscaba el
+siguiente evento de canal haciendo un scan hacia delante por cada controlador.
+Con corridas largas de notas entre CC eso revisita repetidamente los mismos
+eventos. Ahora, al admitir el slab, un pase inverso construye el índice del
+siguiente evento no-nota de cada canal. La consulta durante render queda O(1).
+
+La relación es idéntica a la anterior: ignora note-on/off (van a otra cola), no
+cruza límites de slab, no cruza el final del bloque y sólo absorbe cuando el
+siguiente evento de ese canal es el mismo CC. Se verificó además por comparación
+aleatoria contra el algoritmo anterior; no aparecieron diferencias de decisión.
+
+### 17.3 Espejo compacto de campos estáticos del stealer
+
+`steal_voice_fast()` es byte por byte equivalente al SSv2 nativo en rev. 38, pero
+cada intento fallido puede sondear 128--512 voces. En Shared-WASM, leer para cada
+probe `key`, `voice_age` y el volumen de prioridad desde un `voice` grande obliga
+a tocar líneas de memoria dispersas aunque muchas candidatas se descarten antes
+de necesitar el resto del estado.
+
+Rev. 39 añade un arreglo compacto por voz con exactamente esos campos:
+`priority_volume`, `voice_age`, `key` y la clase de prioridad derivada. Se llena al
+admitir una voz y se actualiza en todas las rutas VOR que modifican
+`original_volume`. El loop de probes usa ese espejo para los guards tempranos y
+sigue leyendo del `voice` para estado dinámico, loudness, envelope y la decisión
+final.
+
+No cambia el orden del scan, `probe_cap`, cursor, scores, protección de bass,
+prioridades, guards, víctima elegida ni qué note-on se descarta. Si el arreglo no
+se puede reservar, el accessor cae automáticamente a los campos originales. Se
+puede compilar sin el camino nuevo con `-DSSW_STEAL_STATIC_CACHE=0`.
+
+### 17.4 Validación disponible
+
+Pasan sintaxis C de `voice.c`, `snappy_wasm_core.c` y `sfz_parser.c`; sintaxis
+Node de worker/bridge; scheduler 14/14; freelist rebalance; VOR redundancy;
+freelist share y simulación del pump. Falta, como siempre en este entorno, el build
+Qt/Emscripten completo y la prueba real en Brave.
+
+La próxima comparación debe usar 24 workers explícitos primero para aislar el
+cambio del stealer. En el mismo punto CC de la captura anterior comparar
+`ALLOC`, `BLOCK`, `STEALS/s`, `DROPPED`, `RING`, `LATE` y respuesta audible. La
+expectativa de esta revisión no es cambiar `STEALS/s`/`DROPPED` por política, sino
+bajar el costo temporal de llegar a exactamente las mismas decisiones.

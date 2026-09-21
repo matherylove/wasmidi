@@ -50,6 +50,11 @@ static int g_soundfont_layers = 0;
 typedef struct {
     int64_t sample_frame;
     uint32_t message;
+    /* Index of the next non-note event for this MIDI channel inside the same
+     * producer slab, or -1.  Built once when the slab is admitted so the
+     * controller-adjacency test in the realtime render loop is O(1) instead of
+     * repeatedly scanning through thousands of intervening note events. */
+    int32_t next_channel_index;
 } ssw_scheduled_event;
 
 typedef struct ssw_event_block {
@@ -230,6 +235,35 @@ int ssw_queue_events(const uint32_t* messages, const double* times, int count) {
         if (!isfinite(t) || t < 0.0) t = 0.0;
         block->events[i].sample_frame = ssw_seconds_to_frame(t);
         block->events[i].message = messages[i];
+        block->events[i].next_channel_index = -1;
+    }
+
+    /*
+     * Build the channel-event adjacency links once per producer batch.
+     *
+     * enqueue_event() routes notes and channel state into different worker
+     * queues, so notes do not separate two controllers for the native queue's
+     * coalescing rule.  The old browser-side reproduction rediscovered the
+     * next channel event by scanning forward for every CC.  On Black MIDI that
+     * can revisit the same note run millions of times.  A reverse pass gives
+     * the exact same next-event relation with linear work and no allocation.
+     *
+     * We intentionally do not link across ssw_event_block boundaries: the old
+     * implementation did not scan across them either, so this is a pure
+     * implementation optimization with identical collapse decisions.
+     */
+    {
+        int32_t next_non_note[16];
+        for (int ch = 0; ch < 16; ++ch) next_non_note[ch] = -1;
+        for (size_t rev = incoming; rev-- > 0;) {
+            ssw_scheduled_event* event = &block->events[rev];
+            const uint32_t message = event->message;
+            const uint32_t command = message & 0xf0u;
+            const uint32_t channel = message & 0x0fu;
+            event->next_channel_index = next_non_note[channel];
+            if (command != 0x90u && command != 0x80u)
+                next_non_note[channel] = (int32_t)rev;
+        }
     }
 
     if (g_event_tail) g_event_tail->next = block;
@@ -643,26 +677,21 @@ static int ssw_controller_absorbed_by_next(
     if (!ssw_cc_is_collapsible((message >> 8) & 0x7fu))
         return 0;
 
-    for (size_t i = index + 1; i < count; ++i) {
-        const uint32_t other = events[i].message;
-        if (events[i].sample_frame >= block_end_frame)
-            return 0;
-        if ((other & 0x0fu) != channel)
-            continue;
+    const int32_t next_index = events[index].next_channel_index;
+    if (next_index < 0 || (size_t)next_index >= count)
+        return 0;
 
-        const uint32_t other_command = other & 0xf0u;
-        /* Notes live in a different queue; they cannot separate two
-         * controllers as far as the coalescing is concerned. */
-        if (other_command == 0x90u || other_command == 0x80u)
-            continue;
+    const ssw_scheduled_event* next = &events[next_index];
+    if (next->sample_frame >= block_end_frame)
+        return 0;
 
-        /* This is the next channel event on this channel. It absorbs the
-         * current one only if it is the same controller. Anything else ends
-         * the adjacency, exactly as it would in the native queue. */
-        return other_command == 0xb0u &&
-               ((other >> 8) & 0x7fu) == ((message >> 8) & 0x7fu);
-    }
-    return 0;
+    const uint32_t other = next->message;
+    const uint32_t other_command = other & 0xf0u;
+    /* next_channel_index already skipped notes and other channels.  Therefore
+     * this is exactly the event the old forward scan would have returned. */
+    return (other & 0x0fu) == channel &&
+           other_command == 0xb0u &&
+           ((other >> 8) & 0x7fu) == ((message >> 8) & 0x7fu);
 }
 
 static void dispatch_short_at_qpc(uint32_t msg, int64_t timestamp_qpc) {

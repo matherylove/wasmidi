@@ -595,6 +595,24 @@ function initCore() {
     resetStealRate();
     if (Module._ssw_set_debug_metrics) Module._ssw_set_debug_metrics(debugMetrics ? 1 : 0);
 
+    // `GetSystemInfo()` inside Emscripten currently reports a single logical
+    // processor in some Chromium/Brave worker configurations.  That made the
+    // UI's Workers=0 (Auto) path silently construct one SSv2 worker even though
+    // the pthread pool had many workers available.  Keep 0 as the persisted UI
+    // value, but resolve Auto at the browser boundary where the browser's own
+    // reported hardwareConcurrency is available.  An explicit user value still
+    // wins unchanged and is deliberately not clipped (Brave may farble the
+    // reported core count).
+    const autoWorkers = (() => {
+        if (requestedWorkers > 0)
+            return requestedWorkers;
+        const reported =
+            (typeof navigator !== "undefined" && navigator.hardwareConcurrency)
+                ? Number(navigator.hardwareConcurrency) | 0
+                : 0;
+        return Math.max(1, Math.min(256, reported || 1));
+    })();
+
     const initialized = Module._ssw_init_ex(
         sampleRateHz,
         synthChannels,
@@ -604,7 +622,7 @@ function initCore() {
         realtimePriority,
         maxVoices,
         minVoices,
-        requestedWorkers,
+        autoWorkers,
         noteSharding,
         stealScoreCache ? 1 : 0,
         fastNoteOff ? 1 : 0,

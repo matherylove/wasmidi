@@ -109,6 +109,9 @@ extern sfz_instrument* instrument;
 
 // Voice stealing optimizations
 #define STEAL_SCAN_LIMIT       192     // Live active-voice samples inspected per steal
+#ifndef SSW_STEAL_STATIC_CACHE
+#define SSW_STEAL_STATIC_CACHE 1
+#endif
 #define STEAL_SAME_KEY_LIMIT   64      // Max same-key voices to inspect before falling back
 #define STEAL_RECENT_AGE_GUARD 96      // Protect very recently allocated voices from fallback steals
 #define STEAL_RELEASE_AUDIBLE_GUARD 2.0f // Release voices louder than incoming*guard are still protected
@@ -359,6 +362,31 @@ typedef struct {
 // ==============================
 static voice* voices = NULL;      // backing array (as required by external code)
 static float* g_steal_score = NULL;
+/*
+ * Compact immutable-per-note fields used by the saturated-pool stealer.
+ *
+ * voice is deliberately render-centric: key lives in a later cache line and
+ * voice_age/original_volume live in the cold management line.  A failed steal
+ * can probe 128 voices, and CC-heavy Black MIDI can trigger hundreds of
+ * thousands of those probes per second.  Native x86 tolerates those scattered
+ * loads much better than Shared-WASM memory does.
+ *
+ * These values are exact mirrors of fields that do not change during a note's
+ * lifetime.  They only make the existing scan cheaper; scan order, guards,
+ * scores, cursor movement and victim selection remain unchanged.  If the
+ * optional cache allocation fails, every read falls back to voice itself.
+ */
+typedef struct {
+    float priority_volume;
+    uint32_t voice_age;
+    uint16_t packed; /* key[0..6], priority[11..13], valid[15] */
+    uint16_t reserved;
+} steal_static_meta;
+static steal_static_meta* g_steal_static = NULL;
+#define STEAL_STATIC_KEY_MASK       0x007fu
+#define STEAL_STATIC_PRIORITY_SHIFT 11u
+#define STEAL_STATIC_PRIORITY_MASK  0x3800u
+#define STEAL_STATIC_VALID          0x8000u
 static int    g_use_steal_score_cache = 0;
 static int    g_use_fast_note_off_tail = 1; // default ON; set SS_FAST_NOTE_OFF=0 to disable
 static int    max_voices = 0;
@@ -1975,16 +2003,82 @@ if (!v) return 0.0f;
 return (v->vor_original_volume_unit > 0.0f) ? v->vor_original_volume_unit : v->original_volume;
 }
 
-static inline int steal_protect_release_tail(const voice *v, float victim_loudness, int incoming_priority) {
+static inline void update_voice_steal_static_meta(int vid, const voice *v) {
+#if SSW_STEAL_STATIC_CACHE
+if (!g_steal_static || !v || vid < 0 || vid >= max_voices) return;
+float volume = steal_priority_volume_from_voice(v);
+int priority = steal_priority_from_volume(volume);
+uint16_t packed = (uint16_t)(v->key & 0x7f);
+packed |= (uint16_t)((priority & 0x7) << STEAL_STATIC_PRIORITY_SHIFT);
+packed |= STEAL_STATIC_VALID;
+g_steal_static[vid].priority_volume = volume;
+g_steal_static[vid].voice_age = v->voice_age;
+g_steal_static[vid].packed = packed;
+#else
+(void)vid;
+(void)v;
+#endif
+}
+
+static inline int read_voice_steal_static_meta(int vid,
+                                                const voice *v,
+                                                int *key,
+                                                float *volume,
+                                                int *priority,
+                                                uint32_t *voice_age) {
+if (g_steal_static && vid >= 0 && vid < max_voices) {
+const steal_static_meta *meta = &g_steal_static[vid];
+const uint16_t packed = meta->packed;
+if (packed & STEAL_STATIC_VALID) {
+if (key) *key = packed & STEAL_STATIC_KEY_MASK;
+if (volume) *volume = meta->priority_volume;
+if (priority) *priority =
+(packed & STEAL_STATIC_PRIORITY_MASK) >> STEAL_STATIC_PRIORITY_SHIFT;
+if (voice_age) *voice_age = meta->voice_age;
+return 1;
+}
+}
+if (!v) return 0;
+float fallback_volume = steal_priority_volume_from_voice(v);
+if (key) *key = v->key;
+if (volume) *volume = fallback_volume;
+if (priority) *priority = steal_priority_from_volume(fallback_volume);
+if (voice_age) *voice_age = v->voice_age;
+return 0;
+}
+
+static inline int steal_protect_sustained_bass_with_key(const voice *v,
+                                                         int victim_key,
+                                                         int incoming_key) {
+if (!v) return 0;
+if (victim_key < 0 || victim_key >= STEAL_BASS_PROTECT_KEY) return 0;
+if (v->env_state == ENV_RELEASE || v->note_off_received || v->kill_now) return 0;
+return incoming_key > victim_key;
+}
+
+static inline int steal_protect_release_tail_with_priority(const voice *v,
+                                                            float victim_loudness,
+                                                            int incoming_priority,
+                                                            float victim_volume,
+                                                            int victim_priority) {
 if (!v || v->env_state == ENV_OFF || v->kill_now) return 0;
 if (incoming_priority != 0) return 0;
 if (v->env_state != ENV_RELEASE && !v->note_off_received) return 0;
 if (v->env_level < 0.18f) return 0;
 if (victim_loudness <= VOICE_SILENCE * 0.25f) return 0;
-float victim_volume = steal_priority_volume_from_voice(v);
-int victim_priority = steal_priority_from_volume(victim_volume);
 if (victim_priority < 2 && victim_volume < STEAL_MELODY_VOLUME) return 0;
 return victim_priority > incoming_priority;
+}
+
+static inline int steal_protect_release_tail(const voice *v, float victim_loudness, int incoming_priority) {
+if (!v || v->env_state == ENV_OFF || v->kill_now) return 0;
+float victim_volume = steal_priority_volume_from_voice(v);
+int victim_priority = steal_priority_from_volume(victim_volume);
+return steal_protect_release_tail_with_priority(v,
+                                                 victim_loudness,
+                                                 incoming_priority,
+                                                 victim_volume,
+                                                 victim_priority);
 }
 
 static inline int steal_protect_priority_lane(const voice *v, float incoming_volume, int incoming_priority) {
@@ -2236,6 +2330,9 @@ static inline void vor_merge_voice(voice *v, float base_gain_unit, float origina
                                                                                                                                                                                                                                                                 v->original_volume += original_volume_unit;
                                                                                                                                                                                                                                                                 v->vor_gain_scale = 1.0f;
                                                                                                                                                                                                                                                                 v->vor_gain_target = 1.0f;
+if (v >= voices && v < voices + max_voices) {
+update_voice_steal_static_meta((int)(v - voices), v);
+}
                                                                                                                                                                                                                                                                 if (g_steal_score && v >= voices && v < voices + max_voices) {
                                                                                                                                                                                                                                                                 update_voice_steal_score((int)(v - voices), v);
                                                                                                                                                                                                                                                                 }
@@ -3094,17 +3191,21 @@ if (v->env_state == ENV_OFF || v->kill_now) {
 idx = next_idx;
 continue;
 }
-if (!low_cap_steal && steal_protect_sustained_bass(v, new_note_key)) {
+int victim_key = 0;
+float victim_volume = 0.0f;
+int victim_priority = 0;
+uint32_t victim_age = 0;
+read_voice_steal_static_meta(vid, v, &victim_key, &victim_volume,
+                             &victim_priority, &victim_age);
+if (!low_cap_steal && steal_protect_sustained_bass_with_key(v, victim_key, new_note_key)) {
 idx = next_idx;
 continue;
 }
 
-float victim_volume = steal_priority_volume_from_voice(v);
-int victim_priority = steal_priority_from_volume(victim_volume);
 if (!low_cap_steal &&
 v->env_state != ENV_RELEASE &&
 !v->note_off_received &&
-(v->owner_channel != ch || v->key != new_note_key) &&
+(v->owner_channel != ch || victim_key != new_note_key) &&
 victim_priority >= incoming_priority) {
 idx = next_idx;
 continue;
@@ -3118,7 +3219,10 @@ idx = next_idx;
 continue;
 }
 float victim_loudness = voice_steal_loudness_active(v);
-if (!low_cap_steal && steal_protect_release_tail(v, victim_loudness, incoming_priority)) {
+if (!low_cap_steal && steal_protect_release_tail_with_priority(v, victim_loudness,
+                                                                 incoming_priority,
+                                                                 victim_volume,
+                                                                 victim_priority)) {
 idx = next_idx;
 continue;
 }
@@ -3128,7 +3232,7 @@ incoming_priority == 0 &&
 victim_priority == 0) {
 score *= 0.25f;
 }
-LONG age_delta = current_voice_age - (LONG)v->voice_age;
+LONG age_delta = current_voice_age - (LONG)victim_age;
 
 if (!low_cap_steal &&
 age_delta < STEAL_RECENT_AGE_GUARD &&
@@ -3156,10 +3260,10 @@ best_quiet_vid = vid;
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 if (oldest_vid < 0 ||
-                                                                                                                                                                                                                                                                v->voice_age < oldest_age ||
-                                                                                                                                                                                                                                                                (v->voice_age == oldest_age && score < oldest_score)) {
+                                                                                                                                                                                                                                                                victim_age < oldest_age ||
+                                                                                                                                                                                                                                                                (victim_age == oldest_age && score < oldest_score)) {
                                                                                                                                                                                                                                                                 oldest_vid = vid;
-                                                                                                                                                                                                                                                                oldest_age = v->voice_age;
+                                                                                                                                                                                                                                                                oldest_age = victim_age;
                                                                                                                                                                                                                                                                 oldest_score = score;
                                                                                                                                                                                                                                                                 }
 
@@ -3494,6 +3598,9 @@ static inline void vor_merge_voice_stacked(voice *v, int stack_count) {
         v->original_volume += v->vor_original_volume_unit * (float)stack_count;
         v->vor_gain_scale = 1.0f;
         v->vor_gain_target = 1.0f;
+if (v >= voices && v < voices + max_voices) {
+update_voice_steal_static_meta((int)(v - voices), v);
+}
         if (g_steal_score && v >= voices && v < voices + max_voices) {
             update_voice_steal_score((int)(v - voices), v);
         }
@@ -3640,6 +3747,9 @@ static inline void vor_merge_voice_stacked(voice *v, int stack_count) {
         v->original_volume += v->vor_original_volume_unit * (float)stack_count;
         v->vor_gain_scale = 1.0f;
         v->vor_gain_target = 1.0f;
+if (v >= voices && v < voices + max_voices) {
+update_voice_steal_static_meta((int)(v - voices), v);
+}
         if (g_steal_score && v >= voices && v < voices + max_voices) {
             update_voice_steal_score((int)(v - voices), v);
         }
@@ -4094,6 +4204,8 @@ v->vor_token = e.vor_token;
                                                                                                                                                                                                                                                                 v->original_volume = original_volume_unit * (float)event_stack_count;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 #endif
+
+update_voice_steal_static_meta(vid, v);
 
                                                                                                                                                                                                                                                                 {
                                                                                                                                                                                                                                                                 float pitch_mul;
@@ -6282,6 +6394,8 @@ static int queue_gpu_render_voices(LONG cycle_id, int frames, int channels) {
 
 free(g_steal_score);
 g_steal_score = NULL;
+free(g_steal_static);
+g_steal_static = NULL;
 g_use_steal_score_cache = 1;
                                                                                                                                                                                                                                                                 if (getenv("SS_STEAL_SCORE_CACHE") && getenv("SS_STEAL_SCORE_CACHE")[0] == '0') {
                                                                                                                                                                                                                                                                 g_use_steal_score_cache = 0;
@@ -6298,6 +6412,10 @@ g_steal_score = (float*)malloc(sizeof(float) * (size_t)max_voices);
                                                                                                                                                                                                                                                                 g_steal_score[i] = FLT_MAX;
 }
 }
+#if SSW_STEAL_STATIC_CACHE
+g_steal_static = (steal_static_meta*)calloc(
+(size_t)max_voices, sizeof(steal_static_meta));
+#endif
                                                                                                                                                                                                                                                                 // Voices backing array - aligned for better cache performance
                                                                                                                                                                                                                                                                 _aligned_free(voices);
                                                                                                                                                                                                                                                                 voices = (voice*)_aligned_malloc(sizeof(voice) * max_voices, 64);
@@ -6523,6 +6641,7 @@ void voice_init(AudioConfig* config) {
                                                                                                                                                                                                                                                                 logger_log("    Workers: success\n");
                                                                                                                                                                                                                                                                 _aligned_free(voices); voices = NULL; max_voices = 0;
 free(g_steal_score); g_steal_score = NULL;
+free(g_steal_static); g_steal_static = NULL;
 free(g_validate_marks); g_validate_marks = NULL; g_validate_epoch = 1;
                                                                                                                                                                                                                                                                 logger_log("    Free voices: success\n");
                                                                                                                                                                                                                                                                 free(g_final_mix); g_final_mix = NULL; g_final_cap = 0;
