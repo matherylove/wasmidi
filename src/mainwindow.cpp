@@ -1154,6 +1154,12 @@ EM_JS(int, wasmidi_snappy_dispatch_x100, (), {
 // Presampling outcome packed for one readout: resampled << 16 | skipped.
 // Skipped regions, or zero resampled on the first load where a reload reports
 // many, is the first-load slowdown.
+EM_JS(void, wasmidi_snappy_set_debug_metrics, (int enabled), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && typeof b.setDebugMetrics === "function")
+        b.setDebugMetrics(!!enabled);
+});
+
 EM_JS(int, wasmidi_snappy_cc_hotspot, (), {
     const b = globalThis.WasmidiSnappyBridge;
     return b && b.state ? (Number(b.state.ccHotspot) | 0) : 0;
@@ -2854,7 +2860,16 @@ void MainWindow::setSynthDebugMetrics(bool enabled)
     synthDebugMetrics_ = enabled;
     WASMIDI_PERSIST_SETTING("synthDebugMetrics", synthDebugMetrics_ ? 1 : 0);
     emit synthConfigChanged();
-    applySynthConfig();
+    /*
+     * Deliberately NOT applySynthConfig(). Every other flag here reconfigures
+     * the engine, which reloads the soundfont; this one only decides whether
+     * diagnostic counters are collected. Routing it through the same path meant
+     * that turning the counters on to take a reading reloaded the soundfont
+     * first, so the reading described the post-reload state rather than the one
+     * being investigated -- which is exactly the first-load problem these
+     * counters exist to diagnose. The worker is told directly instead.
+     */
+    wasmidi_snappy_set_debug_metrics(synthDebugMetrics_ ? 1 : 0);
 }
 
 void MainWindow::setSynthSoftClip(bool enabled)

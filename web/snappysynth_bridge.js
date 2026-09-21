@@ -1091,8 +1091,21 @@
                 : "SnappySynthV2 settings ready");
     }
 
+    // Flips diagnostic counters without reconfiguring the engine.
+    // Routing this through configure() reloaded the soundfont, so turning the
+    // counters on to take a reading destroyed the very state being measured.
+    function setDebugMetrics(enabled) {
+        state.debugMetrics = !!enabled;
+        if (worker)
+            worker.postMessage({
+                type: "configure",
+                debugMetrics: state.debugMetrics
+            });
+    }
+
     globalThis.WasmidiSnappyBridge = {
         state,
+        setDebugMetrics,
         ensureBackend,
         loadSoundfontFile,
         openSoundfont,
