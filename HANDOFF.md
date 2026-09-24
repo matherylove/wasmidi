@@ -1,8 +1,9 @@
 # WASMIDI — Handoff completo
 
-**Revisión 39.** Escrito para alguien que llega sin ningún contexto. Leé las
+**Revisión 40.** Escrito para alguien que llega sin ningún contexto. Leé las
 secciones 1 a 5 antes de tocar código. La sección 5 es la más importante: dice
-dónde está el problema hoy.
+dónde está el problema hoy. **La sección 19 (rev. 40) es el cambio más reciente y
+corrige la lectura del Problema A y de todas las capturas previas.**
 
 ---
 
@@ -79,6 +80,13 @@ python3 tools/extract_vor_redundancy_logic.py
 cc -O1 -Wall -o /tmp/v tools/vor_redundancy_check.c && /tmp/v
 cc -O1 -o /tmp/s tools/worker_freelist_share_check.c && /tmp/s
 node tools/pump_slice_sim.mjs
+
+# rev. 40: motor nativo real, 24 workers, crear/destruir el pool (ver §19)
+S=third_party/snappysynthv2
+cc -O2 -I$S -DSNAPPYSYNTH_WASM=1 -DSSW_WORKER_CYCLE_TRAMPOLINE=1 -pthread \
+   -o /tmp/wc tools/worker_cycle_smoke.c $S/snappy_wasm_core.c $S/Voice/voice.c \
+   $S/Parser/sf2_parser.c $S/Parser/sfz_parser.c $S/Parser/wav_loader.c \
+   $S/wasm_stubs.c -lm && timeout 30 /tmp/wc
 
 # QML: solo balance de llaves, NO es compilación
 python3 -c "import re;s=re.sub(r'//[^\n]*','',open('src/qml/Controls.qml').read());s=re.sub(r'\"(\\\\.|[^\"\\\\])*\"','\"\"',s);print(s.count('{'),s.count('}'))"
@@ -177,7 +185,7 @@ Solo con Debug:
 |---|---|
 | `LOAD %` | costo del bloque como % de su presupuesto de tiempo real |
 | `BLOCK ms` | costo del último bloque |
-| `ALLOC ms` | tiempo sumado entre workers en la fase previa (eventos, asignación, robo) |
+| `ALLOC ms` | tiempo sumado entre workers en la fase previa (eventos, asignación, robo). **Corrección rev. 40:** también incluye la espera en la barrera `g_render_producers_ready`, así que con desbalance entre workers se infla hasta ~N× el worker más lento (ver §19.4) |
 | `BUSY ms` | tiempo sumado entre workers en el render de voces |
 | `WACT` | cuántos workers tomaron al menos un chunk de la cola de render |
 | `SIMD %` / `MISS <razón>` | porción de voces en el camino vectorizado y por qué fallan |
@@ -240,6 +248,13 @@ se puede declarar resuelto desde este entorno. La prueba decisiva de rev. 38 es:
 primera carga con `PRESMP seen == REGIONS`, `skip == 0`, y comparar `LOAD/BLOCK/
 BUSY` en la primera reproducción contra la segunda. Si esas invariantes se cumplen
 y la primera sigue siendo lenta, el presampleo deja de ser la hipótesis principal.
+
+**Rev. 40 — causa probable encontrada leyendo el código (ver §19).** Tras cargar
+la SF2, el estado de datos de C es el mismo en primera carga y en recarga. Lo
+único que la recarga cambia es que destruye y recrea los hilos de síntesis. Como
+`worker_thread` nunca retornaba y V8 no hace OSR en WebAssembly, los hilos creados
+al abrir la página corrían el hot path con el código base (Liftoff) toda su vida.
+Rev. 40 parte el bucle en `worker_cycle()`, llamado una vez por bloque.
 
 ### Problema B — Zona densa con CC: el pool se satura
 
@@ -368,6 +383,7 @@ stealer sin una medición que lo exija.
 | Prewarm de cachés note/region | activo | ahora corre después de validar/materializar la carga |
 | `voice_refresh_all_region_caches` | activo | bug real del multiplicador de pitch; se conserva |
 | Cadencia del pump | activo | underruns 4.770 → 82, medido |
+| Ciclo de worker separado | **activo rev. 40** | `worker_cycle()` por llamada indirecta; mismo código, deja entrar el código optimizado de V8; rollback `SSW_WORKER_CYCLE_TRAMPOLINE=0` |
 | Culler visual | **no conectado** | `src/renderer/note_raster_compositor.*`, verificado celda por celda pero cuesta más de un frame sin un caché de tiles en segundo plano |
 
 Si el colapso de CC por adyacencia altera el sonido, apagarlo con el define.
@@ -1773,3 +1789,247 @@ cambio del stealer. En el mismo punto CC de la captura anterior comparar
 `ALLOC`, `BLOCK`, `STEALS/s`, `DROPPED`, `RING`, `LATE` y respuesta audible. La
 expectativa de esta revisión no es cambiar `STEALS/s`/`DROPPED` por política, sino
 bajar el costo temporal de llegar a exactamente las mismas decisiones.
+
+---
+
+## 18. Estado al cierre de la sesión — rev. 39 / CC hot path pendiente
+
+### 18.1 Qué quedó implementado
+
+La revisión 39 es el último árbol de código disponible al cierre de esta sesión.
+No se debe confundir el resultado del CI del workflow con un fallo del runtime:
+el problema anterior de `MANIFEST.sha256` se debió a que la subida selectiva omitió
+`.github/workflows/build-wasm.yml`; el workflow del repositorio quedó desalineado
+con el árbol empaquetado. El usuario confirmó que ya corrigió esa subida.
+
+Cambios funcionales acumulados desde rev. 37:
+
+- La preparación de SF2 espera a que las regiones requeridas estén materializadas
+  antes de publicar `SF2 ready`; el warmup limpia sus propios `CC120` antes de
+  devolver el control al playback.
+- `PRESMP` ahora permite distinguir regiones vistas, resampleadas y omitidas.
+- El camino de eventos reutiliza slabs y evita `malloc/free` por lote, además de
+  evitar trabajo innecesario de redondeo en la conversión timestamp->frame.
+- La telemetría Debug fue sacada del hot path cuando está desactivada; `RECYC`
+  cuenta retirada real de voces `ENV_OFF` y no movimientos internos de freelist.
+- `Workers=0`/Auto se resuelve en el worker JS usando el límite del navegador
+  (`navigator.hardwareConcurrency`) para no caer accidentalmente a un solo worker.
+- La detección de adyacencia de CC se cambió de scans hacia delante repetidos a
+  un pase inverso O(n) por slab, conservando la decisión anterior.
+- Rev. 39 añadió un espejo compacto de campos usados en los guards tempranos del
+  stealer (`priority_volume`, `voice_age`, `key` y clase de prioridad). El orden
+  del scan, `probe_cap`, cursor, scores, guards y víctima elegida permanecen sin
+  cambios; existe fallback al acceso original y el camino puede desactivarse con
+  `SSW_STEAL_STATIC_CACHE=0`.
+
+### 18.2 Validación real aportada por el usuario
+
+**SF2 recién cargado / primera reproducción:**
+
+- `PRESMP 11 seen / 0 resmp / 0 skip`.
+- En la captura: `ACTIVE 4864`, `FREE 3328`, `ALLOC 25 ms`, `BUSY 537 ms`,
+  `BLOCK 30.1 ms`, `LOAD 260%`, `STEALS/s 0`, `DROPPED 0`, `RING 6%`,
+  `LATE 18 ms`, `UNDERRUNS 88`, con 24 workers efectivos.
+- Esto indica que la preparación de las 11 regiones y el contador de presampleo
+  funcionan, pero la primera reproducción todavía tiene un costo alto en `BUSY`.
+  No se verificó aún si una segunda reproducción del mismo MIDI reduce ese costo.
+
+**Zona con mucho CC por delante:**
+
+- Con 24 workers y 8192 voces la reproducción sigue saturando el pool.
+- Última captura: `ACTIVE 8085`, `FREE 107`, `ALLOC 2,387 ms`, `BUSY 635 ms`,
+  `LOAD 829%`, `BLOCK 30.1 ms`, `STEALS/s 45,558`, `DROPPED 259,130`,
+  `RING 6%`, `LATE 93 ms`, `UNDERRUNS 884`, `REBAL/s 1,521`.
+- *Nota rev. 40:* ese `BLOCK 30.1 ms` es idéntico al de la captura de primera
+  carga y no cuadra con `LOAD 829%` (con el presupuesto de ~11.6 ms que implica la
+  otra captura serían ~96 ms). Probable error de transcripción; confirmar contra la
+  captura original antes de usarlo.
+- Por tanto, rev. 39 **no resolvió el cuello de botella CC**. El espejo compacto
+  del stealer y la optimización O(n) de adyacencia no redujeron suficientemente
+  el costo de admisión/robo bajo esta carga.
+- El síntoma sigue siendo `ALLOC >> BUSY`, con el pool casi completamente lleno.
+
+### 18.3 Qué se quería hacer y quedó sin terminar
+
+La siguiente investigación prevista era seguir bajando el costo del hot path de
+admisión sin cambiar la semántica musical del SSv2 nativo. En particular:
+
+1. Perfilar `alloc_voice()`/`steal_voice_fast()` a nivel de suboperación para
+   separar tiempo de selección de víctima, sincronización, acceso al `active[]`,
+   CAS/free-list y actualización de estado.
+2. Verificar si el gran `ALLOC` viene realmente del scan del stealer o de la
+   fragmentación/contención de las freelists por worker. La métrica `REBAL/s`
+   alta en la última captura hace que esta segunda hipótesis siga abierta.
+3. Revisar la ruta de note admission después de que los CC hayan roto VOR, sin
+   cambiar `probe_cap`, orden de víctimas, scores, protección de bass ni reglas
+   de drop hasta tener evidencia de que una modificación es semánticamente
+   equivalente.
+4. Medir si el `REBAL`/borrow de voces libres puede hacerse más barato. No se
+   debe asumir que más rebalance siempre ayuda: hay que medir `ALLOC`, `REBAL/s`,
+   `STEALS/s`, `DROPPED` y tiempo de bloque juntos.
+5. Para la primera carga, reproducir el mismo MIDI una segunda vez sin recargar
+   SF2 y comparar `BUSY`, `BLOCK` y `LOAD`. Si la segunda pasada cae mucho, localizar
+   el cache/materialización que todavía ocurre dentro de `voice_render_float()` y
+   mover únicamente esa preparación a la fase de carga.
+
+### 18.4 Qué NO se debe hacer sin una prueba de equivalencia
+
+No cambiar todavía:
+
+- la política de VOR;
+- `steal_voice_fast()` para reducir arbitrariamente el número de probes;
+- `probe_cap`, cursor, scores o prioridad de víctimas;
+- protección de bass;
+- orden temporal de eventos;
+- reglas de CC que cambien el significado musical;
+- DSP/render del `voice.c` solo para mejorar el benchmark.
+
+La razón es que el objetivo sigue siendo fidelidad de sonido/comportamiento con el
+SSv2 nativo, no simplemente reducir `ALLOC` o `UNDERRUNS` a costa de cambiar qué
+voz sobrevive.
+
+### 18.5 Próximo punto exacto de continuación
+
+Continuar desde **rev. 39**, no desde rev. 37 ni desde una rama intermedia.
+Primero perfilar la ruta de admisión/rebalance con el MIDI CC que produjo la última
+captura. Mantener **24 workers explícitos** durante la comparación para aislar el
+problema de Auto. Luego repetir el mismo caso con Auto una vez validado el hot path.
+
+Última revisión entregada al usuario antes de este handoff:
+`wasmidi-main-rev39-cc-steal-hotpath.zip`.
+
+---
+
+## 19. Revisión 40 — hilos de síntesis atrapados en código sin optimizar
+
+### 19.1 Cómo se llegó
+
+El usuario pidió no agregar telemetría y encontrar en el código qué hace que el
+rendimiento mejore al **recargar**, aun sin haber reproducido una nota ni cargado
+un MIDI. Se compararon los dos caminos:
+
+- **Primera carga:** `initCore()` al arrancar la página (`ssw_init_ex()` sin
+  instrumento, crea los 24 hilos) → `loadSoundfont` → `ssw_load_sf2()` →
+  presampleo + validación → `voice_refresh_all_region_caches()` →
+  `voice_prewarm_note_caches()` → `ssw_warmup()`.
+- **Recarga** (`reinitializeCore()` o `ssw_clear_soundfonts()`): `ssw_init_ex()`
+  con instrumento → `voice_shutdown()` → `voice_init_with_count()` →
+  presampleo + validación → refresh → prewarm.
+
+En datos de C terminan iguales: lo único de `voice_init_with_count()` que lee el
+instrumento es `refresh_region_runtime_cache()`, que `ssw_load_sf2()` ya repite, y
+`rebuild_channel_render_cache()` depende solo del estado de canal. **La única
+diferencia real es que la recarga destruye y recrea los hilos de síntesis.**
+
+### 19.2 El mecanismo
+
+1. `worker_thread()` era un `for (;;)` que se ejecuta una sola vez por hilo y
+   nunca retorna. Con `-O3 -flto` todo el hot path (eventos, admisión, robo,
+   render) queda inlineado ahí: es la `wasm-function[47]` con 70% de self time
+   del perfilado de rev. 37.
+2. V8 compila cada función wasm primero con Liftoff (rápido de compilar, código
+   sin optimizar) y la recompila con TurboFan cuando se calienta.
+3. **V8 no tiene OSR para WebAssembly:** el código optimizado se usa en la
+   *próxima llamada* a la función. Una función que nunca retorna no la recibe.
+4. Los hilos creados al abrir la página entran a `worker_thread` cuando solo
+   existe Liftoff y se quedan ahí para siempre. Los hilos recreados por una
+   recarga entran cuando TurboFan ya existe (por uso previo o por la caché de
+   código de V8 entre visitas).
+
+Explica: lentitud de primera carga, que recargar la cure sin tocar notas, que
+dependa del "estado de arranque" y que haya sido intermitente (la caché de código
+de V8 se invalida con cada build nuevo). **No explica** por sí solo "mejora al
+repetir el MIDI" (repetir no recrea hilos) ni "cambiar de soundfont lo
+reintroduce". Esas dos observaciones venían de sesiones con varias variables
+cambiando a la vez (§7, error 6); re-observarlas con rev. 40.
+
+### 19.3 El cambio
+
+`third_party/snappysynthv2/Voice/voice.c`: el cuerpo del `for (;;)` pasó **tal
+cual** a `static int worker_cycle(int widx, worker_data *wd)`. `worker_thread()`
+queda como un bucle que la llama una vez por bloque. Solo se mapeó el control de
+flujo del nivel del bucle externo, identificado por el compilador (gcc marca los
+`continue`/`break` que quedan fuera de un bucle) y revisado a mano en las ramas
+que gcc no compila:
+
+| Línea original (rev. 39) | Antes | Ahora |
+|---|---|---|
+| chequeo de `g_quit_flag` al inicio del ciclo | `break;` | `return SSW_WORKER_CYCLE_QUIT;` |
+| worker sin voces activas, tras publicar | `continue;` | `return SSW_WORKER_CYCLE_CONTINUE;` |
+| `#ifdef GPUMIX`, timeout de consumers | `continue;` | `return SSW_WORKER_CYCLE_CONTINUE;` |
+| salidas por quit dentro de bucles internos | `return 0;` | sin cambio (`0 == QUIT`) |
+
+Los `continue` dentro de bucles internos (incluido el de la rama
+`__wasm_simd128__` del batch estéreo, que gcc no compila) quedan igual. El
+`static __thread int s_last_active` sigue siendo uno por hilo. Los `goto` y sus
+etiquetas quedaron todos dentro de `worker_cycle`.
+
+La llamada es **indirecta, por un puntero `volatile`** (`g_worker_cycle_fn`). Con
+una llamada directa, LLVM LTO o el inliner de Binaryen (`wasm-opt -O3` inlinea
+funciones con un solo llamador sin límite de tamaño) podían volver a meterla en
+`worker_thread` y deshacer el arreglo. Costo: una llamada indirecta por bloque
+por worker.
+
+- Default: activo en Emscripten, apagado en nativo.
+- Rollback: `-DSSW_WORKER_CYCLE_TRAMPOLINE=0` (llamada directa, forma anterior).
+- No cambia orden de eventos, admisión, VOR, stealer, `probe_cap`, protección de
+  bass, DSP ni telemetría. Cero contadores nuevos.
+
+### 19.4 Observación sobre `ALLOC` (documentada, sin tocar código)
+
+El cronómetro de `ALLOC` va de después de `g_start_events` hasta el inicio del
+consumo de la cola de render, y en medio está `WaitForSingleObject(
+g_render_producers_ready, 500)`. Por eso incluye la espera al worker más lento: con
+desbalance, `ALLOC` sumado se acerca a N × el camino crítico. La relación
+"`ALLOC` 20-40× `BUSY`" puede estar inflada por eso. Además, **todas las capturas
+del Problema B se tomaron probablemente con hilos del arranque**, o sea sobre
+código Liftoff. Hay que repetirlas con rev. 40 antes de seguir optimizando
+admisión o robo. Por pedido del usuario no se agregó telemetría para separarlo.
+
+### 19.5 Validación
+
+Ejecutado en este entorno:
+
+- Sintaxis C de `voice.c` en variantes: default, `GPUMIX`, `VOICEDEBUG`, `-mavx2`,
+  `-mavx512f -mavx512bw`, `-UVOR`. `snappy_wasm_core.c` y `sfz_parser.c` limpios.
+- Diff sin indentación contra rev. 39: solo cambian las 3 líneas de la tabla más
+  la envoltura de la función.
+- **Nuevo** `tools/worker_cycle_smoke.c`: enlaza el motor real en nativo, crea 24
+  workers, renderiza 200 bloques, destruye/recrea el pool 3 veces y limpia. Pasa
+  con el trampolín activo y con rollback. Se verificó que detecta el error: con el
+  quit mal mapeado, el test se cuelga (el join del shim POSIX ignora el timeout),
+  por eso se corre con `timeout`.
+- Harnesses de host de siempre: scheduler, rebalance, VOR, freelist share, pump.
+
+No disponible: build Emscripten, Brave, prueba audible.
+
+### 19.6 Prueba del usuario (sin telemetría)
+
+1. **Confirmar la causa, con el build rev. 39:** cerrar Brave por completo y
+   abrirlo con `brave.exe --js-flags="--no-liftoff"` (todo compilado optimizado
+   desde el inicio). Si la primera carga ya rinde como tras una recarga, la causa
+   queda confirmada. Volver a abrir Brave normal después.
+2. **Validar rev. 40, Brave normal:** página nueva, cargar SF2, reproducir el mismo
+   MIDI. La primera reproducción debería acercarse a la de después de una recarga
+   en los primeros segundos (V8 necesita que la función se caliente y compilarla).
+3. **Repetir la captura de la zona con CC** con 24 workers explícitos, y compararla
+   con una tomada después de una recarga. Si ahora coinciden, las capturas previas
+   del Problema B estaban medidas sobre código sin optimizar.
+
+### 19.7 Estado y continuación
+
+- **Hecho:** separación de `worker_cycle()`; smoke test; correcciones en §4, §5,
+  §8 y §18.2.
+- **Próximo:** esperar el resultado de §19.6. Si se confirma, re-evaluar el
+  Problema B con capturas nuevas antes de tocar admisión/robo (§18.3 sigue válido
+  como lista, pero sus números base cambian).
+- **Si no mejora:** revertir con el define y buscar otra diferencia entre hilos
+  del arranque e hilos recreados (orden de reserva de memoria del pool de voces,
+  afinidad de pthreads del pool de Emscripten).
+- **Largo plazo:** sin cambios respecto de §11 y §12.c.
+- **Para quien continúe (GPT o Claude):** continuar desde rev. 40. No volver a
+  meter el cuerpo del ciclo dentro de `worker_thread` ni convertir la llamada en
+  directa: el objetivo es que la función del hot path **retorne** en cada bloque.
+  La misma regla aplica a cualquier bucle infinito nuevo en un hilo wasm.
+
+Última revisión entregada: `wasmidi-main-rev40-worker-cycle.zip`.

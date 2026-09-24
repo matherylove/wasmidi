@@ -3814,19 +3814,50 @@ static DWORD wait_for_worker_cycle(LONG render_cycle, DWORD timeout_ms) {
 }
 #endif
 
-static unsigned __stdcall worker_thread(void *arg) {
-int widx = (int)(intptr_t)arg;
-worker_data *wd = &g_workers[widx];
-
-                                                                                                                                                                                                                                                                // Per-thread mix buffer grows on-demand per render() call via ensure capacity in main thread
-                                                                                                                                                                                                                                                                // We sum into a shared per-worker buffer provided by the main thread each cycle.
-
-                                                                                                                                                                                                                                                                for (;;) {
+/*
+ * rev. 40 -- one render cycle of a synth worker, split out of worker_thread().
+ *
+ * WHY: worker_thread() is entered exactly once per pthread and never returns
+ * (for (;;)), and at -O3/LTO the whole admission + render path is inlined into
+ * it. V8 first runs every wasm function with its baseline compiler (Liftoff)
+ * and swaps in the optimized TurboFan code only on the NEXT call of that
+ * function: there is no on-stack replacement for WebAssembly. Threads created
+ * at page start therefore ran the unoptimized hot path for their whole
+ * lifetime, while threads recreated by any later ssw_init_ex() (a "reload")
+ * entered already-optimized code. That is the first-load slowness that a
+ * reload cured without playing a note.
+ *
+ * Calling the cycle as its own function once per render block lets the next
+ * block pick up the optimized code as soon as V8 has it. The body below is the
+ * previous loop body verbatim; only the loop-level control flow was mapped:
+ *   continue;  (outer loop)   -> return SSW_WORKER_CYCLE_CONTINUE;
+ *   break;     (outer loop)   -> return SSW_WORKER_CYCLE_QUIT;
+ *   return 0;  (thread exit)  -> unchanged (0 == SSW_WORKER_CYCLE_QUIT)
+ * Event order, voice admission, stealing, VOR and DSP are untouched.
+ *
+ * It is called through a volatile function pointer so that neither LLVM LTO
+ * nor Binaryen's one-caller inliner (wasm-opt -O3) can fold it back into
+ * worker_thread(). Rollback: -DSSW_WORKER_CYCLE_TRAMPOLINE=0 (direct call,
+ * inlinable, i.e. the previous monolithic shape).
+ */
+#ifndef SSW_WORKER_CYCLE_TRAMPOLINE
+#  ifdef __EMSCRIPTEN__
+#    define SSW_WORKER_CYCLE_TRAMPOLINE 1
+#  else
+#    define SSW_WORKER_CYCLE_TRAMPOLINE 0
+#  endif
+#endif
+#define SSW_WORKER_CYCLE_QUIT 0
+#define SSW_WORKER_CYCLE_CONTINUE 1
+#if SSW_WORKER_CYCLE_TRAMPOLINE && (defined(__GNUC__) || defined(__clang__))
+__attribute__((noinline))
+#endif
+static int worker_cycle(int widx, worker_data *wd) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
 const int ss_profile = debug_metrics_on();
 LARGE_INTEGER ss_cycle_begin;
 if (ss_profile) QueryPerformanceCounter(&ss_cycle_begin);
-                                                                                                                                                                                                                                                                if (load_relaxed_long(&g_quit_flag)) break;
+                                                                                                                                                                                                                                                                if (load_relaxed_long(&g_quit_flag)) return SSW_WORKER_CYCLE_QUIT;
                                                                                                                                                                                                                                                                 int frames_this_block = (g_worker_mix_cap_frames != NULL) ? g_worker_mix_cap_frames[widx] : 0;
                                                                                                                                                                                                                                                                 LONG render_cycle = load_relaxed_long(&g_cycle_id);
 
@@ -4518,7 +4549,7 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_render_producers_ready, 500);
                                                                                                                                                                                                                                                                 SetEvent(g_render_producers_ready);
                                                                                                                                                                                                                                                                 publish_worker_done(widx, render_cycle);
-                                                                                                                                                                                                                                                                continue;
+                                                                                                                                                                                                                                                                return SSW_WORKER_CYCLE_CONTINUE;
                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                 // zero buffer
                                                                                                                                                                                                                                                                 if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 1;
@@ -4574,7 +4605,7 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
             if (gpu_cycle_active_block &&
                 WaitForSingleObject(g_render_consumers_ready, 2000) == WAIT_TIMEOUT) {
                 publish_worker_done(widx, render_cycle);
-                continue;
+                return SSW_WORKER_CYCLE_CONTINUE;
             }
                                                                                                                                                                                                                                                                 #endif
 int step_now = (int)load_relaxed_long(&g_render_decimate_step);
@@ -6009,10 +6040,27 @@ validate_worker_state("post_compact", widx, wd);
 
                                                                                                                                                                                                                                                                 // Publish completion
                                                                                                                                                                                                                                                                 publish_worker_done(widx, render_cycle);
-                                                                                                                                                                                                                                                                }
+return SSW_WORKER_CYCLE_CONTINUE;
+}
 
-                                                                                                                                                                                                                                                                return 0;
-                                                                                                                                                                                                                                                                }
+#if SSW_WORKER_CYCLE_TRAMPOLINE
+typedef int (*ssw_worker_cycle_fn)(int, worker_data *);
+static ssw_worker_cycle_fn volatile g_worker_cycle_fn = worker_cycle;
+#endif
+
+static unsigned __stdcall worker_thread(void *arg) {
+int widx = (int)(intptr_t)arg;
+worker_data *wd = &g_workers[widx];
+for (;;) {
+#if SSW_WORKER_CYCLE_TRAMPOLINE
+    const ssw_worker_cycle_fn cycle = g_worker_cycle_fn;
+    if (cycle(widx, wd) == SSW_WORKER_CYCLE_QUIT) break;
+#else
+    if (worker_cycle(widx, wd) == SSW_WORKER_CYCLE_QUIT) break;
+#endif
+}
+return 0;
+}
 
                                                                                                                                                                                                                                                                 // ==============================
                                                                                                                                                                                                                                                                 // Main thread: worker infra & mixing
