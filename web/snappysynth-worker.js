@@ -900,7 +900,48 @@ function ringTargetFrames() {
     return Math.floor(audioRingCapacityFrames * PUMP_RING_TARGET_FRACTION);
 }
 
+// Dedicated MIDI feeder (HANDOFF §26): same batch format as the parser path.
+let feederPort = null;
+let localActive = false;
+let localGeneration = 0;
+let localInFlight = false;
+let localVelocityFloor = 0;
+const LOCAL_AHEAD_SECONDS = 1.5;
+const LOCAL_REFILL_SECONDS = 0.75;
+
+function localReset(time) {
+    localGeneration = (localGeneration + 1) >>> 0;
+    localInFlight = false;
+    if (!localActive || !feederPort) return;
+    feederPort.postMessage({ type: "reset", generation: localGeneration, time });
+    localRequestFill();
+}
+
+function localRequestFill() {
+    if (!localActive || !feederPort || localInFlight || !playing) return;
+    if (safeUntil >= renderSongTime + LOCAL_REFILL_SECONDS) return;
+    localInFlight = true;
+    feederPort.postMessage({
+        type: "fill",
+        generation: localGeneration,
+        target: Math.max(safeUntil, renderSongTime) + LOCAL_AHEAD_SECONDS,
+        velocityFloor: localVelocityFloor
+    });
+}
+
+function onFeederMessage(d) {
+    if (!d || d.type !== "batch" || (d.generation >>> 0) !== localGeneration || !localActive) return;
+    localInFlight = false;
+    admitSysExBatch(d.sysexMeta, d.sysexData, d.sysexTimes);
+    admitShortSchedule(d.messages, d.times);
+    safeUntil = Math.max(safeUntil, Number(d.safeUntil) || renderSongTime);
+    startupWaitingForSchedule = false;
+    pump();
+    localRequestFill();
+}
+
 function pump() {
+    localRequestFill();
     if (!Module ||
         !coreReady ||
         !soundfontLoaded ||
@@ -1091,6 +1132,24 @@ onmessage = async event => {
             return;
         }
 
+        if (data.type === "feederPort") {
+            if (feederPort) { try { feederPort.close(); } catch (_) {} }
+            feederPort = data.port || null;
+            if (feederPort) {
+                feederPort.onmessage = e => onFeederMessage(e.data || {});
+                feederPort.start();
+            } else {
+                localActive = false;
+                localInFlight = false;
+            }
+            return;
+        }
+
+        if (data.type === "localVelocityFloor") {
+            localVelocityFloor = Math.max(0, Math.min(127, data.value | 0));
+            return;
+        }
+
         if (data.type === "loadSoundfont") {
             if (!Module || !coreReady)
                 throw new Error("SnappySynthV2 core is still starting.");
@@ -1173,12 +1232,14 @@ onmessage = async event => {
         }
 
         if (data.type === "sysexBatch") {
+            if (localActive) return;
             admitSysExBatch(data.meta, data.bytes, data.times);
             pump();
             return;
         }
 
         if (data.type === "scheduleBatch") {
+            if (localActive) return;
             // Admit both streams before pumping.  This preserves sample timing
             // while preventing a same-batch GM/GS/XG reset from being delivered
             // after Program Change/Bank Select audio has already rendered.
@@ -1194,6 +1255,7 @@ onmessage = async event => {
         }
 
         if (data.type === "schedule") {
+            if (localActive) return;
             const messages =
                 data.messages;
 
@@ -1236,6 +1298,9 @@ onmessage = async event => {
                 // worklet believing audio is on the way and cause a deadlock.
                 resetEventQueue();
                 startupWaitingForSchedule = true;
+                localActive = !!data.local && !!feederPort;
+                playing = true;
+                localReset(time);
             }
 
             playing = true;
@@ -1262,6 +1327,9 @@ onmessage = async event => {
             // Preserve cross-port demand for the same reason as play(reset).
             resetEventQueue();
             startupWaitingForSchedule = playing;
+            localActive = !!data.local && !!feederPort;
+            if (localActive) startupWaitingForSchedule = true;
+            localReset(time);
             return;
         }
 

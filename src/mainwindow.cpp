@@ -357,6 +357,8 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                 try { previousMapped.visualWorker.terminate(); } catch (_) {}
             }
             globalThis.__wasmidiMappedMidi = null;
+            if (globalThis.WasmidiSnappyBridge && globalThis.WasmidiSnappyBridge.clearLocalMidiSource)
+                globalThis.WasmidiSnappyBridge.clearLocalMidiSource();
 
             // Fetch the Worker source explicitly with cache:no-store instead of
             // trusting the browser/Pages HTTP cache for a Worker constructor.
@@ -901,6 +903,9 @@ EM_JS(void, wasmidi_browser_open_file_picker, (int kind), {
                         globalThis.__wasmidiMappedMidi = mappedState;
                         worker = null;
                         installComplete = true;
+                        const synthBridge = globalThis.WasmidiSnappyBridge;
+                        if (synthBridge && typeof synthBridge.setLocalMidiSource === 'function')
+                            synthBridge.setLocalMidiSource(file);
 
                         // Make the JS transaction terminal as well as the C++
                         // transaction. This is intentionally after mappedState is
@@ -969,6 +974,8 @@ EM_JS(void, wasmidi_mapped_shutdown, (), {
         try { mapped.visualWorker.terminate(); } catch (_) {}
     }
     globalThis.__wasmidiMappedMidi = null;
+    if (globalThis.WasmidiSnappyBridge && globalThis.WasmidiSnappyBridge.clearLocalMidiSource)
+        globalThis.WasmidiSnappyBridge.clearLocalMidiSource();
 });
 
 EM_JS(void, wasmidi_mapped_request_key_state,
@@ -1013,6 +1020,9 @@ EM_JS(void, wasmidi_mapped_synth_reset, (double tick), {
     const mapped = globalThis.__wasmidiMappedMidi;
     if (!mapped || !mapped.worker || !mapped.mappedStore)
         return;
+    const localBridge = globalThis.WasmidiSnappyBridge;
+    if (localBridge && localBridge.state && localBridge.state.localSynthActive)
+        return;
     mapped.synthGeneration = ((Number(mapped.synthGeneration) >>> 0) + 1) >>> 0;
     if (mapped.synthGeneration === 0)
         mapped.synthGeneration = 1;
@@ -1035,6 +1045,12 @@ EM_JS(void, wasmidi_mapped_synth_pump,
     const mapped = globalThis.__wasmidiMappedMidi;
     if (!mapped || !mapped.worker || !mapped.mappedStore)
         return;
+    // The synth has its own MIDI feeder (HANDOFF sec. 26); only the velocity floor crosses here.
+    const localBridge = globalThis.WasmidiSnappyBridge;
+    if (localBridge && localBridge.state && localBridge.state.localSynthActive) {
+        localBridge.setLocalVelocityFloor(velocityFloor | 0);
+        return;
+    }
 
     const request = {
         type: 'synth-pump',
@@ -1343,6 +1359,12 @@ EM_JS(void, wasmidi_snappy_stop, (), {
     const b = globalThis.WasmidiSnappyBridge;
     if (b && b.stop)
         b.stop();
+});
+
+EM_JS(void, wasmidi_snappy_local_floor, (int value), {
+    const b = globalThis.WasmidiSnappyBridge;
+    if (b && b.setLocalVelocityFloor)
+        b.setLocalVelocityFloor(value | 0);
 });
 
 EM_JS(void, wasmidi_snappy_seek, (double time), {
@@ -2314,6 +2336,7 @@ void MainWindow::play()
             // MPWGL2-style transport: audio starts from the same wall-clock
             // transaction as playback and is never gated by renderer/cache
             // readiness.  The mapped scheduler owns its own MIDI look-ahead.
+            wasmidi_snappy_local_floor(synthEffectiveVelocityFloor_);
             wasmidi_snappy_play(currentTime_, 1);
             resetSynthSchedule(currentTime_);
             synthPlaybackPrimed_ = true;
@@ -2443,6 +2466,7 @@ void MainWindow::seek(float seconds)
 
 #ifdef __EMSCRIPTEN__
     if (soundfontLoaded_) {
+        wasmidi_snappy_local_floor(synthEffectiveVelocityFloor_);
         wasmidi_snappy_seek(clamped);
         resetSynthSchedule(clamped);
         synthPlaybackPrimed_ = true;
@@ -2706,6 +2730,7 @@ void MainWindow::setSynthVelocityFloor(int value)
     // The velocity floor changes the actual MIDI stream sent to the synth, so
     // already rendered PCM is invalid just like after a seek or DSP change.
     if (soundfontLoaded_ && isPlaying_) {
+        wasmidi_snappy_local_floor(synthEffectiveVelocityFloor_);
         wasmidi_snappy_seek(currentTime_);
         resetSynthSchedule(currentTime_);
         synthPlaybackPrimed_ = true;
@@ -2902,6 +2927,7 @@ void MainWindow::setSynthOverlapGain(bool enabled)
         enabled ? 1 : 0);
 
     if (soundfontLoaded_ && isPlaying_) {
+        wasmidi_snappy_local_floor(synthEffectiveVelocityFloor_);
         wasmidi_snappy_seek(currentTime_);
         resetSynthSchedule(currentTime_);
         synthPlaybackPrimed_ = true;
@@ -4112,6 +4138,7 @@ void MainWindow::pollSynthState()
     if (loaded && !synthWasSoundfontLoaded_) {
         synthPlaybackPrimed_ = false;
         if (isPlaying_) {
+            wasmidi_snappy_local_floor(synthEffectiveVelocityFloor_);
             wasmidi_snappy_play(currentTime_, 1);
             resetSynthSchedule(currentTime_);
             synthPlaybackPrimed_ = true;

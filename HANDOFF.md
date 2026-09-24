@@ -2366,4 +2366,67 @@ es barato. Tooltip de Workers actualizado.
 Lo que queda del motor en la zona más densa (101-104 s): el worker de la tecla caliente
 hace ~12 ms nativos por bloque (§24), que en wasm siguen superando los 11,6 ms.
 
-Última revisión entregada: `wasmidi-main-rev42-auto-reserve.zip`.
+Revisión anterior entregada: `wasmidi-main-rev42-auto-reserve.zip`.
+
+---
+
+## 26. Revisión 43 — el synth tiene su propia fuente de MIDI
+
+**Pedido del usuario:** audio y visualización deben ir cada uno a su propio ritmo.
+Hasta rev. 42 los lotes de eventos del synth salían del worker del parser, el mismo
+hilo que arma las 64 pantallas de precarga y el barrido del renderer.
+
+**Diseño:**
+
+- `web/synth-feeder-worker.js` (nuevo): worker dedicado que recibe el `File` del MIDI,
+  lo lee entero (`FileReaderSync`) y hace una pasada de indexado (tempo, selectores,
+  SysEx y checkpoints por pista cada 1024 eventos). Luego fusiona pistas en streaming
+  con un heap (tick, pista, orden en la pista). Habla con el worker del synth por un
+  `MessagePort` directo, sin pasar por el hilo principal.
+- La clase `SmfSynthSource` replica exactamente `buildEventBatch` del store mapeado y
+  el post-proceso de `midi-parser-worker.js`: note-on vel 0 → `0x80` con d2=64,
+  running status (lo cancelan F0-F7 y FF), agrupado de note-ons idénticos
+  consecutivos en la misma tick hasta 256 (bits 24-31), piso de velocidad, SysEx con
+  byte de estado y `safeExclusive`, `safeUntil`, mapa de tempo (orden de pista,
+  duplicados por tick → gana el último, 0 → tempo previo), y en el seek: SysEx
+  histórica + estado de banco/programa/bend posterior al último reset GM/GS/XG.
+- Worker del synth: al recibir `play(reset)` o `seek` con `local: true`, resetea el
+  alimentador por tiempo (mismo `floor(secondsToTick)`) y pide lotes por su cuenta
+  (cobertura 0,75-1,5 s por delante). Mientras está en modo local ignora
+  `schedule`/`scheduleBatch`/`sysexBatch` del camino viejo. Generación por reset para
+  descartar lotes viejos.
+- Bridge: crea el alimentador al cargar el MIDI, le entrega el puerto al worker del
+  synth cuando está listo y activa el modo local recién en el siguiente play/seek con
+  reset (nunca a mitad de reproducción). `state.localSynthReady/Active`.
+- `mainwindow.cpp`: entrega el `File` al bridge al instalar el MIDI y lo limpia al
+  cerrarlo; `wasmidi_mapped_synth_reset/pump` no le piden nada al parser si el modo
+  local está activo; el piso de velocidad se avisa antes de cada play/seek con reset
+  (`wasmidi_snappy_local_floor`).
+- **`?synthsource=parser` en la URL** vuelve al camino anterior: sirve para comparar
+  en la misma zona si el lag viene del visualizador.
+- CI: `node --check`, copia a `site/` y `test -s` del worker nuevo. Manifest: 42.
+
+**Verificación (`tools/feeder_check/`):** `ref.cpp` compila el store mapeado real en
+nativo y produce el flujo del synth (post-proceso incluido) en forma expandida;
+`jsref.mjs` hace lo mismo con `SmfSynthSource`; `proto.mjs` maneja el archivo real del
+worker por `MessagePort` con resets y una generación vieja que debe ignorarse.
+Resultados: **byte a byte idénticos** en Hypernova (0 s, 33,3 s, 77,7 s con piso 40,
+101,5 s, 128 s) y en un MIDI sintético con resets GM/GS/XG, SysEx F0/F7, tempos en la
+misma tick, running status, aftertouch y seek más allá del final. Por el protocolo real
+también iguales (comparando mensajes y SysEx por separado, porque los cortes de lote
+difieren). `./check.sh` repite la parte sintética.
+
+**Costo:** Hypernova 498 MB: carga ~1,4 s; en el segundo más denso, ~0,5 s de CPU por
+segundo de audio, en su propio hilo. Memoria: el archivo entero (~500 MB) vive en el
+alimentador además del store del parser.
+
+**Diferencias conocidas con el camino viejo:** el agrupado de notas idénticas se corta
+en otros puntos porque los lotes tienen otro tamaño (el synth recibe las mismas notas;
+solo cambia cómo se reparten las pilas entre lotes).
+
+**No probado:** nada del lado del navegador (el worker del synth y el bridge no se
+pueden ejecutar acá). Pruebas pedidas: reproducir Hypernova normal y con
+`?synthsource=parser` en la misma zona; seek en pausa y en reproducción; cambiar el
+piso de velocidad durante la reproducción; cargar otro MIDI.
+
+Última revisión entregada: `wasmidi-main-rev43-synth-feeder.zip`.

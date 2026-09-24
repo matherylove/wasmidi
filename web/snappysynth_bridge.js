@@ -6,6 +6,9 @@
 
     const state = {
         ready: false,
+        localSynthReady: false,
+        localSynthActive: false,
+        localSynthLoadMs: 0,
         soundfontLoaded: false,
         soundfontName: "",
         status: "SnappySynthV2 idle",
@@ -164,6 +167,63 @@
             : "soundfont.sf2";
     }
 
+    // Dedicated synth MIDI feeder (HANDOFF §26). ?synthsource=parser keeps the old path.
+    let feeder = null;
+    let feederPortForWorker = null;
+    let localVelocityFloor = -1;
+    const localSourceAllowed = (() => {
+        try { return new URL(globalThis.location.href).searchParams.get("synthsource") !== "parser"; }
+        catch (_) { return true; }
+    })();
+
+    function deliverFeederPort() {
+        if (worker && feederPortForWorker) {
+            worker.postMessage({ type: "feederPort", port: feederPortForWorker }, [feederPortForWorker]);
+            feederPortForWorker = null;
+        }
+    }
+
+    function clearLocalMidiSource() {
+        if (feeder) { try { feeder.terminate(); } catch (_) {} }
+        feeder = null;
+        feederPortForWorker = null;
+        state.localSynthReady = false;
+        state.localSynthActive = false;
+        localVelocityFloor = -1;
+        if (worker) worker.postMessage({ type: "feederPort", port: null });
+    }
+
+    function setLocalMidiSource(file) {
+        clearLocalMidiSource();
+        if (!localSourceAllowed || !file || typeof Worker !== "function") return;
+        feeder = new Worker("./synth-feeder-worker.js?v=13.12.0");
+        const channel = new MessageChannel();
+        feeder.postMessage({ type: "port", port: channel.port1 }, [channel.port1]);
+        feederPortForWorker = channel.port2;
+        const mine = feeder;
+        feeder.onmessage = event => {
+            if (mine !== feeder) return;
+            const d = event.data || {};
+            if (d.type === "ready") {
+                state.localSynthReady = true;
+                state.localSynthLoadMs = Number(d.ms) || 0;
+                deliverFeederPort();
+            } else if (d.type === "failed") {
+                console.warn("SnappySynth feeder unavailable, using parser path:", d.error);
+                clearLocalMidiSource();
+            }
+        };
+        feeder.onerror = () => { if (mine === feeder) clearLocalMidiSource(); };
+        feeder.postMessage({ type: "load", file });
+    }
+
+    function setLocalVelocityFloor(value) {
+        const v = Math.max(0, Math.min(127, value | 0));
+        if (v === localVelocityFloor) return;
+        localVelocityFloor = v;
+        if (worker) worker.postMessage({ type: "localVelocityFloor", value: v });
+    }
+
     async function ensureBackend() {
         if (backendPromise)
             return backendPromise;
@@ -246,6 +306,7 @@
                 type: "audioPort",
                 port: channel.port1
             }, [channel.port1]);
+            if (state.localSynthReady) deliverFeederPort();
 
             node.port.postMessage({
                 type: "workerPort",
@@ -664,11 +725,14 @@
         // A loaded SoundFont means the backend already exists. Post the reset
         // synchronously so the first schedule batch sent by Qt can never race
         // ahead of it and then be erased by a delayed reset.
+        if (reset)
+            state.localSynthActive = state.localSynthReady;
         if (worker) {
             worker.postMessage({
                 type: "play",
                 time: value,
                 reset: !!reset,
+                local: state.localSynthActive,
                 epoch
             });
         }
@@ -720,10 +784,12 @@
 
         const epoch = resetSharedClock(value, true);
 
+        state.localSynthActive = state.localSynthReady;
         if (worker)
             worker.postMessage({
                 type: "seek",
                 time: value,
+                local: state.localSynthActive,
                 epoch
             });
 
@@ -1106,6 +1172,9 @@
     globalThis.WasmidiSnappyBridge = {
         state,
         setDebugMetrics,
+        setLocalMidiSource,
+        clearLocalMidiSource,
+        setLocalVelocityFloor,
         ensureBackend,
         loadSoundfontFile,
         openSoundfont,
