@@ -371,6 +371,12 @@ stealer sin una medición que lo exija.
     mínimos (`maxVoices` 1, `blockFrames` 1, `numBuffers` 1, workers Auto) y
     reinicializa el motor. Los toggles en caliente van con su propio tipo de
     mensaje (ver §20).
+12. **Estructuras intrusivas compartidas entre workers.** En rev. 41 la lista abierta
+    del note-off usaba enlaces por voz; al readmitir una voz tomada del pool global,
+    otro worker la desenganchaba de una lista ajena mientras su dueño la recorría. En
+    el contenedor (1 núcleo) no se manifiesta; en el navegador cuelga un worker. Toda
+    estructura nueva debe tener un único hilo escritor, y las pruebas de host con 1
+    núcleo no demuestran ausencia de carreras.
 
 ---
 
@@ -2292,4 +2298,38 @@ decisiones bajo saturación y hay que aprobarlas de oído.
 Validación: sintaxis C en variantes (default, GPUMIX, FIFO=1, OPEN_LIST=0, AVX2),
 smoke de workers, harnesses de host, `node --check`.
 
-Última revisión entregada: `wasmidi-main-rev41-noteoff-openlist.zip`.
+Revisión anterior entregada: `wasmidi-main-rev41-noteoff-openlist.zip` (tiene el bug de §24).
+
+---
+
+## 24. Revisión 41.1 — regresión de rev. 41: bloques de 2 s en zonas livianas
+
+**Captura del usuario (rev. 41, zona liviana):** NPS ~143k, polifonía 126, pero
+`ACTIVE 8,179`, `FREE 13`, `BLOCK 2,000.9 ms`, `LATE 1,897 ms`, `LOAD 17,205%`,
+`ALLOC 6,510 ms`, `BUSY 55 ms`. `BLOCK` ≈ 2000 ms es el timeout con que el hilo
+principal espera a los workers: un worker no termina su ciclo. Las voces no se
+liberan porque ese worker deja de procesar note-offs, por eso el pool se llena con
+poca música.
+
+**Causa:** la lista abierta de rev. 41 era intrusiva (enlaces `next/prev` por voz y
+cabeza/cola por tecla). `open_append()` desenganchaba la voz de su lista anterior. Una
+voz que vuelve al pool global puede ser readmitida por **otro** worker, que entonces
+modificaba la lista de una tecla ajena mientras el dueño la recorría: lista corrupta,
+ciclo, bucle infinito. Con 1 núcleo (contenedor) no aparece.
+
+**Arreglo (`Voice/voice.c`):** cada (canal, tecla) tiene un arreglo propio de
+entradas `{vid, gen}` que solo toca el worker dueño de esa tecla (el que admite y
+procesa sus note-offs). `g_voice_gen[vid]` se incrementa en cada admisión; una entrada
+cuyo `gen` no coincide es de una admisión anterior y se descarta sin tocar nada ajeno.
+`keyqueue_clear_corrupt` solo incrementa un contador atómico por tecla; el dueño vacía
+su arreglo al verlo cambiado. La compactación al llenarse conserva las entradas que el
+recorrido original todavía tendría que ver (incluidas las voces en `ENV_OFF`, cuyo
+desenganche de la cola principal forma parte del comportamiento).
+
+**Validación:** audio **bit-idéntico a rev. 40 con 1 worker** en la zona densa; 16
+workers: 82 ms de CPU total por bloque en la zona densa (rev. 40: ~150); zona liviana
+20-30 s igual que rev. 40 (~4 ms por bloque). No se pudo reproducir el cuelgue de
+rev. 41 en el contenedor, así que la corrección se apoya en el diseño (un solo
+escritor por arreglo), no en una prueba. Falta la prueba en navegador.
+
+Última revisión entregada: `wasmidi-main-rev41.1-openlist-owner.zip`.
