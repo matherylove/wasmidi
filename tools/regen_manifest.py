@@ -52,6 +52,7 @@ FILES = [
     "web/snappysynth-audio-worklet.js",
     "web/snappysynth-worker.js",
     "web/snappysynth_bridge.js",
+    "web/synth-feeder-worker.js",
     "web/visual-cache-worker.js",
 ]
 
