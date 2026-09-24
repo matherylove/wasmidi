@@ -1314,6 +1314,16 @@ onmessage = async event => {
             return;
         }
 
+        if (data.type === "debugMetrics" ||
+            (data.type === "configure" && data.maxVoices === undefined &&
+             typeof data.debugMetrics === "boolean")) {
+            // Debug toggle only: must not touch the synth config (rev. 40.1, see HANDOFF §20).
+            debugMetrics = data.type === "debugMetrics" ? !!data.enabled : data.debugMetrics;
+            if (coreReady && Module && Module._ssw_set_debug_metrics)
+                Module._ssw_set_debug_metrics(debugMetrics ? 1 : 0);
+            return;
+        }
+
         if (data.type === "configure") {
             sampleRateHz =
                 Math.max(

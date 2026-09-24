@@ -383,6 +383,20 @@ typedef struct {
     uint16_t reserved;
 } steal_static_meta;
 static steal_static_meta* g_steal_static = NULL;
+/* rev. 41: per-key list of voices a note-off can still match (HANDOFF §23). */
+#ifndef SSW_NOTEOFF_OPEN_LIST
+#define SSW_NOTEOFF_OPEN_LIST 1
+#endif
+/* Experimental, changes voice decisions under saturation (HANDOFF §23). */
+#ifndef SSW_NOTEOFF_FIFO
+#define SSW_NOTEOFF_FIFO 0
+#endif
+#if SSW_NOTEOFF_OPEN_LIST
+static int *g_open_next = NULL, *g_open_prev = NULL;
+static unsigned char *g_open_in = NULL, *g_open_ch = NULL, *g_open_key = NULL;
+static int g_open_head[MIDI_CHANNEL_COUNT][MIDI_KEY_COUNT];
+static int g_open_tail[MIDI_CHANNEL_COUNT][MIDI_KEY_COUNT];
+#endif
 #define STEAL_STATIC_KEY_MASK       0x007fu
 #define STEAL_STATIC_PRIORITY_SHIFT 11u
 #define STEAL_STATIC_PRIORITY_MASK  0x3800u
@@ -2271,12 +2285,46 @@ float resonance = 0.707f + (res_norm * res_norm) * 6.0f;
                                                                                                                                                                                                                                                                 v->in_key_queue = 1;
                                                                                                                                                                                                                                                                 }
 
+
+#if SSW_NOTEOFF_OPEN_LIST
+static inline void open_unlink(int vid) {
+    if (!g_open_in || !g_open_in[vid]) return;
+    const int ch = g_open_ch[vid], key = g_open_key[vid];
+    const int p = g_open_prev[vid], n = g_open_next[vid];
+    if (p >= 0) g_open_next[p] = n; else g_open_head[ch][key] = n;
+    if (n >= 0) g_open_prev[n] = p; else g_open_tail[ch][key] = p;
+    g_open_in[vid] = 0;
+}
+static inline void open_append(int ch, int key, int vid) {
+    if (!g_open_in) return;
+    open_unlink(vid);
+    const int h = g_open_head[ch][key];
+    g_open_prev[vid] = -1;
+    g_open_next[vid] = h;
+    if (h >= 0) g_open_prev[h] = vid; else g_open_tail[ch][key] = vid;
+    g_open_head[ch][key] = vid;
+    g_open_ch[vid] = (unsigned char)ch;
+    g_open_key[vid] = (unsigned char)key;
+    g_open_in[vid] = 1;
+}
+static inline void open_clear_key(int ch, int key) {
+    if (!g_open_in) return;
+    int vid = g_open_head[ch][key];
+    while (vid >= 0) { const int n = g_open_next[vid]; g_open_in[vid] = 0; vid = n; }
+    g_open_head[ch][key] = -1;
+    g_open_tail[ch][key] = -1;
+}
+#endif
+
                                                                                                                                                                                                                                                                 static inline void keyqueue_clear_corrupt(int ch, int key, const char *reason, int vid) {
                                                                                                                                                                                                                                                                 if (ch < 0 || ch >= MIDI_CHANNEL_COUNT || key < 0 || key >= MIDI_KEY_COUNT) return;
                                                                                                                                                                                                                                                                 logger_log("keyqueue corrupt ch=%d key=%d reason=%s vid=%d; clearing key queue\n",
                                                                                                                                                                                                                                                                 ch, key, reason ? reason : "?", vid);
                                                                                                                                                                                                                                                                 g_key_head[ch][key] = -1;
                                                                                                                                                                                                                                                                 g_key_tail[ch][key] = -1;
+#if SSW_NOTEOFF_OPEN_LIST
+open_clear_key(ch, key);
+#endif
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 #ifdef VOR
@@ -2386,6 +2434,39 @@ update_voice_steal_static_meta((int)(v - voices), v);
 static inline void keyqueue_apply_noteoff_cutoff(worker_data *wd, int ch, int key, unsigned int cutoff_order, int release_delay) {
                                                                                                                                                                                                                                                                 (void)wd;
                                                                                                                                                                                                                                                                 if (ch < 0 || ch >= MIDI_CHANNEL_COUNT || key < 0 || key >= MIDI_KEY_COUNT) return;
+#if SSW_NOTEOFF_OPEN_LIST && SSW_NOTEOFF_FIFO
+if (g_open_in && g_use_fast_note_off_tail) {
+    int vid = g_open_tail[ch][key];
+    while (vid >= 0) {
+        voice *v = &voices[vid];
+        const int prev = g_open_prev[vid];
+        if (v->owner_channel != ch || v->key != key || v->env_state == ENV_OFF) {
+            open_unlink(vid);
+            keyqueue_unlink_voice(v);
+            vid = prev;
+            continue;
+        }
+        if (!v->in_key_queue || v->env_state == ENV_RELEASE || v->kill_now || v->note_off_received) {
+            open_unlink(vid);
+            vid = prev;
+            continue;
+        }
+        if (v->pending_note_off_samples >= 0 || v->key_order_id > cutoff_order) {
+            vid = prev;
+            continue;
+        }
+        {
+            const int noteoff_delay = keyqueue_noteoff_delay_for_voice(v, release_delay);
+#ifdef VOR
+            if (v->vor_stack_count > 1 && v->vor_pending_note_offs < INT_MAX) ++v->vor_pending_note_offs;
+#endif
+            v->pending_note_off_samples = noteoff_delay;
+        }
+        return;
+    }
+    return;
+}
+#endif
 
                                                                                                                                                                                                                                                                 // fast_tail_handled: set when the tail probe successfully fires a
                                                                                                                                                                                                                                                                 // note-off transition. If set, we skip the full head scan below —
@@ -2448,6 +2529,36 @@ static inline void keyqueue_apply_noteoff_cutoff(worker_data *wd, int ch, int ke
                                                                                                                                                                                                                                                                 // Full head scan: only needed when fast-tail probe didn't handle it
                                                                                                                                                                                                                                                                 // (probe limit exceeded, or fast-tail disabled).
                                                                                                                                                                                                                                                                 if (fast_tail_handled) return;
+#if SSW_NOTEOFF_OPEN_LIST
+if (g_open_in) {
+    int vid = g_open_head[ch][key];
+    while (vid >= 0) {
+        voice *v = &voices[vid];
+        const int next = g_open_next[vid];
+        if (v->owner_channel != ch || v->key != key || v->env_state == ENV_OFF) {
+            open_unlink(vid);
+            keyqueue_unlink_voice(v);
+            vid = next;
+            continue;
+        }
+        if (!v->in_key_queue || v->env_state == ENV_RELEASE || v->kill_now || v->note_off_received) {
+            open_unlink(vid);
+            vid = next;
+            continue;
+        }
+        if (v->key_order_id <= cutoff_order && v->pending_note_off_samples < 0) {
+            const int noteoff_delay = keyqueue_noteoff_delay_for_voice(v, release_delay);
+#ifdef VOR
+            if (v->vor_stack_count > 1 && v->vor_pending_note_offs < INT_MAX) ++v->vor_pending_note_offs;
+#endif
+            v->pending_note_off_samples = noteoff_delay;
+        }
+        vid = next;
+    }
+    return;
+}
+#endif
+
                                                                                                                                                                                                                                                                 int vid = g_key_head[ch][key];
                                                                                                                                                                                                                                                                 int guard = 0;
                                                                                                                                                                                                                                                                 while (vid >= 0) {
@@ -4290,6 +4401,9 @@ v->env_level = 0.0f;
 v->env_state = ENV_ATTACK;
 if (g_steal_score) g_steal_score[vid] = FLT_MAX;
 keyqueue_append_voice(e.ch, e.key, vid);
+#if SSW_NOTEOFF_OPEN_LIST
+open_append(e.ch, e.key, vid);
+#endif
 #ifdef VOR
 if (layer_count == 1 && region->off_by <= 0) {
 wd->vor_fast_voice_plus_one[e.ch][e.key] = vid + 1;
@@ -6460,6 +6574,20 @@ g_steal_score = (float*)malloc(sizeof(float) * (size_t)max_voices);
                                                                                                                                                                                                                                                                 g_steal_score[i] = FLT_MAX;
 }
 }
+#if SSW_NOTEOFF_OPEN_LIST
+free(g_open_next); free(g_open_prev); free(g_open_in); free(g_open_ch); free(g_open_key);
+g_open_next = (int*)malloc(sizeof(int) * (size_t)max_voices);
+g_open_prev = (int*)malloc(sizeof(int) * (size_t)max_voices);
+g_open_in = (unsigned char*)calloc((size_t)max_voices, 1);
+g_open_ch = (unsigned char*)calloc((size_t)max_voices, 1);
+g_open_key = (unsigned char*)calloc((size_t)max_voices, 1);
+if (!g_open_next || !g_open_prev || !g_open_in || !g_open_ch || !g_open_key) {
+    free(g_open_next); free(g_open_prev); free(g_open_in); free(g_open_ch); free(g_open_key);
+    g_open_next = g_open_prev = NULL; g_open_in = g_open_ch = g_open_key = NULL;
+}
+for (int oc = 0; oc < MIDI_CHANNEL_COUNT; ++oc)
+    for (int ok = 0; ok < MIDI_KEY_COUNT; ++ok) { g_open_head[oc][ok] = -1; g_open_tail[oc][ok] = -1; }
+#endif
 #if SSW_STEAL_STATIC_CACHE
 g_steal_static = (steal_static_meta*)calloc(
 (size_t)max_voices, sizeof(steal_static_meta));
@@ -6690,6 +6818,10 @@ void voice_init(AudioConfig* config) {
                                                                                                                                                                                                                                                                 _aligned_free(voices); voices = NULL; max_voices = 0;
 free(g_steal_score); g_steal_score = NULL;
 free(g_steal_static); g_steal_static = NULL;
+#if SSW_NOTEOFF_OPEN_LIST
+free(g_open_next); free(g_open_prev); free(g_open_in); free(g_open_ch); free(g_open_key);
+g_open_next = g_open_prev = NULL; g_open_in = g_open_ch = g_open_key = NULL;
+#endif
 free(g_validate_marks); g_validate_marks = NULL; g_validate_epoch = 1;
                                                                                                                                                                                                                                                                 logger_log("    Free voices: success\n");
                                                                                                                                                                                                                                                                 free(g_final_mix); g_final_mix = NULL; g_final_cap = 0;

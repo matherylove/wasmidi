@@ -1098,8 +1098,8 @@
         state.debugMetrics = !!enabled;
         if (worker)
             worker.postMessage({
-                type: "configure",
-                debugMetrics: state.debugMetrics
+                type: "debugMetrics",
+                enabled: state.debugMetrics
             });
     }
 

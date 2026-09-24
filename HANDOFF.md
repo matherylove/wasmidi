@@ -255,6 +255,8 @@ la SF2, el estado de datos de C es el mismo en primera carga y en recarga. Lo
 `worker_thread` nunca retornaba y V8 no hace OSR en WebAssembly, los hilos creados
 al abrir la página corrían el hot path con el código base (Liftoff) toda su vida.
 Rev. 40 parte el bucle en `worker_cycle()`, llamado una vez por bloque.
+**Confirmado por el usuario en navegador: con rev. 40 la primera carga ya rinde
+bien desde el inicio. Problema A resuelto.**
 
 ### Problema B — Zona densa con CC: el pool se satura
 
@@ -364,6 +366,11 @@ stealer sin una medición que lo exija.
     varios pendientes. Ambos se restauraron (secciones 12-14). **Regla: este
     documento solo se edita agregando o corrigiendo en el lugar; nunca se
     reemplaza un bloque entero sin haberlo leído y sin conservar su contenido.**
+11. **Mandar un mensaje `configure` parcial al worker.** El handler de `configure`
+    trata cada mensaje como configuración completa: los campos ausentes caen a sus
+    mínimos (`maxVoices` 1, `blockFrames` 1, `numBuffers` 1, workers Auto) y
+    reinicializa el motor. Los toggles en caliente van con su propio tipo de
+    mensaje (ver §20).
 
 ---
 
@@ -2026,10 +2033,263 @@ No disponible: build Emscripten, Brave, prueba audible.
 - **Si no mejora:** revertir con el define y buscar otra diferencia entre hilos
   del arranque e hilos recreados (orden de reserva de memoria del pool de voces,
   afinidad de pthreads del pool de Emscripten).
-- **Largo plazo:** sin cambios respecto de §11 y §12.c.
+- **Largo plazo:** sin cambios respecto de §11 y §12.c, más:
+- **Pendiente: limpieza de comentarios del código.** Recortar los comentarios que
+  repiten el handoff (p. ej. el bloque de `worker_cycle()` en `voice.c` y la
+  cabecera de `tools/worker_cycle_smoke.c`) a una línea con qué hace y el define de
+  rollback. Regla del usuario: el razonamiento va en el handoff, no en el código.
 - **Para quien continúe (GPT o Claude):** continuar desde rev. 40. No volver a
   meter el cuerpo del ciclo dentro de `worker_thread` ni convertir la llamada en
   directa: el objetivo es que la función del hot path **retorne** en cada bloque.
   La misma regla aplica a cualquier bucle infinito nuevo en un hilo wasm.
 
-Última revisión entregada: `wasmidi-main-rev40-worker-cycle.zip`.
+### 19.8 Resultado de la prueba del usuario
+
+- **Primera carga: resuelta.** Todo funcionó bien desde la primera reproducción,
+  sin recargar.
+- **Zona con CC: sigue con bastante lag.** El Problema B no dependía (o no solo)
+  del código sin optimizar. Falta una captura del panel con rev. 40 en el mismo
+  punto CC y 24 workers explícitos para tener números base nuevos: las capturas de
+  §17 y §18.2 se tomaron con hilos del arranque y no sirven como referencia.
+
+Próximo trabajo: Problema B, partiendo de esa captura nueva y leyendo el código de
+admisión/robo antes de agregar instrumentación (preferencia del usuario).
+
+Revisión anterior entregada: `wasmidi-main-rev40-worker-cycle.zip`.
+
+---
+
+## 20. Revisión 40.1 — el botón Debug rompía la configuración del synth
+
+**Síntoma (usuario, rev. 40):** todo suena bien hasta prender Debug; desde ahí
+suena mal, y sigue mal al apagarlo hasta reiniciar el programa.
+
+**Causa:** `setDebugMetrics()` del bridge mandaba `{type: "configure",
+debugMetrics}`. El handler de `configure` en `snappysynth-worker.js` lee todos los
+campos sin valores por defecto del estado actual, así que un mensaje con solo
+`debugMetrics` dejaba `maxVoices` 1, `minVoices` 0, `blockFrames` 1,
+`numBuffers` 1, workers Auto, `noteSharding` 0, y después llamaba
+`reinitializeCore()` y mandaba `engineConfig` al AudioWorklet con esos valores.
+Apagar Debug repetía lo mismo; solo un reinicio volvía a mandar la configuración
+completa. El comentario del bridge decía que ya no pasaba por `configure()`, pero
+el tipo de mensaje seguía siendo `configure`.
+
+**Arreglo:**
+
+- `web/snappysynth_bridge.js`: el toggle manda `{type: "debugMetrics", enabled}`.
+- `web/snappysynth-worker.js`: rama nueva para `debugMetrics` que solo llama
+  `ssw_set_debug_metrics()` y retorna, sin tocar configuración ni reinicializar.
+  Además acepta un `configure` sin `maxVoices` pero con `debugMetrics` como toggle,
+  para el caso de un bridge viejo en caché. Los dos `configure` reales del bridge
+  siempre incluyen `maxVoices`, así que no entran en esa rama.
+
+**Validación:** `node --check` de worker y bridge; manifest. Sin prueba en
+navegador desde acá.
+
+**Consecuencia para las mediciones:** cualquier captura tomada después de prender
+Debug en caliente, con este bug presente, no describe el motor configurado. Las
+capturas del Problema B con rev. 40 deben tomarse con rev. 40.1.
+
+**Próximo:** el usuario prueba rev. 40.1 (Debug on/off en reproducción, debe seguir
+sonando igual) y manda la captura de la zona CC con 24 workers explícitos.
+
+Última revisión entregada: `wasmidi-main-rev40.1-debug-toggle.zip`.
+
+### 20.1 Captura del usuario con rev. 40.1 (zona CC, Debug on)
+
+Debug ya no altera la configuración (8192 voces se mantienen). **Corrección del
+usuario:** esta captura es de **otro hardware** (no el 5900X; de ahí `WORKERS 16`) y
+de **otra sesión/parte del MIDI**. No es comparable con las capturas de §17/§18.2.
+
+`ACTIVE 8,144`, `FREE 48`, `ALLOC 928 ms`, `BUSY 54 ms`, `WACT 13`, `LOAD 564%`,
+`BLOCK 50.4 ms`, `STEALS/s 64,930`, `DROPPED 705,083` (acumulado), `RING 6%`,
+`LATE 39 ms`, `REBAL/s 0`, `UNDERRUNS 4,043` (acumulado), `CCOL 1,747,328`,
+`CC#7 66%`, `MISS INTERP 100%`, `PRESMP 11/0/0`. Gráficos: NPS ~3,75M, CC/s ~111k.
+
+Lectura:
+
+- `BUSY` 54 ms: ~3,4 ms por worker por bloque para 8,1k voces; dentro de esta
+  captura el render es una fracción menor del bloque. (No comparar con los 635 ms de
+  rev. 39: otro hardware y otra parte del MIDI.)
+- `ALLOC` / 16 ≈ 58 ms ≈ `BLOCK`: cada worker pasa todo el bloque en la fase previa
+  o esperando en la barrera (§19.4). El bloque lo fija el worker más lento en
+  admisión/robo. Todo el exceso sobre el presupuesto (11,6 ms) está ahí.
+- Pool a >99% (`FREE 48`), así que `probe_cap` = 128 por intento de robo; cada note-on
+  que termina en `DROPPED` pagó el escaneo completo sin resultado.
+- Análisis independiente de esa captura (sin comparar con otras):
+  - Demanda: NPS ~3,75M → ~43,5k note-ons por bloque de 512 frames (11,6 ms), más
+    sus note-offs. Bloque real 50,4 ms ≈ 4,3× el presupuesto.
+  - Descartados por la propia captura: DSP (`BUSY` 54 ms sumado), manejo de CC (solo
+    11 CC llegaron a los workers en la última llamada; `CCOL` absorbe el resto),
+    preparación de SF (`PRESMP 11/0/0`).
+  - `RECYC 3%`: casi ninguna voz termina su release; se reutilizan por robo. Voces
+    iniciadas ≈ `STEALS/s` / 0,97 ≈ 67k/s → ~98% de los note-ons no toman voz nueva
+    (se apilan por VOR o se descartan).
+  - **El stealer no alcanza a explicar el tiempo:** ~750 robos por bloque (más los
+    drops), cada uno ≤128 probes con el pool >99%, son del orden de 10^5 probes por
+    bloque repartidos en 16 workers: décimas de ms por worker, no 50 ms.
+  - Con 8192 voces y 16 workers el sharding es por hash, que acá equivale a
+    `worker = key % 16`: reparto razonable salvo que la sección use pocas teclas.
+  - Si el reparto es parejo, son ~2,7k note-ons (+ note-offs) por worker por bloque
+    en ~50 ms: varios µs por evento, demasiado para el camino de apilado VOR.
+    **Dónde buscar:** el trabajo por evento del camino que toma el ~98% de las notas
+    (selección de región, `vor_find_overlap_voice`, emparejado de note-off y colas
+    por tecla), no el stealer.
+- **Dato del usuario (corregido):** el SSv2 **nativo reproduce todo bien, incluso con
+  más voces**. Es la versión **WASM** la que no corre bien esta sección en ninguno de
+  los hardwares probados. El costo extra es propio del port y, según esta captura,
+  está en la fase previa al render de los workers (no en DSP, CC, stealer ni
+  segmentación: `ALLOC`/16 ≈ `BLOCK` y `BUSY` de un render completo indican un solo
+  segmento por bloque). Próximo paso: diff de la fase previa (`worker_cycle` hasta la
+  barrera de producers) contra el `voice.c` nativo; cada diferencia es candidata.
+
+---
+
+## 21. Comparación con el `voice.c` nativo (sin cambios de código)
+
+El usuario aportó el `voice.c` nativo de SSv2 (6.183 líneas; el `voice.c_` adjunto
+es una versión anterior de 2.084 líneas y no se usó). Se compararon función por
+función, normalizando espacios y comentarios: 136 funciones idénticas, 10 distintas.
+
+**Fase previa de los workers (`worker_thread` nativo vs `worker_cycle`) — única
+diferencia además de telemetría y del mapeo de control de flujo de rev. 40:**
+
+- el port llama `rebalance_worker_freelist(wd)` cada ciclo (devuelve al pool global
+  lo que exceda los eventos pendientes); el nativo no rebalancea;
+- relleno de freelist: el nativo apunta a 128 libres por ciclo y
+  `refill_worker_freelist` pide 512; el port apunta a la cantidad de eventos
+  pendientes y limita el refill a eso + 1;
+- `++wd->drops_local` al descartar;
+- `update_voice_steal_static_meta` (espejo de rev. 39) al admitir y en
+  `vor_merge_voice*`.
+
+**Otras diferencias:** `enqueue_event` (filtro de redundancia VOR, solo evita
+breaks), `steal_voice_fast` (espejo de rev. 39; `steal_protect_release_tail` se
+refactorizó a `_with_priority` y es equivalente), `voice_render_float`
+(sincronización de fin de ciclo propia de wasm), `setup_workers`,
+`voice_init_with_count`, `voice_shutdown`.
+
+**Conclusión (inferencia de lectura, NO medida):** el trabajo por evento de la fase
+previa es el mismo código que el nativo y las diferencias del port en esa fase
+parecen baratas. Que "el mismo trabajo corre más lento en el navegador" es una
+hipótesis: nunca se ejecutó el núcleo del port fuera del navegador con una SF2 y un
+MIDI reales. Lo único ejecutado en nativo es `tools/worker_cycle_smoke.c` (Linux,
+sin SF2, sin notas que suenen: solo control de hilos). Además, el build no-navegador
+del app Qt no tiene sintetizador ni carga de archivos (todo está bajo
+`#ifdef __EMSCRIPTEN__` / `if(EMSCRIPTEN)`).
+
+**Próximo paso propuesto:** banco de prueba en host (sin telemetría en el producto):
+compilar el motor del port en nativo, como `tools/worker_cycle_smoke.c`, y
+alimentarlo con un flujo sintético con la densidad de la captura de §20.1 (~3,75M
+note-ons/s con duplicados VOR, ~111k CC/s, 8192 voces, 16 workers). Si en nativo
+el bloque entra en presupuesto, el problema es del entorno wasm; si no, se perfila
+con `perf` en host para nombrar la función.
+
+---
+
+## 22. Banco de prueba en host y lectura de la captura de §20.1
+
+`tools/host_bench/`: `make_sf2.py` genera una SF2 de 11 regiones a 44,1 kHz (como la
+de la captura: sin resampleo) y `bench.c` alimenta al núcleo del port por la misma
+API que el worker del navegador (`ssw_queue_events` + `ssw_render_queued_into`),
+bloques de 512, 8192 voces. Flujo sintético: 172 ticks/s, 16 canales, K teclas por
+canal y tick, D pistas duplicadas (VOR), CC7 por pista, notas de 20 ms. Con los
+valores por defecto (K=24, D=56) da ~3,7M NPS y reproduce los números de la
+captura: `STEALS/s` ~62k (captura: ~65k), pool lleno, drops altos.
+
+Resultados en el contenedor (1 núcleo, CPU desconocida, build nativo -O3):
+
+| Config | CPU por bloque | Fase previa | Render |
+|---|---|---|---|
+| 1 worker | ~39 ms | ~17 ms | ~20 ms |
+| 16 workers (en 1 núcleo) | ~31-32 ms total | ~0,5 ms por worker, parejo | ~22 ms total |
+
+- En nativo la fase previa se reparte **pareja** entre los 16 workers (~0,5 ms cada
+  uno). El trabajo total es ~30 ms de CPU por bloque: en una máquina de 8+ hilos
+  entraría holgado en los 11,6 ms si se paraleliza.
+- En el navegador (§20.1) el render sumado fue 54 ms (≈2,5× el nativo de acá, razonable
+  para wasm SIMD128 sin FTZ), pero `ALLOC` por worker ≈ el bloque entero. Con la fase
+  previa pareja y chica, eso indica que **algún worker tarda ~50 ms en llegar a la
+  barrera o la barrera tarda en liberarse**: no es trabajo repartido.
+- En este flujo sintético los CC no cambian nada (misma cifra con y sin CC), porque
+  todas las pistas mandan el mismo valor y el filtro de redundancia/colapso los
+  absorbe. El MIDI real debe tener CC que sí rompen el apilado VOR; hace falta el
+  archivo real para reproducirlo.
+
+**Hipótesis principal para el navegador: sobresuscripción de hilos.** El diseño
+sincroniza todos los workers en barreras en cada bloque. En el navegador los workers
+compiten con el hilo de UI (piano roll WebGL a millones de NPS), el parser de MIDI, el
+caché visual, el AudioWorklet y el hilo que despacha eventos. Con Workers = hilos
+lógicos, basta que el SO desaloje un worker para que los demás esperen en la barrera.
+El SSv2 nativo corre sin esa competencia. **Prueba sin código:** misma máquina y
+sección, Workers explícitos 4 / 8 / 12 contra Auto; si el lag baja con menos workers,
+es esto.
+
+**Otros costos propios de wasm, por orden de peso esperado:** render escalar
+(`MISS INTERP 100%`, ~2/3 del CPU total en host; un kernel de interpolación con
+SIMD128 sobre 4 voces/muestras es la mayor ganancia de CPU disponible), sin FTZ/DAZ
+(denormales en filtros/colas), cadena de despertares de futex en las barreras
+(`SetEvent` re-señalado por cada worker), y el costo por evento de admisión (~200 ns
+nativo por evento, ~85k eventos por bloque en esta densidad; cada nota duplicada se
+procesa por separado porque las pistas duplicadas no quedan adyacentes en la cola).
+
+---
+
+## 23. Revisión 41 — Hypernova real en host: el cuello son dos teclas
+
+**Material de prueba del usuario:** `Hypernova.mid` (498 MB, 26 pistas, 960 TPQN) +
+`MatheryLSD.sf2` (11 regiones). No van en el repo. El `.7z` usa LZMA2 sin filtros;
+sin `7z` se extrae con `lzma` de Python (formato RAW, `dict_size = 32 MiB`, datos
+desde el byte 32; CRC verificado `0xeb442912`).
+
+**Herramienta:** `tools/host_bench/midibench.c` (fusiona pistas en streaming con mapa
+de tempo, precarga CC/programas antes de `start`, renderiza desde `start-2`). Uso:
+`./build.sh && DBG=1 ./midibench MatheryLSD.sf2 hypernova.mid <workers> 101.5 1.5 [wav]`.
+
+**Diagnóstico (build nativo, contenedor de 1 núcleo, zona 101,5-103 s, ~2,9M NPS):**
+
+- Las teclas **0 y 127** llevan ~7% de las notas cada una (y 1/126, 2/125...), 61% en
+  el canal 15. Con 16 workers el reparto `worker = tecla % 16` manda la tecla 0 al
+  worker 0 y la 127 al worker 15.
+- CPU de la fase previa por worker y bloque (rev. 40): **~31 y ~33 ms** en esos dos,
+  **<1 ms** en los otros 14. Eso explica la captura de §20.1: todos esperan en la
+  barrera al worker de una tecla caliente (×~2,5 en wasm ≈ el bloque entero).
+- Dentro de esos workers, con el pool saturado (~650k-960k drops/s): el emparejado de
+  note-off (~65%) y el escaneo del stealer (~30%).
+- Causa del note-off: `keyqueue_append_voice` agrega por la **cabeza** (más nuevo), el
+  sondeo rápido recorre desde la **cola** (más viejo) 128 voces que en teclas calientes
+  son todas colas de release, falla, y cae al recorrido completo de la lista de esa
+  tecla (~400 voces, casi todas liberadas). ~24k recorridos completos por bloque.
+- Más voces empeoran: con 32768 voces las listas por tecla son más largas.
+
+**Cambio (rev. 41), `Voice/voice.c`, `SSW_NOTEOFF_OPEN_LIST` (default 1):** lista
+intrusiva por (canal, tecla) solo con voces que un note-off todavía puede emparejar
+(se agregan al admitir, se podan perezosamente al encontrarlas liberadas, muertas,
+fuera de la cola o reasignadas). El recorrido completo de respaldo del note-off
+recorre esa lista en vez de la cola completa; aplica el mismo predicado y los mismos
+efectos por voz. Arreglos compactos aparte del struct `voice`.
+
+- **Audio bit-idéntico con 1 worker** (WAV comparado byte a byte contra rev. 40 en la
+  zona densa). Con 16 workers el motor ya era no determinista entre corridas (dos
+  corridas de rev. 40 difieren tanto como rev. 40 vs rev. 41), así que la prueba de
+  equivalencia es la de 1 worker: el cambio es lógica por tecla.
+- Worker caliente: **~31-33 ms → ~12-14 ms** por bloque. CPU total con 16 workers:
+  150 → 95 ms por bloque.
+
+**Experimento, `SSW_NOTEOFF_FIFO` (default 0):** reemplaza también el sondeo desde la
+cola por "la voz abierta más vieja con orden ≤ corte" sobre la lista abierta. Worker
+caliente ~8 ms. **Cambia decisiones** (el original, al fallar el sondeo de 128, libera
+todas las voces que califican; esta variante solo la más vieja): la diferencia de audio
+es clara en la zona densa. Se entregaron WAVs A/B de 96-105 s (`..._rev41.wav` y
+`..._fifo_experimental.wav`, 1 worker) para juzgar de oído.
+
+**Qué falta en el worker caliente (~12 ms nativos):** el sondeo desde la cola del
+note-off (128 probes por note-off) y `steal_voice_fast`. Hacerlos exactamente más
+baratos es difícil porque el sondeo cuenta entradas obsoletas de la cola principal y
+sus desenlaces dependen de ese conteo. Las ganancias grandes que quedan cambian
+decisiones bajo saturación y hay que aprobarlas de oído.
+
+Validación: sintaxis C en variantes (default, GPUMIX, FIFO=1, OPEN_LIST=0, AVX2),
+smoke de workers, harnesses de host, `node --check`.
+
+Última revisión entregada: `wasmidi-main-rev41-noteoff-openlist.zip`.
