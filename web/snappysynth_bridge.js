@@ -167,13 +167,13 @@
             : "soundfont.sf2";
     }
 
-    // Dedicated synth MIDI feeder (HANDOFF §26). ?synthsource=parser keeps the old path.
+    // Dedicated synth MIDI feeder (HANDOFF §26-27): opt-in with ?synthsource=feeder.
     let feeder = null;
     let feederPortForWorker = null;
     let localVelocityFloor = -1;
     const localSourceAllowed = (() => {
-        try { return new URL(globalThis.location.href).searchParams.get("synthsource") !== "parser"; }
-        catch (_) { return true; }
+        try { return new URL(globalThis.location.href).searchParams.get("synthsource") === "feeder"; }
+        catch (_) { return false; }
     })();
 
     function deliverFeederPort() {

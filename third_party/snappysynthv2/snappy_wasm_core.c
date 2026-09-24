@@ -18,6 +18,8 @@ static int64_t g_render_cursor = 1;
 /* Adaptive per-block voice_render_float() budget; see ssw_render_queued_into().
  * 1 == exactly the native engine's behaviour (state applied at block start). */
 static int    g_render_budget = 1;
+/* rev. 45 (HANDOFF §29): keep block render time under this % of real time; 0 = off. */
+static int    g_render_limit_percent = 100;
 static double g_render_load_ema = -1.0;
 /* Cost of the most recent block, in microseconds of wall clock. Together with
  * the load EMA this separates "out of CPU" from "out of data": both produce
@@ -1402,6 +1404,22 @@ events_done:
         g_last_render_us = elapsed_ms * 1000.0;
         g_last_dispatch_us = g_dispatch_accum_us;
         ssw_update_render_budget(elapsed_ms, frames);
+        if (g_render_limit_percent > 0 && frames > 0) {
+            const double target_us = (double)g_render_limit_percent * 10000.0 * (double)frames /
+                (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
+            const double spent_us = elapsed_ms * 1000.0;
+            int budget = voice_get_admit_budget_us();
+            if (spent_us > target_us) {
+                budget = budget > 0 ? (budget * 3) / 4 : (int)(target_us * 0.5);
+                if (budget < 200) budget = 200;
+                voice_set_admit_budget_us(budget);
+            } else if (budget > 0 && spent_us < target_us * 0.7) {
+                budget += budget / 8 + 50;
+                voice_set_admit_budget_us(budget > (int)(target_us * 4.0) ? 0 : budget);
+            }
+        } else if (voice_get_admit_budget_us() > 0) {
+            voice_set_admit_budget_us(0);
+        }
     }
     return 1;
 }
@@ -1461,6 +1479,10 @@ int ssw_last_render_us(void) { return (int)(g_last_render_us + 0.5); }
  * workers stops helping. */
 int ssw_last_dispatch_us(void) { return (int)(g_last_dispatch_us + 0.5); }
 int ssw_render_budget(void) { return g_render_budget; }
+void ssw_set_render_limit_percent(int percent) { g_render_limit_percent = percent < 0 ? 0 : percent; }
+int ssw_render_limit_percent(void) { return g_render_limit_percent; }
+int ssw_admit_budget_us(void) { return voice_get_admit_budget_us(); }
+int ssw_limited_notes(void) { return voice_get_admit_limited_notes(); }
 int ssw_detected_cores(void) { return voice_get_detected_cores(); }
 
 /*

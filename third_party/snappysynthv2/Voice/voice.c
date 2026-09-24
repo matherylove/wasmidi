@@ -387,9 +387,9 @@ static steal_static_meta* g_steal_static = NULL;
 #ifndef SSW_NOTEOFF_OPEN_LIST
 #define SSW_NOTEOFF_OPEN_LIST 1
 #endif
-/* Experimental, changes voice decisions under saturation (HANDOFF §23). */
+/* Default since rev. 44; changes voice decisions under saturation (HANDOFF §23, §28). */
 #ifndef SSW_NOTEOFF_FIFO
-#define SSW_NOTEOFF_FIFO 0
+#define SSW_NOTEOFF_FIFO 1
 #endif
 #if SSW_NOTEOFF_OPEN_LIST
 typedef struct { int vid; uint32_t gen; } open_entry;
@@ -3094,6 +3094,12 @@ static volatile LONG g_path_simd_voice_last = 0;
 int voice_get_path_fast(void) { return (int)g_path_fast_last; }
 int voice_get_path_scalar(void) { return (int)g_path_scalar_last; }
 int voice_get_worker_busy_us(void) { return (int)g_worker_busy_last; }
+/* rev. 45 render-time limit (HANDOFF §29): per-cycle note-on admission budget, 0 = unlimited. */
+static volatile LONG g_admit_budget_us = 0;
+static volatile LONG g_admit_limited_notes = 0;
+void voice_set_admit_budget_us(int us) { InterlockedExchange(&g_admit_budget_us, us > 0 ? us : 0); }
+int voice_get_admit_budget_us(void) { return (int)load_relaxed_long(&g_admit_budget_us); }
+int voice_get_admit_limited_notes(void) { return (int)load_relaxed_long(&g_admit_limited_notes); }
 int voice_get_path_simd_voice(void) { return (int)g_path_simd_voice_last; }
 
 #define WORKER_FREELIST_REFILL 512
@@ -3962,6 +3968,12 @@ __attribute__((noinline))
 static int worker_cycle(int widx, worker_data *wd) {
                                                                                                                                                                                                                                                                 WaitForSingleObject(g_start_events[widx], INFINITE);
 const int ss_profile = debug_metrics_on();
+const LONG admit_budget_us = load_relaxed_long(&g_admit_budget_us);
+LARGE_INTEGER admit_t0, admit_freq;
+admit_t0.QuadPart = 0;
+admit_freq.QuadPart = 1;
+if (admit_budget_us > 0) { QueryPerformanceFrequency(&admit_freq); QueryPerformanceCounter(&admit_t0); }
+int admit_over = 0, admit_checks = 0, admit_limited = 0;
 LARGE_INTEGER ss_cycle_begin;
 if (ss_profile) QueryPerformanceCounter(&ss_cycle_begin);
                                                                                                                                                                                                                                                                 if (load_relaxed_long(&g_quit_flag)) return SSW_WORKER_CYCLE_QUIT;
@@ -4072,6 +4084,15 @@ wd->vor_fast_voice_plus_one[e.ch][e.key] = 0;
 }
 #endif
 
+if (admit_budget_us > 0) {
+    if (!admit_over && ((++admit_checks) & 15) == 0) {
+        LARGE_INTEGER admit_now;
+        QueryPerformanceCounter(&admit_now);
+        if ((admit_now.QuadPart - admit_t0.QuadPart) * 1000000 / admit_freq.QuadPart > admit_budget_us)
+            admit_over = 1;
+    }
+    if (admit_over) { ++wd->drops_local; ++admit_limited; continue; }
+}
                                                                                                                                                                                                                                                                  int midi_program = 0;
                                                                                                                                                                                                                                                                 int midi_bank_combined = 0;
                                                                                                                                                                                                                                                                 int midi_bank_msb = 0;
@@ -4651,6 +4672,7 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                  if (wd->active_count == 0) {
                                                                                                                                                                                                                                                                  if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 0;
                                                                                                                                                                                                                                                                  wd->last_key_off_epoch = load_relaxed_long(&g_key_off_epoch);
+if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();
@@ -4699,6 +4721,7 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                 }
 
                                                                                                                                                                                                                                                                 // If to_copy was 0 we do not reserve any entries; ensure consistency
+if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();

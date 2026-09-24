@@ -2429,4 +2429,101 @@ pueden ejecutar acá). Pruebas pedidas: reproducir Hypernova normal y con
 `?synthsource=parser` en la misma zona; seek en pausa y en reproducción; cambiar el
 piso de velocidad durante la reproducción; cargar otro MIDI.
 
-Última revisión entregada: `wasmidi-main-rev43-synth-feeder.zip`.
+Revisión anterior entregada: `wasmidi-main-rev43-synth-feeder.zip`.
+
+---
+
+## 27. Revisión 43.1 — resultado del A/B: el lag no viene del visualizador
+
+**Prueba del usuario (rev. 43, Hypernova):**
+
+- Con el alimentador propio (default de rev. 43): **peor** que las builds anteriores.
+- Con `?synthsource=parser` (camino viejo): mejor, pero **el mismo lag en la misma
+  parte**.
+
+**Conclusión:** separar la entrega de eventos del hilo de precarga no elimina el lag,
+así que el cuello en esa parte no es la competencia con el visualizador por ese hilo:
+es el cómputo del motor (el worker de la tecla caliente, §23-24). Que el alimentador
+empeore es coherente con que suma un hilo ocupado (~0,5 núcleo en lo más denso) y
+~500 MB de RAM sin quitar trabajo del camino crítico.
+
+**Cambio:** el camino del parser vuelve a ser el default. El alimentador queda como
+opción con `?synthsource=feeder` (el código y la verificación de §26 se conservan).
+
+**Próximo:** volver al motor. Lo que queda en el worker caliente (~12 ms nativos por
+bloque en 101,5-103 s, ~2,5× en wasm) es el sondeo desde la cola del note-off y el
+stealer bajo saturación. Las reducciones grandes cambian decisiones de voz y
+requieren aprobación de oído (§23, WAVs A/B).
+
+Revisión anterior entregada: `wasmidi-main-rev43.1-parser-default.zip`.
+
+---
+
+## 28. Revisión 44 — note-off FIFO activado por defecto
+
+**Decisión del usuario:** activar `SSW_NOTEOFF_FIFO` (§23). Ahora es `1` por defecto;
+`-DSSW_NOTEOFF_FIFO=0` vuelve al emparejado exacto de rev. 41.1.
+
+**Qué cambia:** cada note-off libera la voz abierta más vieja de esa tecla con orden
+≤ corte, buscándola en la lista de voces abiertas del worker dueño. El original sondea
+128 voces desde la cola de la lista completa y, si no encuentra, libera **todas** las
+que califican; en teclas saturadas eso último pasaba casi siempre. En pasajes no
+saturados el resultado suele coincidir; en los saturados cambia qué voces se liberan.
+
+**Verificación:** el audio de esta build con 1 worker es bit-idéntico, en la parte
+común, al WAV `hypernova_96-105s_fifo_experimental.wav` entregado en rev. 41 (hecho
+entonces con la lista enlazada), así que ese WAV sigue siendo la referencia de oído.
+
+**Costo del worker caliente (nativo, contenedor, 101,5-103 s):**
+
+| Workers | Rev. 40 | Rev. 41.1 (exacto) | Rev. 44 (FIFO) |
+|---|---|---|---|
+| 16 | ~31-33 ms | ~12-14 ms | ~10 ms |
+| 12 (Auto de rev. 42 en 16 hilos) | — | — | ~6,4 ms |
+
+Con 12 workers cada uno tiene más voces propias y satura menos. En wasm (~2,5×) el
+worker caliente queda cerca de ~16 ms con 12 workers: todavía por encima de los
+11,6 ms, pero mucho más cerca que al principio (~80 ms).
+
+**Próximo:** el stealer en el worker caliente, y medir en el navegador con Auto.
+
+Revisión anterior entregada: `wasmidi-main-rev44-noteoff-fifo.zip`.
+
+---
+
+## 29. Revisión 45 — límite de tiempo de render al 100%
+
+**Pedido del usuario:** que SnappySynth tenga un límite de 100% de tiempo de render,
+para que cuando se atrasa no arrastre todo lo demás (la transporte visual sigue el
+reloj del PCM entregado, así que un synth lento frena también el piano roll).
+
+**Diseño (estilo "CPU limit" de BASSMIDI, pero cortando admisión):**
+
+- `snappy_wasm_core.c`: después de cada bloque compara el tiempo real que tardó
+  `ssw_render_queued_into` con `g_render_limit_percent` (default **100**) del tiempo
+  que dura el bloque. Si se pasa, fija/reduce un presupuesto de admisión por ciclo
+  (empieza en 50% del bloque, ×0,75 por bloque lento, mínimo 200 µs). Si el bloque
+  tarda <70% del objetivo, lo sube (+12,5% + 50 µs) y al pasar 4× el bloque lo quita
+  (0 = sin límite). `ssw_set_render_limit_percent(0)` lo desactiva.
+- `Voice/voice.c` (`worker_cycle`): cada worker mide desde el inicio de su ciclo; cada
+  16 note-ons que no se apilaron por la vía rápida de VOR, mira el reloj; pasado el
+  presupuesto, los note-ons restantes de ese ciclo se descartan (cuentan en `DROPPED`
+  y en `ssw_limited_notes()`). Los contadores de orden por tecla se incrementan igual
+  que en un drop normal, así que los note-offs siguen emparejando bien. Note-offs, CC y
+  apilados VOR no se limitan.
+- Es el camino crítico real: el bloque espera al worker de la tecla caliente, y lo que
+  ese worker gasta es admisión.
+
+**Validación (host):**
+- Zona liviana (20-24 s, 1 worker): audio **bit-idéntico** a rev. 44; el límite no
+  cortó ninguna nota (el presupuesto puede activarse brevemente sin llegar a cortar).
+- Zona densa (100-105 s, 16 workers en 1 núcleo): 55,9 → 37,7 ms por bloque. No llega a
+  11,6 ms acá porque con un solo núcleo el render de ~8k voces ya pasa el bloque; en el
+  navegador el render se reparte entre núcleos y la admisión del worker caliente es lo
+  que manda, que es justo lo que se corta.
+
+**Límites conocidos:** si el render mismo (no la admisión) supera el bloque, cortar
+admisión no alcanza; el siguiente paso sería matar voces en release (más cambio de
+sonido). El límite no es configurable desde la UI todavía (default fijo 100%).
+
+Última revisión entregada: `wasmidi-main-rev45-render-limit.zip`.
