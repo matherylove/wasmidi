@@ -255,6 +255,22 @@ events_done:
         g_last_render_us = elapsed_ms * 1000.0;
         g_last_dispatch_us = g_dispatch_accum_us;
         ssw_update_render_budget(elapsed_ms, frames);
+        if (g_render_limit_percent > 0 && frames > 0) {
+            const double target_us = (double)g_render_limit_percent * 10000.0 * (double)frames /
+                (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
+            const double spent_us = elapsed_ms * 1000.0;
+            int budget = voice_get_admit_budget_us();
+            if (spent_us > target_us) {
+                budget = budget > 0 ? (budget * 3) / 4 : (int)(target_us * 0.5);
+                if (budget < 200) budget = 200;
+                voice_set_admit_budget_us(budget);
+            } else if (budget > 0 && spent_us < target_us * 0.7) {
+                budget += budget / 8 + 50;
+                voice_set_admit_budget_us(budget > (int)(target_us * 4.0) ? 0 : budget);
+            }
+        } else if (voice_get_admit_budget_us() > 0) {
+            voice_set_admit_budget_us(0);
+        }
     }
     return 1;
 }
