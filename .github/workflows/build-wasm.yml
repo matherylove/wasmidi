@@ -115,6 +115,7 @@ jobs:
           node --check build/wasmidi-midi-parser.js
           node --check web/midi-parser-worker.js
           node --check web/snappysynth-worker.js
+          node --check web/synth-feeder-worker.js
           node --check web/snappysynth-audio-worklet.js
           # Realtime PCM must never be stopped at the producer's MIDI
           # safeUntil watermark. That browser-only gate caused the repeatable
@@ -162,6 +163,7 @@ jobs:
           cp web/coi-serviceworker.js site/
           cp web/snappysynth_bridge.js site/
           cp web/snappysynth-worker.js site/
+          cp web/synth-feeder-worker.js site/
           cp web/snappysynth-audio-worklet.js site/
 
           # Load the isolation helper and bridge before Qt's generated bootstrap.
@@ -221,6 +223,7 @@ jobs:
           test -s site/snappysynth-core.wasm
           test -s site/snappysynth-core.worker.js
           test -s site/snappysynth-worker.js
+          test -s site/synth-feeder-worker.js
           test -s site/snappysynth-audio-worklet.js
           test -s site/snappysynth_bridge.js
           test -s site/coi-serviceworker.js
@@ -241,6 +244,7 @@ jobs:
           test -s site/snappysynth-core.wasm
           test -s site/snappysynth-core.worker.js
           test -s site/snappysynth-worker.js
+          test -s site/synth-feeder-worker.js
           test -s site/snappysynth-audio-worklet.js
           test -s site/snappysynth_bridge.js
           echo "SnappySynthV2 Pages payload OK"
