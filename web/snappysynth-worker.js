@@ -610,7 +610,9 @@ function initCore() {
             (typeof navigator !== "undefined" && navigator.hardwareConcurrency)
                 ? Number(navigator.hardwareConcurrency) | 0
                 : 0;
-        return Math.max(1, Math.min(256, reported || 1));
+        // Leave cores for UI, MIDI parser/prefetch, visual cache and audio (HANDOFF §25).
+        const reserve = reported >= 8 ? 4 : (reported >= 4 ? 2 : 0);
+        return Math.max(1, Math.min(256, (reported || 1) - reserve));
     })();
 
     const initialized = Module._ssw_init_ex(

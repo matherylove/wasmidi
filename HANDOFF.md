@@ -2332,4 +2332,38 @@ workers: 82 ms de CPU total por bloque en la zona densa (rev. 40: ~150); zona li
 rev. 41 en el contenedor, así que la corrección se apoya en el diseño (un solo
 escritor por arreglo), no en una prueba. Falta la prueba en navegador.
 
-Última revisión entregada: `wasmidi-main-rev41.1-openlist-owner.zip`.
+Revisión anterior entregada: `wasmidi-main-rev41.1-openlist-owner.zip`.
+
+---
+
+## 25. Revisión 42 — lentitud durante la precarga: competencia de hilos
+
+**Reporte del usuario (rev. 41.1):** el rendimiento mejoró claramente, pero sigue
+ralentizándose en las mismas partes, y **ocurre mientras la app hace la precarga**.
+
+**Lectura del código:** mientras reproduce, el worker del parser (`midi-parser-worker.js`)
+arma en segundo plano un horizonte de 64 pantallas de páginas visuales y el barrido del
+renderer; el `visual-cache-worker` y el hilo de UI también trabajan. Todo eso compite
+por núcleos con los workers del synth. Con Workers en Auto = `hardwareConcurrency`, el
+motor tiene un worker por hilo lógico, así que durante la precarga hay más hilos
+ocupados que núcleos. El motor sincroniza todos sus workers en barreras en cada bloque:
+basta que el sistema desaloje uno (en Windows, un quantum es ~15 ms) para que el bloque
+entero espere. Cuando termina la precarga, esos hilos quedan libres y deja de pasar.
+Además, los lotes de eventos del synth salen del mismo hilo del parser que arma las
+páginas visuales; una página es un trabajo que no se interrumpe, así que un lote puede
+esperar a que termine (el código ya prioriza el synth entre páginas, no dentro de una).
+
+**Cambio:** Auto ahora deja hilos libres: `workers = reportados − 4` (−2 con menos de 8,
+nada con menos de 4). Un valor explícito sigue ganando sin cambios. En la zona densa
+esto no cuesta: el camino crítico es el worker de la tecla caliente (§23) y el render
+es barato. Tooltip de Workers actualizado.
+
+**Pruebas pedidas al usuario:**
+1. Misma parte con Auto (rev. 42) durante la precarga.
+2. Dejar que la precarga termine, volver antes de la parte y reproducir. Si ya no se
+   ralentiza, el problema restante es de planificación entre hilos, no del motor.
+
+Lo que queda del motor en la zona más densa (101-104 s): el worker de la tecla caliente
+hace ~12 ms nativos por bloque (§24), que en wasm siguen superando los 11,6 ms.
+
+Última revisión entregada: `wasmidi-main-rev42-auto-reserve.zip`.

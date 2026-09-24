@@ -1193,7 +1193,7 @@ Item {
                                 text = String(root.mainWindow.synthWorkers)
                             }
                             ToolTip.visible: hovered
-                            ToolTip.text: "0 = every logical thread the browser reports. Brave and some others under-report this for fingerprinting defence, so 0 can give far fewer workers than the CPU has; set the count explicitly and it wins over the reported value. The voice pool is divided across the workers. Free voices are handed back to the shared pool every cycle (REBAL/s), so a worker never drops or steals a note while another worker has an idle free voice; a worker still steals only voices it owns. Watch VOICES/WKR, STEALS/s and DROPPED together."
+                            ToolTip.text: "0 = the logical threads the browser reports, minus 4 (minus 2 below 8 threads) left for the UI, MIDI parser/preload and audio. Brave and some others under-report this for fingerprinting defence, so 0 can give far fewer workers than the CPU has; set the count explicitly and it wins over the reported value. The voice pool is divided across the workers. Free voices are handed back to the shared pool every cycle (REBAL/s), so a worker never drops or steals a note while another worker has an idle free voice; a worker still steals only voices it owns. Watch VOICES/WKR, STEALS/s and DROPPED together."
                         }
 
                         Item { Layout.fillWidth: true }
