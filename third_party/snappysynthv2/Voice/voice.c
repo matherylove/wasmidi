@@ -3101,12 +3101,23 @@ void voice_set_admit_budget_us(int us) { InterlockedExchange(&g_admit_budget_us,
 int voice_get_admit_budget_us(void) { return (int)load_relaxed_long(&g_admit_budget_us); }
 int voice_get_admit_limited_notes(void) { return (int)load_relaxed_long(&g_admit_limited_notes); }
 /* rev. 47: loudness bins (velocity amp x stack x channel gain, 1.5 dB each, 96 = unity). */
-static volatile LONG g_admit_floor_bin = 0;
-static volatile LONG g_admit_hist[128];
-void voice_set_admit_floor_bin(int bin) { InterlockedExchange(&g_admit_floor_bin, bin < 0 ? 0 : bin > 128 ? 128 : bin); }
-int voice_get_admit_floor_bin(void) { return (int)load_relaxed_long(&g_admit_floor_bin); }
-void voice_take_admit_hist(int *out128) {
-    for (int b = 0; b < 128; ++b) out128[b] = (int)InterlockedExchange(&g_admit_hist[b], 0);
+/* rev. 52: per worker cap of note-ons per (channel, key) and cycle (HANDOFF sec. 41). */
+#define SSW_ADMIT_MAX_WORKERS 256
+static volatile LONG g_admit_key_cap[SSW_ADMIT_MAX_WORKERS];
+static volatile LONG g_admit_key_max[SSW_ADMIT_MAX_WORKERS];
+static volatile LONG g_admit_work_us[SSW_ADMIT_MAX_WORKERS];
+void voice_set_admit_key_cap(int worker, int cap) {
+    if (worker >= 0 && worker < SSW_ADMIT_MAX_WORKERS)
+        InterlockedExchange(&g_admit_key_cap[worker], cap < 0 ? 0 : cap);
+}
+int voice_get_admit_key_cap(int worker) {
+    return worker >= 0 && worker < SSW_ADMIT_MAX_WORKERS ? (int)load_relaxed_long(&g_admit_key_cap[worker]) : 0;
+}
+int voice_get_admit_key_max(int worker) {
+    return worker >= 0 && worker < SSW_ADMIT_MAX_WORKERS ? (int)load_relaxed_long(&g_admit_key_max[worker]) : 0;
+}
+int voice_get_admit_work_us(int worker) {
+    return worker >= 0 && worker < SSW_ADMIT_MAX_WORKERS ? (int)load_relaxed_long(&g_admit_work_us[worker]) : 0;
 }
 int voice_get_path_simd_voice(void) { return (int)g_path_simd_voice_last; }
 
@@ -3982,9 +3993,12 @@ admit_t0.QuadPart = 0;
 admit_freq.QuadPart = 1;
 if (admit_budget_us > 0) { QueryPerformanceFrequency(&admit_freq); QueryPerformanceCounter(&admit_t0); }
 int admit_over = 0, admit_checks = 0, admit_limited = 0;
-const int admit_floor_bin = (int)load_relaxed_long(&g_admit_floor_bin);
-int admit_hist[128];
-memset(admit_hist, 0, sizeof(admit_hist));
+const int admit_key_cap = widx < SSW_ADMIT_MAX_WORKERS ? (int)load_relaxed_long(&g_admit_key_cap[widx]) : 0;
+static __thread uint16_t admit_key_count[MIDI_CHANNEL_COUNT * MIDI_KEY_COUNT];
+memset(admit_key_count, 0, sizeof(admit_key_count));
+int admit_key_max = 0;
+LARGE_INTEGER admit_work_t0;
+QueryPerformanceCounter(&admit_work_t0);
 LARGE_INTEGER ss_cycle_begin;
 if (ss_profile) QueryPerformanceCounter(&ss_cycle_begin);
                                                                                                                                                                                                                                                                 if (load_relaxed_long(&g_quit_flag)) return SSW_WORKER_CYCLE_QUIT;
@@ -4096,12 +4110,10 @@ wd->vor_fast_voice_plus_one[e.ch][e.key] = 0;
 #endif
 
 {
-    const float admit_loud = midi_vel_to_amp(e.value) * (float)event_stack_count * g_channel_render[e.ch].gain_mul;
-    int admit_bin = admit_loud > 0.0f ? (int)(log2f(admit_loud) * 4.0f) + 96 : 0;
-    if (admit_bin < 0) admit_bin = 0;
-    if (admit_bin > 127) admit_bin = 127;
-    ++admit_hist[admit_bin];
-    if (admit_bin < admit_floor_bin) { ++wd->drops_local; ++admit_limited; continue; }
+    uint16_t *admit_slot = &admit_key_count[(e.ch & 15) * MIDI_KEY_COUNT + (e.key & 0x7F)];
+    if (*admit_slot < 0xFFFFu) ++*admit_slot;
+    if ((int)*admit_slot > admit_key_max) admit_key_max = (int)*admit_slot;
+    if (admit_key_cap > 0 && (int)*admit_slot > admit_key_cap) { ++wd->drops_local; ++admit_limited; continue; }
 }
 if (admit_budget_us > 0) {
     if (!admit_over && ((++admit_checks) & 15) == 0) {
@@ -4692,7 +4704,14 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                  if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 0;
                                                                                                                                                                                                                                                                  wd->last_key_off_epoch = load_relaxed_long(&g_key_off_epoch);
 if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
-for (int ab = 0; ab < 128; ++ab) if (admit_hist[ab]) InterlockedAdd(&g_admit_hist[ab], admit_hist[ab]);
+if (widx < SSW_ADMIT_MAX_WORKERS) {
+    InterlockedExchange(&g_admit_key_max[widx], admit_key_max);
+    LARGE_INTEGER admit_work_t1, admit_work_freq;
+    QueryPerformanceCounter(&admit_work_t1);
+    QueryPerformanceFrequency(&admit_work_freq);
+    InterlockedExchange(&g_admit_work_us[widx],
+        (LONG)((admit_work_t1.QuadPart - admit_work_t0.QuadPart) * 1000000 / admit_work_freq.QuadPart));
+}
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();
@@ -4742,7 +4761,14 @@ for (int ab = 0; ab < 128; ++ab) if (admit_hist[ab]) InterlockedAdd(&g_admit_his
 
                                                                                                                                                                                                                                                                 // If to_copy was 0 we do not reserve any entries; ensure consistency
 if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
-for (int ab = 0; ab < 128; ++ab) if (admit_hist[ab]) InterlockedAdd(&g_admit_hist[ab], admit_hist[ab]);
+if (widx < SSW_ADMIT_MAX_WORKERS) {
+    InterlockedExchange(&g_admit_key_max[widx], admit_key_max);
+    LARGE_INTEGER admit_work_t1, admit_work_freq;
+    QueryPerformanceCounter(&admit_work_t1);
+    QueryPerformanceFrequency(&admit_work_freq);
+    InterlockedExchange(&g_admit_work_us[widx],
+        (LONG)((admit_work_t1.QuadPart - admit_work_t0.QuadPart) * 1000000 / admit_work_freq.QuadPart));
+}
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();

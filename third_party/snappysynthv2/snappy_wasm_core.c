@@ -21,7 +21,12 @@ static int    g_render_budget = 1;
 /* rev. 45 (HANDOFF §29): keep block render time under this % of real time; 0 = off. */
 static int    g_render_limit_percent = 100;
 static double g_render_limit_ema_us = 0.0;
-static double g_render_limit_allow = -1.0;
+#define SSW_LIMIT_MAX_WORKERS 256
+static void ssw_render_limit_clear(void) {
+    for (int w = 0; w < SSW_LIMIT_MAX_WORKERS; ++w)
+        if (voice_get_admit_key_cap(w) > 0) voice_set_admit_key_cap(w, 0);
+    if (voice_get_admit_budget_us() > 0) voice_set_admit_budget_us(0);
+}
 static double g_render_load_ema = -1.0;
 /* Cost of the most recent block, in microseconds of wall clock. Together with
  * the load EMA this separates "out of CPU" from "out of data": both produce
@@ -741,6 +746,7 @@ int ssw_init_ex(int sample_rate,
                 int fast_note_off,
                 int validate_state,
                 int soft_clip) {
+    ssw_render_limit_clear();
     if (g_ready) voice_shutdown();
     g_ready = 0;
 
@@ -992,9 +998,7 @@ void ssw_set_soft_clip(int enabled) {
 
 void ssw_reset(void) {
     g_render_limit_ema_us = 0.0;
-    g_render_limit_allow = -1.0;
-    voice_set_admit_floor_bin(0);
-    voice_set_admit_budget_us(0);
+    ssw_render_limit_clear();
     if (!g_ready) return;
     gs_reset_part_map(0);
     apply_gm_reset_at_qpc(g_render_cursor);
@@ -1411,54 +1415,49 @@ events_done:
         g_last_dispatch_us = g_dispatch_accum_us;
         ssw_update_render_budget(elapsed_ms, frames);
         if (g_render_limit_percent > 0 && frames > 0) {
-            /* Over the limit, admit only the loudest note-ons, sized from this block's
-               loudness histogram; the time budget is the last resort (HANDOFF sec. 31). */
-            int hist[128];
-            voice_take_admit_hist(hist);
+            /* Over the limit, the workers that set the block time cap how many
+               note-ons each (channel, key) may start per cycle: spam keys shed
+               notes, sparse keys (melody) never do (HANDOFF sec. 41). */
             const double target_us = (double)g_render_limit_percent * 10000.0 * (double)frames /
                 (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
             g_render_limit_ema_us = g_render_limit_ema_us * 0.75 + elapsed_ms * 1000.0 * 0.25;
             const double spent_us = g_render_limit_ema_us;
-            int floor_bin = voice_get_admit_floor_bin();
+            int workers = voice_get_worker_count();
+            if (workers > SSW_LIMIT_MAX_WORKERS) workers = SSW_LIMIT_MAX_WORKERS;
             int budget = voice_get_admit_budget_us();
-            double admitted = 0.0, total = 0.0;
-            for (int b = 0; b < 128; ++b) { total += hist[b]; if (b >= floor_bin) admitted += hist[b]; }
-            if (spent_us > target_us) {
-                if (g_render_limit_allow < 0.0 || admitted < g_render_limit_allow)
-                    g_render_limit_allow = admitted;
-                if (g_render_limit_allow > 8.0) {
-                    g_render_limit_allow *= 0.8;
-                } else {
-                    g_render_limit_allow = 8.0;
-                    budget = budget > 0 ? (budget * 3) / 4 : (int)(target_us * 0.5);
-                    if (budget < 200) budget = 200;
-                    voice_set_admit_budget_us(budget);
-                }
-            } else if (spent_us < target_us * 0.85 && g_render_limit_allow >= 0.0) {
-                if (budget > 0) {
-                    budget += budget / 8 + 50;
-                    voice_set_admit_budget_us(budget > (int)(target_us * 4.0) ? 0 : budget);
-                } else {
-                    g_render_limit_allow = g_render_limit_allow * 1.1 + 8.0;
-                    if (g_render_limit_allow > total * 2.0 + 64.0) g_render_limit_allow = -1.0;
-                }
+            double slowest = 0.0;
+            for (int w = 0; w < workers; ++w) {
+                const double us = (double)voice_get_admit_work_us(w);
+                if (us > slowest) slowest = us;
             }
-            int next_floor = 0;
-            if (g_render_limit_allow >= 0.0) {
-                double kept = 0.0;
-                next_floor = 128;
-                for (int b = 127; b >= 0; --b) {
-                    if (kept + hist[b] > g_render_limit_allow) break;
-                    kept += hist[b];
-                    next_floor = b;
+            int all_at_min = 1, any_limited = 0;
+            for (int w = 0; w < workers; ++w) {
+                const double work_us = (double)voice_get_admit_work_us(w);
+                const int bottleneck = work_us >= slowest * 0.6 && work_us > target_us * 0.25;
+                const int key_max = voice_get_admit_key_max(w);
+                int cap = voice_get_admit_key_cap(w);
+                if (spent_us > target_us && bottleneck) {
+                    if (cap == 0) cap = key_max > 2 ? key_max / 2 : 1;
+                    else cap = cap > 1 ? (cap * 4) / 5 : 1;
+                    if (cap < 1) cap = 1;
+                } else if (cap > 0 && (spent_us < target_us * 0.85 || !bottleneck)) {
+                    cap += cap / 4 + 1;
+                    if (cap > key_max * 2 + 4) cap = 0;
                 }
+                if (cap > 0) { any_limited = 1; if (cap > 1) all_at_min = 0; }
+                if (cap != voice_get_admit_key_cap(w)) voice_set_admit_key_cap(w, cap);
             }
-            if (next_floor != floor_bin) voice_set_admit_floor_bin(next_floor);
+            if (spent_us > target_us && any_limited && all_at_min) {
+                budget = budget > 0 ? (budget * 3) / 4 : (int)(target_us * 0.5);
+                if (budget < 200) budget = 200;
+                voice_set_admit_budget_us(budget);
+            } else if (budget > 0 && spent_us < target_us * 0.7) {
+                budget += budget / 8 + 50;
+                voice_set_admit_budget_us(budget > (int)(target_us * 4.0) ? 0 : budget);
+            }
         } else {
             g_render_limit_ema_us = 0.0;
-            g_render_limit_allow = -1.0;
-            if (voice_get_admit_budget_us() > 0) voice_set_admit_budget_us(0);
-            if (voice_get_admit_floor_bin() > 0) voice_set_admit_floor_bin(0);
+            ssw_render_limit_clear();
         }
     }
     return 1;
@@ -1523,7 +1522,7 @@ void ssw_set_render_limit_percent(int percent) { g_render_limit_percent = percen
 int ssw_render_limit_percent(void) { return g_render_limit_percent; }
 int ssw_admit_budget_us(void) { return voice_get_admit_budget_us(); }
 int ssw_limited_notes(void) { return voice_get_admit_limited_notes(); }
-int ssw_admit_floor_bin(void) { return voice_get_admit_floor_bin(); }
+int ssw_admit_key_cap(int worker) { return voice_get_admit_key_cap(worker); }
 int ssw_detected_cores(void) { return voice_get_detected_cores(); }
 
 /*

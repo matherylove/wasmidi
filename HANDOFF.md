@@ -2927,4 +2927,117 @@ Worker.
 
 **Siguiente (fase 3):** rangos difíciles sembrados al cargar, como BPFA.
 
-Última revisión entregada: `wasmidi-main-rev50-bpfa-tiles.zip`.
+Revisión anterior entregada: `wasmidi-main-rev50-bpfa-tiles.zip` (CI falló por el manifest, ver §39).
+
+---
+
+## 39. Revisión 50.1 — CI: manifest desactualizado por README.md
+
+**Falla del CI (rev. 50):** `MANIFEST.sha256 is stale ... MISMATCH: README.md`. El
+README del repo del usuario no coincide con ninguna versión entregada (ni la de rev. 39
+ni la de rev. 47.1+, ni sus variantes con CRLF), así que en el repo tiene contenido
+propio. El resto de los chequeos pasó (scheduler, freelists, VOR, pump, compositor con
+la regla nueva). El `#pragma message` de `voice.c` es solo una nota de compilación.
+
+**Cambio:** `README.md` sale de la lista de `tools/regen_manifest.py`: es documentación
+que el usuario edita directo en el repo y no tiene sentido que frene el build. El
+manifest ahora cubre 41 archivos. El README del zip no se aplica encima del del repo.
+
+Revisión anterior entregada: `wasmidi-main-rev50.1-manifest.zip`.
+
+---
+
+## 40. Revisión 51 — el límite recorta solo en los workers que marcan el tiempo
+
+**Reporte del usuario (rev. 50, "Axley - Quarantine Project 2", 69M notas, pico 5,4M
+NPS, 24576 voces, 24 workers):** la velocidad mejoró, pero el búfer de frames se sigue
+agotando en las zonas fuertes (en la captura el roll queda vacío con el teclado
+encendido) y WasmiSynth sigue comiéndose notas audibles importantes.
+
+**Causa del audio:** el tiempo del bloque lo fija el worker más lento (el de las teclas
+calientes, §23), pero rev. 47 bajaba el piso de sonoridad para **todos** los workers.
+Las notas de melodía en teclas atendidas por workers ociosos se descartaban sin ahorrar
+nada en el camino crítico.
+
+**Cambio (`Voice/voice.c`, `snappy_wasm_core.c`):**
+
+- Histograma de sonoridad, piso y tiempo de trabajo **por worker**
+  (`g_admit_hist[w][128]`, `g_admit_floor_bin[w]`, `g_admit_work_us[w]`; hasta 256
+  workers). Cada worker mide su fase previa (QPC al empezar el ciclo y antes de la
+  barrera de producers) y la publica al terminar.
+- Controlador: sobre el 100% (promedio móvil), solo un worker "cuello" recorta
+  (trabajo ≥ 60% del más lento y > 25% del bloque). Los demás tienen piso 0 y liberan
+  su `allow` si lo tenían. El corte por tiempo sigue como último recurso cuando todos
+  los que recortan llegaron al mínimo. `ssw_render_limit_clear()` en init y en reset.
+- Harness del scheduler: stubs actualizados.
+
+**Medición (host, 1 núcleo, 16 workers, 98-106 s de Hypernova, contra el mismo motor
+sin límite):**
+
+| Versión | Nivel medio | Peor ventana 50 ms | Correlación de envolvente |
+|---|---|---|---|
+| rev. 46 | −2,5 dB | 41,5 dB más baja | −0,03 |
+| rev. 47 | +0,5 dB | 1,5 dB más baja | 0,67 |
+| rev. 51 | +0,4 dB | 0,9 dB más baja | **0,82** |
+
+Solo los workers 0 y 15 (teclas 0 y 127) recortan; el resto queda con piso 0. En este
+contenedor el bloque no baja de ~40 ms porque con 1 núcleo el cuello es la CPU total,
+no el camino crítico; en una máquina real el recorte ataca justo el camino crítico.
+
+**Frames (sin cambio de código, análisis):** los tiles de rev. 50 solo aligeran el
+dibujo en la GPU. Lo que se agota es la preparación: el worker del parser genera el
+barrido de todas las notas (5,4M/s), el hilo principal las copia al ring y las sube
+enteras a la GPU, y recién ahí se cullean. En BPFA el culling ocurre en hilos de fondo
+sobre el MIDI preprocesado y el hilo principal solo sube tiles terminados. El paso
+equivalente acá: armar los tiles culleados fuera del hilo principal, donde está el
+MIDI, y mandar solo sobrevivientes (en Hypernova denso se descartan >57% solo por
+duplicados). Es un cambio de arquitectura; pendiente de aprobación.
+
+Revisión anterior entregada: `wasmidi-main-rev51-limit-per-worker.zip`.
+
+---
+
+## 41. Revisión 52 — el límite corta notas repetidas por tecla, no por sonoridad
+
+**Reporte del usuario (rev. 51):** sigue comiéndose muchas notas audibles. Aprobó el
+cambio de arquitectura de frames (§40).
+
+**Causa:** el worker cuello atiende varias teclas (con 24 workers, el de la tecla 0
+también atiende 24, 48, 72, 96, 120: los Do de la melodía). El piso de sonoridad
+comparaba la melodía con el spam de la tecla 0, que por venir apilado estima más
+fuerte, y la melodía perdía.
+
+**Cambio (`Voice/voice.c`, `snappy_wasm_core.c`):** en vez del piso de sonoridad, los
+workers cuello ponen un **tope de note-ons por (canal, tecla) y ciclo**. El primer
+note-on de cada tecla en el ciclo siempre entra; se descartan solo los que se repiten
+en la misma tecla más veces que el tope. Una tecla con notas esparcidas (melodía) nunca
+llega al tope; una tecla de spam sí, y ahí cada nota extra aporta casi nada porque la
+enmascaran las demás. Cada worker publica el máximo de note-ons en una sola tecla del
+ciclo; el controlador arranca el tope en la mitad de ese máximo, lo baja ×0,8 por bloque
+lento hasta 1 y lo sube +25% cuando sobra tiempo, hasta quitarlo. Los apilados VOR
+por la vía rápida nunca cuentan. El corte por tiempo sigue como último recurso con
+todos los topes en 1.
+
+**Medición (host, Hypernova 98-106 s, contra sin límite):**
+
+| Versión | Nivel medio | Peor ventana 50 ms | Correlación de envolvente | Notas cortadas por el límite |
+|---|---|---|---|---|
+| rev. 47 | +0,5 dB | 1,5 dB | 0,67 | — |
+| rev. 51 | +0,4 dB | 0,9 dB | 0,82 | ~1,3M |
+| rev. 52 | −0,1 dB | 2,0 dB | **0,95** | ~0,24M |
+
+**Otro hallazgo:** con la config del usuario (24576 voces, 24 workers) y sin límite, en
+1:41-1:44 el pool se llena igual (quedan ~200-300 voces libres) y el stealer descarta
+~450-580k notas/s porque no encuentra víctima. Ese descarte es del algoritmo de SSv2 (el
+nativo hace lo mismo con esas voces) y es independiente del límite.
+
+**Plan de frames aprobado (siguiente revisión):** en modo remoto el hilo principal usa
+solo el ring Sharp (el constructor de páginas visuales del parser está desactivado a
+propósito). `MidiMappedStore::buildVisualPage(start, end)` ya arma en C++ la lista de
+notas de un rango: se reusa para construir en el worker del parser los tiles de
+`k·W` y pasarles `CullViewport` (el compositor es C++ puro) antes de transferirlos.
+El renderer dibuja tiles primero y usa el ring solo donde falte un tile, lo que
+permite reducir el barrido Sharp. Así el hilo principal deja de copiar y subir todas
+las notas.
+
+Última revisión entregada: `wasmidi-main-rev52-limit-per-key.zip`.
