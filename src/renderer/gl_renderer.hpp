@@ -1,5 +1,6 @@
 #pragma once
 
+#include "note_raster_compositor.hpp"
 #include <GLES3/gl3.h>
 
 #include "../midi/midi_parser.hpp"
@@ -119,6 +120,26 @@ private:
     void drawSharpRing(uint32_t currentTick, uint32_t viewStart,
                        uint32_t viewEnd, uint32_t windowTicks,
                        bool notesReady = true);
+    void drawSharpRingRange(uint32_t viewEnd, bool notesReady);
+
+    // BPFA-style culled tile cache (HANDOFF sec. 38).
+    struct CullTile {
+        uint32_t index = 0;
+        GLuint vbo = 0;
+        uint32_t count = 0;
+        bool raw = false;
+    };
+    void updateCullTiles(uint32_t viewStart, uint32_t windowTicks);
+    void buildCullTile(uint32_t index, uint32_t windowTicks);
+    void releaseCullTiles();
+    const CullTile* findCullTile(uint32_t index) const;
+    std::vector<CullTile> cullTiles_;
+    uint64_t cullSignature_ = 0;
+    uint64_t sharpRingEpoch_ = 0;
+    GLuint cullVao_ = 0;
+    std::vector<CompositorNote> cullInput_;
+    CompositorScratch cullScratch_;
+    CompositorResult cullResult_;
 
     struct VisualPage {
         uint32_t spanTicks = 0;

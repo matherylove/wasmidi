@@ -89,13 +89,13 @@ void CullViewport(
         // including the order of the operations. A faster fixed-point form was
         // tried and rounded differently, which let the culler drop notes that
         // did own a pixel. Keep it as written.
-        int left = static_cast<int>(std::floor(
-            widthAsDouble * (static_cast<double>(noteStart - viewStart) / span)));
+        // Pixel-centre coverage, as the GPU rasterizes the quad (HANDOFF sec. 38):
+        // column c is covered when c + 0.5 lies in [x0, x1). A quad that covers
+        // no centre emits no fragment, so it owns nothing and may be culled.
+        int left = static_cast<int>(std::ceil(
+            widthAsDouble * (static_cast<double>(noteStart - viewStart) / span) - 0.5));
         int right = static_cast<int>(std::ceil(
-            widthAsDouble * (static_cast<double>(noteEnd - viewStart) / span)));
-        // A note thinner than a cell still covers the cell it falls in; the
-        // renderer draws it, so culling it would remove a visible pixel.
-        if (right <= left) right = left + 1;
+            widthAsDouble * (static_cast<double>(noteEnd - viewStart) / span) - 0.5));
         if (left < 0) left = 0;
         if (right > width) right = width;
         if (right <= left)

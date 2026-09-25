@@ -27,6 +27,8 @@ qt_add_executable(wasmidi
     src/midi/scheduler.hpp
     src/renderer/gl_renderer.cpp
     src/renderer/gl_renderer.hpp
+    src/renderer/note_raster_compositor.cpp
+    src/renderer/note_raster_compositor.hpp
 )
 
 qt_add_qml_module(wasmidi

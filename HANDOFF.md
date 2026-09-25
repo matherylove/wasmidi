@@ -377,6 +377,11 @@ stealer sin una medición que lo exija.
     el contenedor (1 núcleo) no se manifiesta; en el navegador cuelga un worker. Toda
     estructura nueva debe tener un único hilo escritor, y las pruebas de host con 1
     núcleo no demuestran ausencia de carreras.
+13. **Acortar el horizonte de precarga visual para contener el ring** (rev. 48). La
+    densidad estimada desde lo residente (`sharpTail_` → cabeza preparada sobre
+    `viewStart` → `sharpRemoteSafeThrough_`) sale inflada, porque la cola retiene notas
+    largas que empezaron mucho antes de `viewStart`; el horizonte caía al mínimo de 4
+    pantallas y los frames se perdían mucho antes. No tocar el horizonte sin medirlo.
 
 ---
 
@@ -2721,4 +2726,205 @@ no se podía compilar fuera del CI. Único warning: `-Wclass-memaccess` en la l�
 - **Conectar el culler** después de 7.3, con depth test apagado o z constante en el
   pase de notas (el orden lo impone el culler). Regla vigente: no cambiar cómo se ve.
 
-Última revisión entregada: `wasmidi-main-rev48-renderer-horizon.zip`.
+Revisión anterior entregada: `wasmidi-main-rev48-renderer-horizon.zip` (empeoró, ver §35).
+
+---
+
+## 35. Revisión 48.1 — se revierte el horizonte de rev. 48
+
+**Reporte del usuario (rev. 48):** el rendimiento empeoró y empezó a perder frames
+mucho antes.
+
+**Lectura:** el cambio acortaba el horizonte de precarga. La densidad "residente" se
+calculaba dividiendo las notas entre la cola del ring y la cabeza preparada por los
+ticks desde `viewStart`, pero la cola conserva notas largas que empezaron antes de la
+vista: la densidad salía inflada, el horizonte caía a 4 pantallas en zonas normales y
+el renderer quedaba sin frames preparados ante cualquier demora del worker.
+
+**Cambio:** `calculateSharpView()` vuelve exactamente a rev. 47 (densidad promedio de
+la canción, presupuesto 0,55 × max(ring, 2^23)). Se conserva solo el `console.warn`
+de `allocateRing()` cuando el ring crece, que no cambia nada del dibujo ni del flujo.
+Diff contra rev. 47: únicamente esas líneas.
+
+**Cómo seguir con 7.8:** no achicar el horizonte. La prueba pendiente es la misma:
+Hypernova en 1:41 con la consola abierta.
+- Si aparece "WASMIDI renderer ring grows" justo cuando se frenan los frames, la
+  causa es el crecimiento del ring. El arreglo va del lado de la instalación
+  (`flushRemoteSharpBatches`): no instalar lotes lejanos que obliguen a crecer, sin
+  tocar cuántas pantallas se piden.
+- Si no aparece, la hipótesis de 7.8 es falsa y hay que buscar en otro lado.
+
+Revisión anterior entregada: `wasmidi-main-rev48.1-renderer-revert.zip`.
+
+---
+
+## 36. 7.3 + culler: análisis antes de implementar (sin cambios de código)
+
+**Decisión del usuario:** dejar 7.8 de lado y pasar a los otros pendientes del renderer
+(7.3 prerender con caché de tiles y conectar el culler).
+
+**Lo que muestra el código actual:**
+
+1. **Regla de capas.** `drawSharpRing()` dibuja con depth test `GL_LESS` y
+   `z = (end - start) / 2^24`: la nota **más corta queda arriba**; a igual duración gana
+   la primera dibujada. El culler (`note_raster_compositor`) usa la regla de BPFA: la
+   que **empieza después queda arriba**. Su cabecera dice que la regla de WASMIDI "se
+   dejó a pedido", pero el renderer nunca se cambió. Conectarlo cambia qué color se ve
+   donde se superponen notas.
+2. **Exactitud del prerender.** El culler es exacto a resolución de píxel para *un*
+   frame (inicio de vista y ancho exactos). En tiempo real los ticks de cada frame no
+   se conocen de antemano, así que un caché calculado con otro alineamiento puede
+   diferir en astillas de un píxel. Por frame, en cambio, cuesta 21,8 ms por 1M notas
+   (más que un frame).
+3. **Hilos.** La app Qt no se compila con pthreads (solo el core del synth). Un
+   "hilo de fondo" sería un Web Worker sin acceso al ring del hilo principal: habría que
+   copiarle las notas o hacerlo en el worker del parser (que ya compite con el synth).
+4. **Transparencia:** blending apagado y `uTransparencyEnabled = 0`: las notas son
+   opacas, así que quitar notas ocultas no cambia píxeles.
+
+**Alternativa exacta medida:** eliminar notas **idénticas** a una anterior (misma
+tecla, mismo inicio, mismo fin, cualquier pista/canal). Con la regla actual, a igual
+duración gana la primera dibujada, y dos notas idénticas cubren exactamente los mismos
+píxeles a cualquier resolución: la segunda nunca se ve. En Hypernova, de las 12,7M
+notas que empiezan entre los ticks 600000 y 680000 (zona densa), **7,2M (56,8%) son
+duplicados exactos**. No depende del frame, no necesita culling por frame ni hilos, y
+se puede hacer en el worker del parser al armar el barrido (también achica la
+transferencia y el ring). Complicación: el barrido estilo SharpMIDI agrega notas
+abiertas y las cierra después, así que el duplicado recién se conoce al cerrar.
+
+**Pregunta abierta al usuario:** (A) eliminación exacta de duplicados, sin cambio
+visual; o (B) el plan original de 7.3 + culler, aceptando cambiar la regla de capas y
+diferencias de un píxel.
+
+**Decisión del usuario (§36):** hacerlo como lo maneja BPFA: su regla de capas (la que
+empieza después queda arriba; a igual inicio, la de mayor orden de fuente) y su
+esquema de `NoteMeshCache` (hilos de fondo, hasta 64 pantallas por delante, caché por
+firma de settings + tick de inicio, invalidación por generación en el seek). Se
+mantiene la salida del culler como **notas** (mismo shader, paleta, glow) salvo la
+regla de capas.
+
+**Bloqueo:** el repo solo tiene el compositor ya portado; el código de BPFA
+(`linux/NoteMeshCache.cpp` y lo que agenda sus frames) no está disponible en esta
+sesión, y el resumen de `PORTING_STATUS.md` no alcanza para replicarlo con exactitud
+(en particular, cómo elige el tick de inicio de cada frame en reproducción en tiempo
+real). Pedido al usuario: esos archivos.
+
+---
+
+## 37. Revisión 49 — BPFA: cómo lo hace y fase 1 (regla de capas)
+
+**Fuente:** el usuario aportó el repo de BPFA (`BPFA-master-latest.7z`; extraído con un
+lector 7z propio en Python porque el contenedor no tiene `7z`). Archivos clave:
+`linux/NoteMeshCache.{h,cpp}` y `PianoFromAbove/PreprocessedMidi.{h,cpp}`.
+**Licencia de BPFA: "All Rights Reserved" (EULA de Piano From Above).** No copiar su
+código a WASMIDI; implementar el diseño.
+
+**Cómo funciona `NoteMeshCache` (lo que antes faltaba):**
+
+- **Tiles alineados a una grilla fija**, no por frame: `base = floor(pos / span) ×
+  span`; cada tile cubre `[k·span, (k+1)·span)` completo, con `rasterHeight` filas.
+  El frame visible cae entre dos tiles y se dibujan desplazados. Así resuelve que en
+  tiempo real no se sepa el tick de cada frame: la exactitud es por tile, no por frame.
+- `RequestWindow(pos, settings, screens=64)`: pide los tiles de `base` a
+  `base + 64·span`, al frente de la cola; descarta pedidos y resultados fuera de esa
+  ventana (salvo los "difíciles"). Con firma de settings nueva: generación nueva y
+  cola vacía. Al cambiar de firma siembra también los rangos **difíciles**
+  (`GetDifficultTimeRanges`) con ±10 tiles, al final de la cola.
+- Workers: `max(2, min(32, hw>4 ? hw·3/4 : hw−1))` hilos con prioridad baja
+  (`setpriority(…, 3)`), cada uno toma pedidos del frente.
+- `Build`: rasteriza visitando notas visibles **en reverso**
+  (`VisitVisibleReverse`); cada celda queda con la nota de mayor `(start,
+  sourceOrder)`: **empieza después = arriba; a igual inicio, mayor sourceOrder**.
+  `sourceOrder` se asigna en orden de note-on del flujo fusionado. `fixInvisibleNotes`
+  fuerza al menos una fila. Después emite quads por corridas de celdas iguales.
+- `PopPrepared` entrega resultados de la generación vigente; `Release` al desalojar un
+  tile permite volver a pedirlo; `Invalidate` en el seek.
+
+**Fase 1 hecha (rev. 49):** `drawSharpRing()` dibuja con depth test **apagado**. El ring
+guarda las notas en orden de note-on del flujo fusionado (el mismo orden que
+`sourceOrder` de BPFA), así que "la última dibujada queda arriba" es exactamente la
+regla de BPFA. Antes: depth `GL_LESS` con `z = duración`, la más corta arriba. Cambia
+qué color se ve donde se superponen notas; es la parte visible de adoptar BPFA y lo
+que el culler asume. `tools/renderer_check/check.sh`: compila.
+
+**Plan de las fases siguientes (sin empezar):**
+
+- **Fase 2 — caché de tiles.** Tiles de `sharpStableWindowTicks_` alineados a la
+  grilla; raster de ancho = píxeles del área de notas y 128 filas de teclas (el roll de
+  WASMIDI es horizontal). Un tile se arma cuando está completo en el ring
+  (`sharpRemoteSafeThrough_ ≥ fin del tile`; las notas aún abiertas en ese punto
+  realmente siguen más allá). Salida: notas sobrevivientes (`note_raster_compositor`,
+  sin la geometría de BPFA, para no cambiar el shader), en orden de ring, a un VBO por
+  tile. Dibujo: por cada tile visible, scissor a su rango de x y draw instanciado con el
+  mismo shader; si un tile no está listo, se dibuja ese rango desde el ring como hoy.
+  Hasta 64 tiles por delante + 2 de historia; invalidación en seek, cambio de note
+  speed, ancho, colores por pista.
+- **Dónde corre el armado:** BPFA usa hilos; la app Qt de WASMIDI no tiene pthreads.
+  Primer paso propuesto: en el hilo principal con presupuesto por frame (un tile de
+  ~600k notas cuesta ~13 ms y se usa durante varios frames); si no alcanza, moverlo a
+  Web Workers.
+- **Fase 3 — rangos difíciles** sembrados al cargar, como BPFA.
+
+**Prueba pedida (fase 1):** mirar zonas con notas superpuestas; el color que queda
+arriba ahora es el de la nota que empieza después.
+
+Revisión anterior preparada: `wasmidi-main-rev49-bpfa-layering.zip` (no se llegó a entregar; su contenido está en rev. 50).
+
+---
+
+## 38. Revisión 50 — fase 2: caché de tiles culleados estilo BPFA
+
+**Pedido del usuario:** continuar con BPFA después de la fase 1 (§37, incluida acá).
+
+**Cambios:**
+
+- `src/renderer/gl_renderer.{hpp,cpp}`:
+  - `updateCullTiles()` (al inicio de `drawSharpRing`): solo en modo `remoteIndexed`.
+    Tiles de `windowTicks` alineados a la grilla (`k·W`). Firma: `W`, ancho del
+    framebuffer, colores por pista, `sharpRingEpoch_` (se incrementa en los 3 resets
+    del ring, o sea en cada seek) y documento; si cambia, se liberan todos. Se
+    desalojan los tiles detrás de la vista o a más de 64 por delante. Arma como mucho
+    2 tiles por frame o hasta 4 ms, en orden, y solo tiles completos
+    (`(k+1)·W ≤ sharpRemoteSafeThrough_`).
+  - `buildCullTile()`: toma del ring (desde `sharpTail_` hasta la cabeza preparada) las
+    notas con inicio < fin del tile y que no terminaron antes de su inicio; las abiertas
+    se tratan como abiertas hasta el fin del tile (`viewEndTick`), que es cierto porque
+    el tile está completo. Con menos de 50k notas el tile queda "crudo" (se dibuja
+    desde el ring como antes, porque culling no conviene). Si no, `CullViewport` con
+    raster = ancho del framebuffer y 128 teclas; los sobrevivientes van a un VBO propio
+    del tile (`GL_STATIC_DRAW`), en orden de ring.
+  - Dibujo: si algún tile visible está culleado, cada tile visible se dibuja con
+    scissor a sus columnas (una columna pertenece al tile donde cae su centro) con
+    `cullVao_`; los crudos o no listos, con el dibujo del ring de siempre
+    (`drawSharpRingRange`) bajo su scissor. Sin tiles culleados, igual que fase 1.
+  - `cullVao_` se crea con los 3 atributos instanciados y se borra en `destroy()`.
+- `src/renderer/note_raster_compositor.cpp`: cobertura por **centro de píxel**
+  (`ceil(x − 0,5)` en ambos bordes), igual que rasteriza la GPU (el contexto no usa
+  MSAA) y que BPFA (`floor(x + 0,5)`). Antes usaba `floor`/`ceil` "por contacto": una
+  nota de arriba reclamaba columnas que en pantalla no cubría y ocultaba notas
+  visibles. Una nota que no cubre ningún centro no emite fragmentos y se puede
+  descartar. `tools/note_raster_compositor_check.cpp` (en el CI) actualizado a ese
+  modelo: TODO OK.
+- `CMakeLists.txt`: `note_raster_compositor.{cpp,hpp}` ahora se compilan en la app.
+
+**Verificación (`tools/renderer_check/`):**
+
+- `check.sh`: `gl_renderer.cpp` y el compositor compilan (stubs de GL).
+- `cull_tile_sim.cpp`: modelo en CPU del dibujo (centro de píxel, última dibujada
+  gana), flujo sintético denso con duplicados, 1000 px para 1920 ticks:
+  - frames alineados a la grilla de tiles: **0 píxeles distintos** contra el dibujo
+    crudo (el culling es exacto);
+  - frames desalineados (el caso normal al reproducir): **0,135%** de píxeles con otro
+    color. Es la aproximación de la grilla fija de BPFA (el tile se decide en su
+    grilla, el frame cae corrido); BPFA además dibuja el raster mismo, así que su
+    diferencia es mayor.
+  - Los tiles conservan el 42,7% de las notas.
+
+**No probado:** nada en navegador. El armado corre en el hilo principal (la app no
+tiene pthreads): un tile de ~100k notas cuesta unos pocos ms nativos, más en wasm, y un
+armado no se puede partir; si se notan tirones, el siguiente paso es moverlo a un Web
+Worker.
+
+**Siguiente (fase 3):** rangos difíciles sembrados al cargar, como BPFA.
+
+Última revisión entregada: `wasmidi-main-rev50-bpfa-tiles.zip`.
