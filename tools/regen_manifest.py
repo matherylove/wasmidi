@@ -16,7 +16,6 @@ FILES = [
     "CMakeLists.txt",
     "HANDOFF.md",
     "PORTING_STATUS.md",
-    "README.md",
     "VALIDATION.md",
     "src/keyboard.cpp",
     "src/keyboard.hpp",

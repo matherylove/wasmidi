@@ -18,11 +18,13 @@ static double g_render_limit_ema_us = 0.0;
 static int t_admit_budget;
 static int voice_get_admit_budget_us(void) { return t_admit_budget; }
 static void voice_set_admit_budget_us(int us) { t_admit_budget = us; }
-static int t_admit_floor_bin;
-static int voice_get_admit_floor_bin(void) { return t_admit_floor_bin; }
-static void voice_set_admit_floor_bin(int v) { t_admit_floor_bin = v; }
-static void voice_take_admit_hist(int *h) { for (int b = 0; b < 128; ++b) h[b] = 0; }
-static double g_render_limit_allow = -1.0;
+static int voice_get_admit_key_cap(int w) { (void)w; return 0; }
+static void voice_set_admit_key_cap(int w, int v) { (void)w; (void)v; }
+static int voice_get_admit_key_max(int w) { (void)w; return 0; }
+static int voice_get_admit_work_us(int w) { (void)w; return 0; }
+static int voice_get_worker_count(void) { return 1; }
+#define SSW_LIMIT_MAX_WORKERS 256
+static void ssw_render_limit_clear(void) {}
 static double g_render_load_ema = -1.0;
 static int g_ready = 1;
 static double g_song_time_seconds = 0.0;
