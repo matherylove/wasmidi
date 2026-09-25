@@ -2160,6 +2160,12 @@ void GLRenderer::allocateRing(std::size_t capacity)
     std::size_t rounded = 1;
     while (rounded < std::max<std::size_t>(capacity, 2))
         rounded <<= 1;
+#ifdef __EMSCRIPTEN__
+    if (ringCapacity_ != 0 && rounded > ringCapacity_) {
+        EM_ASM({ console.warn("WASMIDI renderer ring grows", $0, "->", $1, "notes (HANDOFF sec. 34)"); },
+               double(ringCapacity_), double(rounded));
+    }
+#endif
 
     const std::size_t oldCapacity = ringCapacity_;
     const std::size_t oldMask = ringMask_;
@@ -2642,10 +2648,17 @@ void GLRenderer::calculateSharpView(
     const double notesPerTick = document_->maxTick > 0
         ? double(document_->noteCount) / double(document_->maxTick)
         : 0.0;
-    const double estimatedPerScreen =
+    double estimatedPerScreen =
         std::max(1.0, notesPerTick * double(windowTicks));
-    const double residentBudget =
-        double(std::max<std::size_t>(ringCapacity_, std::size_t(1) << 23)) * 0.55;
+    // Size the horizon from the density actually resident now, not only the song
+    // average, and never from a grown ring (HANDOFF sec. 34, pending 7.8).
+    const uint32_t residentHead = std::max(sharpHead_, sharpRemotePreparedHead_);
+    if (residentHead > sharpTail_ && sharpRemoteSafeThrough_ > viewStart) {
+        const double residentTicks = double(sharpRemoteSafeThrough_ - viewStart) + 1.0;
+        const double localPerTick = double(residentHead - sharpTail_) / residentTicks;
+        estimatedPerScreen = std::max(estimatedPerScreen, localPerTick * double(windowTicks));
+    }
+    const double residentBudget = double(std::size_t(1) << 23) * 0.55;
     // Keep a healthy multi-screen reserve, but do not let speculative
     // preprocessing consume the same CPU/Worker budget needed by audio and
     // live-state updates.  Pass 13.8 raised this to 12..96 screens and then

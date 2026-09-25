@@ -613,7 +613,12 @@ Item {
             Layout.fillWidth: true
             spacing: 5
 
-            SectionLabel { text: "SNAPPYSYNTH V2" }
+            SectionLabel {
+                text: "WASMISYNTH"
+                HoverHandler { id: wasmiSynthHover }
+                ToolTip.visible: wasmiSynthHover.hovered
+                ToolTip.text: "SnappySynthV2 for WASMIDI"
+            }
             Item { Layout.fillWidth: true }
 
             Rectangle {

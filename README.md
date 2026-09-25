@@ -9,7 +9,7 @@ Reproductor MIDI de alta densidad construido con **Qt para WebAssembly** y **Web
 - **Qt/QML** - Interfaz moderna y responsiva
 - **Black MIDI ready** - Miles de notas simultá¬°neas
 - **Salida MIDI nativa** - Web MIDI API
-- **Sintetizador embebido** - SnappySynth (SoundFont 2)
+- **Sintetizador embebido** - WasmiSynth, "SnappySynthV2 for WASMIDI" (SoundFont 2)
 
 ## 📦 Estructura del proyecto
 

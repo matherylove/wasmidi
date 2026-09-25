@@ -2619,4 +2619,106 @@ límite corta muchísimo porque el render solo ya casi llena el bloque).
 - WAV: `hypernova_96-106s_rev47_limit_worstcase_1core.wav` (peor caso).
 - Harness del scheduler actualizado con los stubs nuevos.
 
-Última revisión entregada: `wasmidi-main-rev47-loudness-limit.zip`.
+Revisión anterior entregada: `wasmidi-main-rev47-loudness-limit.zip`.
+
+---
+
+## 32. Nombre del fork: WasmiSynth
+
+**Decisión del usuario:** el fork del motor se llama **WasmiSynth**, con el slogan
+**"SnappySynthV2 for WASMIDI"**. Usar ese nombre de acá en adelante (también en
+sesiones con GPT).
+
+- Panel: el título de la sección pasó de "SNAPPYSYNTH V2" a "WASMISYNTH" (tooltip con
+  el slogan). README actualizado.
+- `third_party/snappysynthv2/UPSTREAM_NOTES.md`: nuevo encabezado y una sección con
+  el comportamiento que difiere a propósito del original y cómo volver a él (el texto
+  anterior decía que los cambios se limitaban a compatibilidad, ya no era cierto).
+- **Sin renombrar identificadores:** rutas (`third_party/snappysynthv2/`), archivos
+  (`snappysynth-worker.js`, `snappysynth_bridge.js`), el prefijo `ssw_*`,
+  `WasmidiSnappyBridge` y los targets de CMake quedan igual; cambiarlos rompe
+  cachés, el CI y referencias cruzadas sin beneficio. Si alguna vez se renombran,
+  hacerlo en una revisión dedicada.
+
+Revisión anterior entregada: `wasmidi-main-rev47.1-wasmisynth.zip`.
+
+---
+
+## 33. Pendiente evaluado: qué del lado JS convendría pasar a wasm
+
+**Pregunta del usuario:** ¿quedan cosas en JS que, pasadas a wasm, mejoren el
+rendimiento? Revisión de los bucles por evento/muestra en `web/*.js` (sin cambios de
+código). Lo pesado ya está en wasm (motor, store del parser, páginas visuales en C++).
+**Nada de esto cambia el lag de la zona densa**: ese cuello es el worker de la tecla
+caliente, que ya es wasm (§23-31).
+
+1. **Candidato (pendiente, prioridad baja-media):** post-proceso del synth-pump en
+   `midi-parser-worker.js` (el `while (i < count)`): piso de velocidad, unión de
+   pilas de note-ons idénticos y copia a dos arreglos nuevos por lote, evento por
+   evento en JS, en el mismo hilo que la precarga visual. Moverlo dentro de
+   `MidiMappedStore::buildEventBatch` (o una función C++ vecina) que escriba directo
+   los arreglos finales de mensajes y tiempos. Ganancia estimada, no medida: decenas de
+   ms de CPU por segundo de audio en lo más denso, en el hilo del parser; no acorta el
+   camino crítico del synth. Verificación: `tools/feeder_check/` ya emula ese
+   post-proceso byte a byte; el flujo debe seguir idéntico.
+2. **Descartado por ahora:** puntuación y armado de páginas en
+   `visual-cache-worker.js`. Solo visual; bucles sobre arreglos tipados enteros donde
+   V8 queda cerca de wasm. Ganancia chica.
+3. **Descartado:** worker del synth (solo `HEAPU32.set`/`HEAPF64.set` = memcpy, SysEx
+   escaso) y AudioWorklet (~88k muestras/s de copia).
+
+**Prioridad real para el lag:** el stealer en el worker caliente y el costo del render
+con miles de voces.
+
+---
+
+## 34. Revisión 48 — renderer: pendiente 7.8 (frames que se frenan a 3M+ NPS)
+
+**Pedido del usuario:** empezar con los pendientes del handoff que tocan el renderer
+del visualizador. Pendientes del renderer: **7.8** (frames que se detienen en pasajes
+de 3M+ NPS), **7.3** (prerender de frames con caché de tiles en hilos de fondo) y el
+**culler visual** sin conectar, que depende de 7.3. Se empezó por 7.8: es un bug que
+afecta justo las zonas densas y su causa se puede leer en el código.
+
+**Causa encontrada en el código (hipótesis de 7.8 precisada):**
+`calculateSharpView()` decide cuántas pantallas preparar por delante con
+`estimatedPerScreen = noteCount / maxTick × windowTicks`, o sea la densidad
+**promedio de toda la canción**. En un Black MIDI no uniforme como Hypernova, el
+promedio es bajo, así que pide hasta 32 pantallas; al entrar en la zona de ~3M NPS esas
+32 pantallas son decenas de millones de notas. El ring (2^23 = 8,4M notas, 100 MB)
+tiene que duplicarse a 16M/32M (201/402 MB de VBO más el mismo tamaño en el vector de
+CPU, más la copia del anterior y la subida completa): congelamiento o falla de
+asignación en WebGL. Además `residentBudget` crecía con `ringCapacity_`: una vez que
+el ring crecía, el presupuesto permitía todavía más.
+
+**Cambio (`src/renderer/gl_renderer.cpp`):**
+
+- `estimatedPerScreen` = máximo entre la densidad promedio y la densidad **residente
+  ahora** (notas entre `sharpTail_` y la cabeza preparada, sobre los ticks entre el
+  inicio de la vista y `sharpRemoteSafeThrough_`). Al entrar en una zona densa el
+  horizonte se acorta solo, en cuanto llegan sus primeras notas.
+- `residentBudget` fijo en 0,55 × 2^23, sin depender del ring actual.
+- `allocateRing()` escribe un `console.warn` si el ring crece. Es un evento raro (no
+  es telemetría por frame): si aparece en la consola durante Hypernova, 7.8 sigue
+  abierto y hay que agregar control de flujo al instalar lotes remotos
+  (`flushRemoteSharpBatches`).
+- No cambia qué se dibuja ni cómo: solo cuánto se prepara por delante. Mínimo 4
+  pantallas como antes.
+
+**Herramienta nueva:** `tools/renderer_check/check.sh` compila `gl_renderer.cpp` y
+`note_raster_compositor.cpp` en host con stubs de GLES3/emscripten generados desde
+los símbolos que usan. Prueba que compila, no que dibuja bien. Hasta ahora el renderer
+no se podía compilar fuera del CI. Único warning: `-Wclass-memaccess` en la línea
+~1674, previo a este cambio.
+
+**Prueba pedida:** Hypernova en la zona de 1:41 con la consola del navegador abierta:
+¿se siguen frenando los frames? ¿aparece "WASMIDI renderer ring grows"?
+
+**Siguientes pendientes del renderer (sin empezar):**
+- **7.3 — prerender con caché de tiles** en hilos de fondo (la otra mitad de
+  `NoteMeshCache` de BPFA): trabajo grande de diseño; necesario para que el culler
+  rinda (hoy 21,8 ms por viewport de 1M notas).
+- **Conectar el culler** después de 7.3, con depth test apagado o z constante en el
+  pase de notas (el orden lo impone el culler). Regla vigente: no cambiar cómo se ve.
+
+Última revisión entregada: `wasmidi-main-rev48-renderer-horizon.zip`.

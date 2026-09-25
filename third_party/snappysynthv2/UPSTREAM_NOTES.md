@@ -1,7 +1,29 @@
-# SnappySynthV2 browser subset
+# WasmiSynth — "SnappySynthV2 for WASMIDI"
 
-This directory is adapted from the SnappySynthV2 source archive supplied by the
-WASMIDI project owner for this port.
+WasmiSynth is WASMIDI's fork of the SnappySynthV2 engine. This directory is
+adapted from the SnappySynthV2 source archive supplied by the WASMIDI project
+owner. The DSP, envelopes, filters, interpolation, region selection and SF2
+parser are the upstream code; the fork diverges in voice management and
+scheduling, listed below.
+
+## Behaviour that intentionally differs from upstream
+
+These change which notes/voices sound in saturated passages. Each has a switch
+back to upstream behaviour:
+
+- Note-off matching is FIFO over a per-key list of open voices
+  (`SSW_NOTEOFF_FIFO`, default 1; `0` restores upstream matching, which the
+  per-key list still accelerates bit-exactly via `SSW_NOTEOFF_OPEN_LIST`).
+- 100% render-time limit: when block render time stays above real time, only the
+  loudest incoming note-ons (velocity amp x stack x channel gain) are admitted
+  (`ssw_set_render_limit_percent(0)` disables it; default 100).
+- Worker freelists are rebalanced every cycle and refilled adaptively (below).
+- A VOR redundancy filter skips sequence breaks for controller values that do
+  not change.
+
+See `HANDOFF.md` sections 23-31 for measurements and history.
+
+## Upstream subset and compatibility notes
 
 Only code required for SF2 playback is kept:
 - SF2/SFZ/WAV parsing
@@ -16,7 +38,7 @@ The following upstream components are intentionally not integrated:
 - GameAudio API
 - DLL/config-file/sflist plumbing
 
-Browser-specific compatibility changes are limited to:
+Browser-specific compatibility changes (in addition to the list above):
 - portable include paths
 - an Emscripten pthread pool with a bounded, voice-count-aware default worker set
 - WASM SIMD128 equivalents for the eligible native AVX2 sustain paths
