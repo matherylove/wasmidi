@@ -1,4 +1,4 @@
-# WASMIDI Player
+# WebAssembly MIDI Player
 
 Reproductor MIDI de alta densidad construido con **Qt para WebAssembly** y **WebGL2**.
 
