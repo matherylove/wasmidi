@@ -256,20 +256,54 @@ events_done:
         g_last_dispatch_us = g_dispatch_accum_us;
         ssw_update_render_budget(elapsed_ms, frames);
         if (g_render_limit_percent > 0 && frames > 0) {
+            /* Over the limit, admit only the loudest note-ons, sized from this block's
+               loudness histogram; the time budget is the last resort (HANDOFF sec. 31). */
+            int hist[128];
+            voice_take_admit_hist(hist);
             const double target_us = (double)g_render_limit_percent * 10000.0 * (double)frames /
                 (double)(g_cfg.sample_rate > 0 ? g_cfg.sample_rate : 44100);
-            const double spent_us = elapsed_ms * 1000.0;
+            g_render_limit_ema_us = g_render_limit_ema_us * 0.75 + elapsed_ms * 1000.0 * 0.25;
+            const double spent_us = g_render_limit_ema_us;
+            int floor_bin = voice_get_admit_floor_bin();
             int budget = voice_get_admit_budget_us();
+            double admitted = 0.0, total = 0.0;
+            for (int b = 0; b < 128; ++b) { total += hist[b]; if (b >= floor_bin) admitted += hist[b]; }
             if (spent_us > target_us) {
-                budget = budget > 0 ? (budget * 3) / 4 : (int)(target_us * 0.5);
-                if (budget < 200) budget = 200;
-                voice_set_admit_budget_us(budget);
-            } else if (budget > 0 && spent_us < target_us * 0.7) {
-                budget += budget / 8 + 50;
-                voice_set_admit_budget_us(budget > (int)(target_us * 4.0) ? 0 : budget);
+                if (g_render_limit_allow < 0.0 || admitted < g_render_limit_allow)
+                    g_render_limit_allow = admitted;
+                if (g_render_limit_allow > 8.0) {
+                    g_render_limit_allow *= 0.8;
+                } else {
+                    g_render_limit_allow = 8.0;
+                    budget = budget > 0 ? (budget * 3) / 4 : (int)(target_us * 0.5);
+                    if (budget < 200) budget = 200;
+                    voice_set_admit_budget_us(budget);
+                }
+            } else if (spent_us < target_us * 0.85 && g_render_limit_allow >= 0.0) {
+                if (budget > 0) {
+                    budget += budget / 8 + 50;
+                    voice_set_admit_budget_us(budget > (int)(target_us * 4.0) ? 0 : budget);
+                } else {
+                    g_render_limit_allow = g_render_limit_allow * 1.1 + 8.0;
+                    if (g_render_limit_allow > total * 2.0 + 64.0) g_render_limit_allow = -1.0;
+                }
             }
-        } else if (voice_get_admit_budget_us() > 0) {
-            voice_set_admit_budget_us(0);
+            int next_floor = 0;
+            if (g_render_limit_allow >= 0.0) {
+                double kept = 0.0;
+                next_floor = 128;
+                for (int b = 127; b >= 0; --b) {
+                    if (kept + hist[b] > g_render_limit_allow) break;
+                    kept += hist[b];
+                    next_floor = b;
+                }
+            }
+            if (next_floor != floor_bin) voice_set_admit_floor_bin(next_floor);
+        } else {
+            g_render_limit_ema_us = 0.0;
+            g_render_limit_allow = -1.0;
+            if (voice_get_admit_budget_us() > 0) voice_set_admit_budget_us(0);
+            if (voice_get_admit_floor_bin() > 0) voice_set_admit_floor_bin(0);
         }
     }
     return 1;

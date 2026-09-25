@@ -14,9 +14,15 @@ static AudioConfig g_cfg = {44100, 2, 32, 512, 16, 1};
 static int64_t g_render_cursor = 1;
 static int g_render_budget = 1;
 static int g_render_limit_percent = 0; /* render limit (HANDOFF §29) is off in this harness */
+static double g_render_limit_ema_us = 0.0;
 static int t_admit_budget;
 static int voice_get_admit_budget_us(void) { return t_admit_budget; }
 static void voice_set_admit_budget_us(int us) { t_admit_budget = us; }
+static int t_admit_floor_bin;
+static int voice_get_admit_floor_bin(void) { return t_admit_floor_bin; }
+static void voice_set_admit_floor_bin(int v) { t_admit_floor_bin = v; }
+static void voice_take_admit_hist(int *h) { for (int b = 0; b < 128; ++b) h[b] = 0; }
+static double g_render_limit_allow = -1.0;
 static double g_render_load_ema = -1.0;
 static int g_ready = 1;
 static double g_song_time_seconds = 0.0;
