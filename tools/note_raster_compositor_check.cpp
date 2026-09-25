@@ -64,9 +64,9 @@ static std::vector<Shown> Rasterize(const std::vector<CompositorNote>& notes,
         const std::int64_t ns = n.startTick;
         const std::int64_t ne = n.endTick ? (std::int64_t)n.endTick : viewEnd;
         if (ne <= viewStart || ns >= viewEnd) continue;
-        int left = (int)std::floor((double)w * ((double)(ns - viewStart) / span));
-        int right = (int)std::ceil((double)w * ((double)(ne - viewStart) / span));
-        if (right <= left) right = left + 1;
+        // GPU model: a pixel column is drawn when its centre lies in [x0, x1).
+        int left = (int)std::ceil((double)w * ((double)(ns - viewStart) / span) - 0.5);
+        int right = (int)std::ceil((double)w * ((double)(ne - viewStart) / span) - 0.5);
         left = std::max(0, left); right = std::min(w, right);
         const std::uint32_t dur = (std::uint32_t)std::max<std::int64_t>(0, ne - ns);
         const std::uint32_t order = (std::uint32_t)i;
@@ -141,10 +141,15 @@ static int RunAll() {
         CullViewport(one.data(), one.size(), s, g_scratch, r);
         CHECK(r.notes.size() == 1, "a lone note was culled");
 
-        // sub-pixel note must survive: the renderer still draws it
-        std::vector<CompositorNote> tiny = { { 100u, 101u, Pack(90, 64, 1) } };
+        // A sub-pixel note that covers a pixel centre is drawn and must survive
+        // (x in [50.5, 51) at 2 ticks per pixel: the centre 50.5 is on its left edge).
+        std::vector<CompositorNote> tiny = { { 101u, 102u, Pack(90, 64, 1) } };
         CullViewport(tiny.data(), tiny.size(), s, g_scratch, r);
-        CHECK(r.notes.size() == 1, "sub-pixel note was culled");
+        CHECK(r.notes.size() == 1, "sub-pixel note covering a pixel centre was culled");
+        // One that covers no centre emits no fragment (x in [50, 50.5)); culling it is exact.
+        std::vector<CompositorNote> none = { { 100u, 101u, Pack(90, 64, 1) } };
+        CullViewport(none.data(), none.size(), s, g_scratch, r);
+        CHECK(r.notes.empty(), "a note covering no pixel centre was kept");
 
         // open note (endTick == 0) stretches to the view edge
         std::vector<CompositorNote> open = { { 100u, 0u, Pack(90, 70, 1) } };
