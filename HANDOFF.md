@@ -2526,4 +2526,97 @@ reloj del PCM entregado, así que un synth lento frena también el piano roll).
 admisión no alcanza; el siguiente paso sería matar voces en release (más cambio de
 sonido). El límite no es configurable desde la UI todavía (default fijo 100%).
 
-Última revisión entregada: `wasmidi-main-rev45-render-limit.zip`.
+Revisión anterior entregada: `wasmidi-main-rev45-render-limit.zip`.
+
+---
+
+## 30. Revisión 46 — el límite de 100% descarta primero las notas más suaves
+
+**Reporte del usuario (rev. 45):** mejora mucho todo, pero cuando el límite corta se
+nota mucho. Pidió que corte empezando por las notas de menor velocity.
+
+**Por qué rev. 45 sonaba mal:** cortaba por tiempo dentro de cada ciclo: pasado el
+presupuesto, todas las notas restantes de ese ciclo se perdían sin importar su
+volumen, y siempre las del final del bloque.
+
+**Dato de Hypernova (100-105 s):** el 99,1% de los note-ons tiene velocity ≤ 16. Un
+piso de velocity bajo alcanza para sacar casi toda la carga y conservar lo que se oye.
+
+**Cambio:**
+
+- `Voice/voice.c`: `g_admit_vel_floor` (0 = apagado). En `worker_cycle`, justo después
+  de incrementar el contador de orden de la tecla (para que los note-offs sigan
+  emparejando), un note-on con velocity de entrada menor al piso se descarta (cuenta en
+  `DROPPED` y `ssw_limited_notes()`). Es una comparación entera: casi no cuesta.
+- `snappy_wasm_core.c`: el controlador ahora usa un promedio móvil del tiempo por bloque
+  (EMA 0,25, para ignorar picos aislados que el ring absorbe). Sobre el 100%: sube el
+  piso de 1 a 4 por bloque según cuánto se pasa. Entre 85% y 100%: lo mantiene. Bajo
+  85%: lo baja de a 1 por bloque. Solo con el piso en 128 (ya no entra ninguna nota
+  nueva) vuelve al corte por tiempo de rev. 45 como último recurso. `ssw_reset()`
+  (seek/play desde cero) reinicia piso, presupuesto y promedio.
+- `ssw_admit_vel_floor()` exportado para depuración (no está en el panel).
+
+**Validación (host, 1 núcleo — el peor caso posible, con 16 workers compartiendo un
+núcleo):**
+
+- Zona densa 98-106 s: el bloque promedia ~10 ms (<11,6 ms) contra ~56 ms sin límite;
+  el piso se mueve entre ~65 y ~100 en este entorno, donde el render solo ya casi llena
+  el bloque. En una máquina real el render se reparte y el piso debería quedar mucho
+  más bajo.
+- Inicio de la canción: audio **bit-idéntico** a rev. 44.
+- Zona 20-24 s con 1 worker: en este contenedor hay un tramo (22 s) donde el render de
+  ~5k voces pasa el bloque y el límite actúa (≈1,4k notas suaves). Es el
+  comportamiento esperado en una máquina que no llega; en una que llega, no actúa.
+- WAV entregado: `hypernova_96-106s_rev46_limit_worstcase_1core.wav`, renderizado con
+  el límite en este contenedor: es el peor caso, sirve para oír qué tipo de notas se
+  pierden, no cuántas se perderán en tu PC.
+- Harness del scheduler (en el CI) actualizado con los stubs nuevos.
+
+Revisión anterior entregada: `wasmidi-main-rev46-velocity-limit.zip` (criterio equivocado, ver §31).
+
+---
+
+## 31. Revisión 47 — el límite descarta por sonoridad estimada, no por velocity
+
+**Reporte del usuario (rev. 46):** desaparecían las notas más audibles en vez de las
+menos audibles.
+
+**Causa:** la velocity de entrada no mide cuánto se oye una nota. En Hypernova lo que
+se oye son notas de velocity baja apiladas (VOR: la ganancia sube con la cantidad de
+pistas duplicadas) y canales con CC7/CC11 altos. Además, el controlador de rev. 46
+subía el piso a ciegas mientras el render no bajaba (las voces ya sonando siguen
+costando), así que se pasaba de largo hasta 65-120.
+
+**Cambio:**
+
+- `Voice/voice.c`: por cada note-on que no se apila por la vía rápida de VOR se estima
+  su sonoridad = `midi_vel_to_amp(vel) × stack × g_channel_render[ch].gain_mul` (lo
+  mismo que ya usa el stealer para priorizar), en bins de 1,5 dB (`log2 × 4 + 96`,
+  96 = ganancia unitaria). Cada worker acumula un histograma del ciclo y lo suma al
+  global al terminar. Si el bin es menor que `g_admit_floor_bin`, la nota se descarta
+  (mismo tratamiento de contadores que antes). Los apilados VOR nunca se descartan.
+- `snappy_wasm_core.c`: sobre el 100% (promedio móvil), el controlador fija cuántas
+  notas admitir por bloque (`allow`, empieza en lo admitido y baja ×0,8 por bloque
+  lento) y elige el piso como el bin más bajo que deja entrar solo las `allow` notas
+  más sonoras del histograma del bloque. Bajo 85% sube `allow` (×1,1 + 8) hasta
+  quitar el límite. Con `allow` en el mínimo (8) vuelve al corte por tiempo como último
+  recurso. `ssw_reset()` reinicia todo.
+
+**Medición (host, 1 núcleo, 16 workers, 98-106 s; referencia = mismo motor sin
+límite):**
+
+| Versión | Nivel medio vs sin límite | Peor ventana de 50 ms | Correlación de envolvente |
+|---|---|---|---|
+| rev. 46 (piso de velocity) | −2,5 dB | 41,5 dB más baja | −0,03 (no se parece) |
+| rev. 47 (sonoridad) | +0,5 dB | 1,5 dB más baja | 0,67 |
+
+Confirma el reporte y el arreglo: rev. 46 hacía desaparecer tramos enteros audibles;
+rev. 47 conserva el nivel y la forma aun en el peor caso posible (en este contenedor el
+límite corta muchísimo porque el render solo ya casi llena el bloque).
+
+- Inicio de la canción: bit-idéntico a rev. 44. Zona 20-24 s con 1 worker: el límite
+  actúa solo en el tramo de 22 s donde este contenedor no llega.
+- WAV: `hypernova_96-106s_rev47_limit_worstcase_1core.wav` (peor caso).
+- Harness del scheduler actualizado con los stubs nuevos.
+
+Última revisión entregada: `wasmidi-main-rev47-loudness-limit.zip`.

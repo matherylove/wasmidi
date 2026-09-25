@@ -3100,6 +3100,14 @@ static volatile LONG g_admit_limited_notes = 0;
 void voice_set_admit_budget_us(int us) { InterlockedExchange(&g_admit_budget_us, us > 0 ? us : 0); }
 int voice_get_admit_budget_us(void) { return (int)load_relaxed_long(&g_admit_budget_us); }
 int voice_get_admit_limited_notes(void) { return (int)load_relaxed_long(&g_admit_limited_notes); }
+/* rev. 47: loudness bins (velocity amp x stack x channel gain, 1.5 dB each, 96 = unity). */
+static volatile LONG g_admit_floor_bin = 0;
+static volatile LONG g_admit_hist[128];
+void voice_set_admit_floor_bin(int bin) { InterlockedExchange(&g_admit_floor_bin, bin < 0 ? 0 : bin > 128 ? 128 : bin); }
+int voice_get_admit_floor_bin(void) { return (int)load_relaxed_long(&g_admit_floor_bin); }
+void voice_take_admit_hist(int *out128) {
+    for (int b = 0; b < 128; ++b) out128[b] = (int)InterlockedExchange(&g_admit_hist[b], 0);
+}
 int voice_get_path_simd_voice(void) { return (int)g_path_simd_voice_last; }
 
 #define WORKER_FREELIST_REFILL 512
@@ -3974,6 +3982,9 @@ admit_t0.QuadPart = 0;
 admit_freq.QuadPart = 1;
 if (admit_budget_us > 0) { QueryPerformanceFrequency(&admit_freq); QueryPerformanceCounter(&admit_t0); }
 int admit_over = 0, admit_checks = 0, admit_limited = 0;
+const int admit_floor_bin = (int)load_relaxed_long(&g_admit_floor_bin);
+int admit_hist[128];
+memset(admit_hist, 0, sizeof(admit_hist));
 LARGE_INTEGER ss_cycle_begin;
 if (ss_profile) QueryPerformanceCounter(&ss_cycle_begin);
                                                                                                                                                                                                                                                                 if (load_relaxed_long(&g_quit_flag)) return SSW_WORKER_CYCLE_QUIT;
@@ -4084,6 +4095,14 @@ wd->vor_fast_voice_plus_one[e.ch][e.key] = 0;
 }
 #endif
 
+{
+    const float admit_loud = midi_vel_to_amp(e.value) * (float)event_stack_count * g_channel_render[e.ch].gain_mul;
+    int admit_bin = admit_loud > 0.0f ? (int)(log2f(admit_loud) * 4.0f) + 96 : 0;
+    if (admit_bin < 0) admit_bin = 0;
+    if (admit_bin > 127) admit_bin = 127;
+    ++admit_hist[admit_bin];
+    if (admit_bin < admit_floor_bin) { ++wd->drops_local; ++admit_limited; continue; }
+}
 if (admit_budget_us > 0) {
     if (!admit_over && ((++admit_checks) & 15) == 0) {
         LARGE_INTEGER admit_now;
@@ -4673,6 +4692,7 @@ InterlockedExchange(&g_channel_render_dirty[e.ch], 1);
                                                                                                                                                                                                                                                                  if (g_worker_mix_has_data) g_worker_mix_has_data[widx] = 0;
                                                                                                                                                                                                                                                                  wd->last_key_off_epoch = load_relaxed_long(&g_key_off_epoch);
 if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
+for (int ab = 0; ab < 128; ++ab) if (admit_hist[ab]) InterlockedAdd(&g_admit_hist[ab], admit_hist[ab]);
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();
@@ -4722,6 +4742,7 @@ if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
 
                                                                                                                                                                                                                                                                 // If to_copy was 0 we do not reserve any entries; ensure consistency
 if (admit_limited) InterlockedAdd(&g_admit_limited_notes, admit_limited);
+for (int ab = 0; ab < 128; ++ab) if (admit_hist[ab]) InterlockedAdd(&g_admit_hist[ab], admit_hist[ab]);
                                                                                                                                                                                                                                                                 LONG producers_done = InterlockedIncrement(&g_render_producers_done);
                                                                                                                                                                                                                                                                 if (producers_done == g_worker_count) {
                                                                                                                                                                                                                                                                 rebuild_channel_render_cache();
