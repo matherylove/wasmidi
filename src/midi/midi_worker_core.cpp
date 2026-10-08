@@ -1,6 +1,7 @@
 #include "midi_document_codec.hpp"
 #include "midi_parser.hpp"
 #include "midi_mapped_store.hpp"
+#include "bpfa_midi_store.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -19,7 +20,15 @@
 
 namespace {
 
+// BPFA loader by default (HANDOFF sec. 44); -DWASMIDI_PARSER_BPFA=0 restores the old store.
+#ifndef WASMIDI_PARSER_BPFA
+#define WASMIDI_PARSER_BPFA 1
+#endif
+#if WASMIDI_PARSER_BPFA
+wasmidi::BpfaMidiStore g_mappedStore;
+#else
 wasmidi::MidiMappedStore g_mappedStore;
+#endif
 wasmidi::MidiDocument g_document;
 std::vector<wasmidi::VisualNote> g_visualPage;
 std::vector<wasmidi::MidiMappedStore::EventWord> g_eventBatch;

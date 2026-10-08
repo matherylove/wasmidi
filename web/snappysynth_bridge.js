@@ -288,9 +288,15 @@
                 });
             }
 
+            // ?synthlimit=N (0 = off) for A/B tests of the render limit (HANDOFF sec. 42).
+            let synthLimitParam = "";
+            try {
+                const value = new URL(globalThis.location.href).searchParams.get("synthlimit");
+                if (value !== null) synthLimitParam = "&synthlimit=" + encodeURIComponent(value);
+            } catch (_) {}
             worker =
                 new Worker(
-                    "./snappysynth-worker.js?v=13.12.0");
+                    "./snappysynth-worker.js?v=13.12.0" + synthLimitParam);
 
             workerReadyPromise =
                 new Promise(

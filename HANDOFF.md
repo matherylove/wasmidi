@@ -3040,4 +3040,162 @@ El renderer dibuja tiles primero y usa el ring solo donde falte un tile, lo que
 permite reducir el barrido Sharp. Así el hilo principal deja de copiar y subir todas
 las notas.
 
-Última revisión entregada: `wasmidi-main-rev52-limit-per-key.zip`.
+Revisión anterior entregada: `wasmidi-main-rev52-limit-per-key.zip`.
+
+---
+
+## 42. Revisión 52.1 — "lagea donde antes no": interruptores A/B
+
+**Pregunta del usuario:** por qué WasmiSynth lagea en lugares donde originalmente no
+lageaba.
+
+**Medido en host (Hypernova, 24576 voces, 1 worker, rev. 40 vs 44 vs 52):**
+
+| Zona | rev. 40 | rev. 44 (FIFO) | rev. 52 |
+|---|---|---|---|
+| 40-44 s | 3,78 ms/bloque, 1354 voces | 4,06 ms, 1354 | 3,74 ms, 1354 |
+| 70-74 s | 96,2 ms, pool lleno | 93,5 ms, pool lleno | 89,4 ms, pool lleno |
+
+El costo del motor por bloque no subió en zonas normales, y FIFO no deja voces colgadas
+(mismas voces activas). Lo que cambió desde el original y puede sentirse como lag en el
+navegador, no medible acá:
+
+1. **Tiles en el hilo principal (rev. 50).** Armar un tile es una operación que no se
+   corta; en wasm y con millones de notas puede tomar decenas de ms. Con Workers
+   explícito en 24 en un CPU de 24 hilos, el hilo principal ocupado suma competencia
+   con los workers del synth, que se sincronizan en barreras (§25).
+2. **El límite de render (rev. 45+).** No agrega lag, pero en zonas que ya estaban justas
+   corta notas que antes sonaban tarde.
+
+**Cambio (solo para diagnosticar):**
+
+- `?tiles=0` en la URL apaga la caché de tiles (EM_JS `wasmidi_tiles_disabled` en
+  `gl_renderer.cpp`, leído una vez).
+- `?synthlimit=0` (o un porcentaje) llega al worker del synth como parámetro de su URL y
+  se aplica con `ssw_set_render_limit_percent` en `applyCoreSettings()` (exportado en
+  CMake).
+
+**Prueba pedida:** en un lugar que antes no lageaba, probar normal, `?tiles=0`,
+`?synthlimit=0` y ambos juntos, y además Workers en Auto en vez de 24.
+
+Revisión anterior entregada: `wasmidi-main-rev52.1-ab-switches.zip`.
+
+---
+
+## 43. Revisión 53 — parser de BPFA, fase A (carga + flujo del synth)
+
+**Pedido del usuario:** reemplazar el parser actual por el de BPFA manteniendo todas
+las funciones. **El usuario tiene permiso del autor de BPFA** para reutilizar su código
+(esto reemplaza la restricción de licencia anotada en §37).
+
+**Qué es el cargador de BPFA (`PianoFromAbove/PreprocessedMidi.{h,cpp}`):** archivo
+entero en RAM ("Disk to RAM"), `ScanTrack` por pista (checkpoints cada 256 eventos con
+offset/tick/running status, tempos, eventos de estado no-nota, SysEx), notas como
+`PackedNote` de 8 bytes (tick de inicio + `durationAndKey`: 12 bits de duración,
+`0x0fff` → tabla `LongNote`, velocity, nota, canal) emparejadas por pila por
+canal/tecla (la más nueva primero) y parcheadas en el lugar al note-off, `NoteBlock` de
+1024 notas por pista con fin máximo, cursores por pista sobre los bytes originales para
+reproducir. En BPFA además: compresión zstd de bloques con deduplicación, hilos (PPL /
+`std::async`), modo look-ahead con límite de memoria, buckets de densidad.
+
+**Estrategia:** una clase nueva con el diseño de BPFA detrás del **mismo contrato** que
+`MidiMappedStore` (mismos tipos y firmas), para que `midi_worker_core.cpp`, el worker
+JS, `mainwindow` y el synth no cambien. Salidas idénticas byte a byte a las actuales;
+lo que cambia es cómo se carga y se guarda el MIDI.
+
+**Fase A hecha — `src/midi/bpfa_midi_store.{hpp,cpp}` (todavía no conectado al
+build):**
+
+- `index()`: lee el archivo entero por `readAt` en bloques de 8 MB, valida cabecera y
+  chunks, `ScanTrack` estilo BPFA (decodificador `ReadNextEvent` de BPFA; tempos con
+  la regla de WASMIDI —`len ≥ 3`, tempo 0 = mantener el anterior— para que el mapa de
+  tiempo sea idéntico), metadatos (`noteCount`, `controlEventCount`, rango de alturas,
+  `activeChannelMasks`, `maxTick`, duración), `PackedNote` + `LongNote` + `NoteBlock`.
+- Synth: `resetEventCursor` (checkpoint previo + avance), `buildEventBatch` (heap por
+  tick/pista sobre los bytes originales, vel 0 → note-off d2=64, agrupado de note-ons
+  idénticos ≤256, `safeExclusive` de SysEx), `buildHistoricalSysEx`,
+  `buildHistoricalSelectorState` (resets GM/GS/XG).
+- SysEx: se guardan todos con el formato de WASMIDI (`[estado] + payload`), no con el
+  filtro/normalización de BPFA, porque el synth es otro.
+
+**Diferencias de decodificación heredadas de BPFA (casos raros):** un dato ≥ 0x80 o un
+running status inválido termina la pista en lugar de rechazar el archivo; los meta
+eventos no cancelan el running status. Archivos que el parser actual rechazaba pueden
+cargar.
+
+**Verificación (`tools/feeder_check/store_compare.cpp`, en `check.sh`):** flujo del
+synth expandido (SysEx histórica, selectores y lotes) **idéntico byte a byte** al
+parser actual en el MIDI sintético (6 posiciones) y en Hypernova (0 s, 33,3 s,
+101,5 s).
+
+**Medición (host nativo, 1 hilo, Hypernova 498 MB):** carga **~2,5 s** contra
+~6,7 s del parser actual (18,8 s en frío). Memoria del store BPFA: ~842 MB (archivo
+completo + 44,75M notas × 8 bytes; 721 notas largas).
+
+**Fases siguientes:**
+- **B — funciones visuales** sobre `PackedNote`/`NoteBlock`: `buildRenderSweep` (con
+  las reglas SharpMIDI de color por pista/primera nota del parser actual),
+  `buildVisualPage`, `buildKeySnapshot`, `buildLiveSnapshot`, tablas de color. Cada
+  una verificada contra el parser actual.
+- **C — conectar** en `midi_worker_core.cpp` (alias del tipo del store) y CMake.
+- **D — zstd** de los bloques del archivo (baja la RAM) y **E — hilos** (pthreads en el
+  módulo del parser).
+
+Revisión anterior entregada: `wasmidi-main-rev53-bpfa-parser-a.zip`.
+
+---
+
+## 44. Revisión 54 — parser de BPFA, fases B y C (visual + conectado)
+
+**Pedido del usuario:** aplicar el resto de las fases, salvo las que necesiten pruebas
+suyas.
+
+**Fase B — funciones visuales en `BpfaMidiStore`:**
+
+- Cursor fusionado genérico (`MergeCursor`: heap tick/pista sobre los bytes originales
+  con los checkpoints de BPFA), con filtro de solo notas para el renderer.
+- Colores: el escaneo registra, por pista y canal, la primera nota, su orden y su orden
+  de cierre (incluidas las huérfanas al fin de pista en orden de tecla) y
+  `buildColorTables()` reproduce la paleta global y por pista (MPWGL2) del parser
+  actual.
+- `resetRenderCursor`/`buildRenderSweep`: barrido SharpMIDI (contador por canal/tecla,
+  reemplazo de dueño, IDs de ring, cierres).
+- `buildLiveSnapshot`/`buildKeySnapshot`: estado visual FIFO por (pista, canal, tecla)
+  reconstruido reproduciendo cada pista desde su inicio (como hacía el parser actual,
+  que nunca llenaba los snapshots de sus checkpoints), cola diferida de note-offs en
+  el tick exacto, ventanas de NPS/CC. **Detalle crítico:** la elección del color dueño
+  de cada tecla depende del orden de iteración del `unordered_map`, así que hay que
+  repetir exactamente las mismas operaciones; incluida la del original de borrar la
+  cola cuando queda vacía. Sin eso, mismos conteos pero colores distintos en empates.
+- `buildVisualPage`: devuelve `false`. Nadie lo pide (`visual-prime` no se envía en la
+  app; el renderer remoto tiene ese camino apagado).
+
+**Verificación (`tools/feeder_check/`, en `check.sh`):** idéntico byte a byte al
+parser actual en
+- barrido del renderer, colores globales y por pista: sintético (0 y 5,5 s) y Hypernova
+  (0 y 101,5 s, ~1M appends y cierres);
+- snapshots en vivo con 120 frames a 60 fps por posición y seeks adelante y atrás:
+  sintético (5 posiciones) y Hypernova (10, 101,5, 60 y 125 s).
+Costo de los snapshots en Hypernova (3 seeks + 360 frames): 6,3 s contra 5,1 s del
+parser actual; el seek reproduce desde los bytes en vez de un arreglo residente.
+
+**Fase C — conectado:** `midi_worker_core.cpp` usa `BpfaMidiStore` por defecto
+(`WASMIDI_PARSER_BPFA=1`; con `0` vuelve el store anterior). `CMakeLists.txt` compila
+`bpfa_midi_store.cpp` en `midi_parser_core`. Compila en ambos modos (con stub de
+emscripten en host).
+
+**Fases no aplicadas (necesitan algo que no hay acá o pruebas del usuario):**
+- **D — zstd:** el contenedor no tiene fuentes ni cabeceras de zstd ni red. Opción: en
+  CMake, `FetchContent` de zstd (BSD) en el CI y comprimir bloques de 64 KB como BPFA
+  con deduplicación. Baja la RAM (hoy el archivo completo vive en el módulo del parser).
+- **E — hilos:** requiere compilar el módulo del parser con pthreads + Memory64
+  compartida y probar en navegador.
+
+**Riesgo a vigilar:** memoria. El store BPFA guarda el archivo completo + 8 bytes por
+nota (Hypernova: ~842 MB). El parser anterior no guardaba el archivo pero sí 8 bytes por
+evento de canal en arreglos residentes. Con MIDIs de varios GB conviene la fase D.
+
+**Prueba pedida:** cargar MIDIs grandes (Hypernova, Axley) y comprobar tiempo de carga,
+que el teclado, colores por pista, estadísticas y el audio se vean/oigan igual, y seeks.
+
+Última revisión entregada: `wasmidi-main-rev54-bpfa-parser.zip`.

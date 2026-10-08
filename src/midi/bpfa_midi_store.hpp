@@ -1,0 +1,180 @@
+#pragma once
+
+// BPFA PreprocessedMidi loader behind the MidiMappedStore contract (HANDOFF sec. 43).
+
+#include "midi_mapped_store.hpp"
+
+#include <array>
+#include <cstddef>
+#include <deque>
+#include <unordered_map>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace wasmidi {
+
+class BpfaMidiStore {
+public:
+    using EventWord = MidiMappedStore::EventWord;
+    using SysExBatchEvent = MidiMappedStore::SysExBatchEvent;
+    using RenderClose = MidiMappedStore::RenderClose;
+    using KeySnapshot = MidiMappedStore::KeySnapshot;
+    using LiveSnapshot = MidiMappedStore::LiveSnapshot;
+
+    // BPFA PreprocessedMidi::PackedNote: start tick + 12-bit duration
+    // (0x0fff -> LongNote side table), velocity, note, channel.
+    struct PackedNote {
+        uint32_t startTick;
+        uint32_t durationAndKey;
+    };
+    struct LongNote {
+        uint32_t noteIndex;
+        uint32_t endTick;
+    };
+    struct NoteBlock {
+        uint32_t firstStartTick;
+        uint32_t maximumEndTick;
+        uint32_t noteOffset;
+        uint16_t noteCount;
+        uint16_t reserved;
+    };
+
+    BpfaMidiStore() = default;
+    BpfaMidiStore(const BpfaMidiStore&) = delete;
+    BpfaMidiStore& operator=(const BpfaMidiStore&) = delete;
+
+    void clear();
+    bool index(uint64_t size, MidiReadAt readAt, void* readUser, MidiDocument& metadata,
+               MidiParseProgress progress = nullptr, void* progressUser = nullptr);
+
+    bool valid() const { return valid_; }
+    const char* error() const { return error_.c_str(); }
+    const MidiDocument& metadata() const { return metadata_; }
+
+    void resetEventCursor(uint32_t startTick);
+    bool buildEventBatch(uint32_t endTick, std::size_t maxEvents, std::vector<EventWord>& output,
+                         std::vector<SysExBatchEvent>& sysExEvents, std::vector<uint8_t>& sysExBytes,
+                         bool& complete, uint32_t& nextTick, bool& hasNextTick);
+    bool buildHistoricalSysEx(uint32_t startTick, std::vector<SysExBatchEvent>& sysExEvents,
+                              std::vector<uint8_t>& sysExBytes);
+    bool buildHistoricalSelectorState(uint32_t startTick, std::vector<EventWord>& output);
+
+    void resetRenderCursor(uint32_t startTick, bool perTrackColors);
+    bool buildRenderSweep(uint32_t endTick, std::size_t maxSourceEvents, std::vector<VisualNote>& appends,
+                          std::vector<RenderClose>& closes, uint32_t& appendBase, bool& complete,
+                          uint32_t& nextTick, bool& hasNextTick);
+
+    bool buildKeySnapshot(uint32_t tick, KeySnapshot& output);
+    bool buildLiveSnapshot(double tick, double npsStartTick, double ccStartTick, LiveSnapshot& output,
+                           bool forceReset = false);
+    bool buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::vector<VisualNote>& output);
+
+    std::size_t noteRecordCount() const { return notes_.size(); }
+    std::size_t longNoteCount() const { return longNotes_.size(); }
+    std::size_t memoryBytes() const;
+
+private:
+#pragma pack(push, 1)
+    struct TrackCheckpoint {
+        uint64_t byteOffset;
+        uint32_t tick;
+        uint8_t runningStatus;
+    };
+    struct SeekStateEvent {
+        uint32_t tick;
+        uint16_t track;
+        uint32_t order;
+        uint32_t message;
+    };
+#pragma pack(pop)
+    struct TrackStorage {
+        uint64_t byteBegin = 0;
+        uint64_t byteEnd = 0;
+        uint32_t maxTick = 0;
+        std::vector<TrackCheckpoint> checkpoints;
+    };
+    struct SysExRef {
+        uint32_t tick = 0;
+        uint16_t track = 0;
+        uint64_t order = 0;
+        std::vector<uint8_t> data;
+    };
+    struct Cursor {
+        uint64_t position = 0;
+        uint64_t end = 0;
+        uint32_t tick = 0;
+        uint8_t runningStatus = 0;
+        bool finished = false;
+        uint32_t eventTick = 0;
+        uint32_t eventMessage = 0;
+    };
+
+    // Merged (tick, track) cursor over the original bytes; notesOnly keeps
+    // NoteOn/NoteOff, the renderer's stream.
+    struct MergeCursor {
+        std::vector<Cursor> cursors;
+        std::vector<uint16_t> heap;
+        bool notesOnly = false;
+        bool valid = false;
+    };
+    bool decodeNext(Cursor& cursor, bool notesOnly) const;
+    void mergeReset(MergeCursor& m, uint32_t startTick, bool notesOnly);
+    bool mergePeek(const MergeCursor& m, uint32_t& tick, uint32_t& message, uint16_t& track) const;
+    void mergePop(MergeCursor& m);
+    void buildNoteBlocks();
+    void buildColorTables();
+
+    bool valid_ = false;
+    std::string error_;
+    MidiDocument metadata_;
+    std::vector<uint8_t> fileBytes_;
+    std::vector<TrackStorage> tracks_;
+    std::vector<SeekStateEvent> stateEvents_;
+    std::vector<SysExRef> sysex_;
+    std::vector<PackedNote> notes_;
+    std::vector<LongNote> longNotes_;
+    std::vector<NoteBlock> noteBlocks_;
+    std::vector<uint64_t> trackNoteBegin_;
+
+    struct FirstNote {
+        uint16_t seenMask = 0;
+        std::array<uint32_t, 16> tick{};
+        std::array<uint64_t, 16> order{};
+        std::array<uint64_t, 16> closeOrder{};
+    };
+    std::vector<FirstNote> firstNotes_;
+    std::array<uint8_t, 16> globalColors_{};
+    std::vector<std::array<uint8_t, 16>> trackColors_;
+
+    struct ActiveVisualNote { uint32_t startTick; uint8_t velocity; uint8_t color; uint64_t openOrder; };
+    struct VisualState { std::unordered_map<uint32_t, std::deque<ActiveVisualNote>> pending; };
+    struct DensityPoint { uint32_t tick; uint32_t count; };
+    struct DeferredOff { uint32_t tick; uint32_t message; uint16_t track; };
+    uint8_t colorByte(uint16_t track, uint8_t channel) const;
+    void applyVisualEvent(VisualState& state, uint32_t tick, uint32_t message, uint16_t track, uint64_t order) const;
+    void closeExpiredOrphans(VisualState& state, uint32_t beforeTick) const;
+    void rebuildVisualStateAt(uint32_t targetTick, VisualState& state) const;
+    VisualState liveState_;
+    MergeCursor liveCursor_;
+    bool liveCursorValid_ = false;
+    double liveTick_ = -1.0;
+    std::vector<DeferredOff> liveDeferredOffs_;
+    std::deque<DensityPoint> liveNps_;
+    std::deque<DensityPoint> liveCc_;
+    uint64_t liveNpsCount_ = 0;
+    uint64_t liveCcCount_ = 0;
+    uint32_t visualCheckpointSpan_ = 1;
+
+    MergeCursor eventCursor_;
+    std::size_t eventSysExCursor_ = 0;
+
+    MergeCursor renderCursor_;
+    bool renderPerTrackColors_ = false;
+    uint32_t renderHead_ = 1;
+    std::array<uint16_t, 128u * 16u> renderActiveCounts_{};
+    std::array<uint8_t, 128u * 16u> renderActiveColors_{};
+    std::array<uint32_t, 128u * 16u> renderActiveIds_{};
+};
+
+} // namespace wasmidi

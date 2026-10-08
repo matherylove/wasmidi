@@ -10,6 +10,16 @@
 #endif
 
 #ifdef __EMSCRIPTEN__
+// ?tiles=0 disables the culled tile cache for A/B tests (HANDOFF sec. 42).
+EM_JS(int, wasmidi_tiles_disabled, (), {
+    try { return new URL(globalThis.location.href).searchParams.get("tiles") === "0" ? 1 : 0; }
+    catch (_) { return 0; }
+});
+#else
+static int wasmidi_tiles_disabled() { return 0; }
+#endif
+
+#ifdef __EMSCRIPTEN__
 namespace {
 wasmidi::GLRenderer* g_visualCacheRenderer = nullptr;
 }
@@ -3578,7 +3588,8 @@ void GLRenderer::releaseCullTiles()
 
 void GLRenderer::updateCullTiles(uint32_t viewStart, uint32_t windowTicks)
 {
-    if (!document_ || !document_->remoteIndexed || windowTicks == 0 || width_ <= 0 ||
+    static const bool tilesDisabled = wasmidi_tiles_disabled() != 0;
+    if (tilesDisabled || !document_ || !document_->remoteIndexed || windowTicks == 0 || width_ <= 0 ||
         ringCapacity_ == 0) {
         releaseCullTiles();
         return;

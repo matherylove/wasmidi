@@ -583,6 +583,11 @@ function callLoadSoundfont(path) {
 }
 
 function applyCoreSettings() {
+    try {
+        const limit = new URL(self.location.href).searchParams.get("synthlimit");
+        if (limit !== null && Module && Module._ssw_set_render_limit_percent)
+            Module._ssw_set_render_limit_percent(Math.max(0, Number(limit) | 0));
+    } catch (_) {}
     // MIDI master volume belongs to the synth and may be changed by SysEx.
     // UI volume is applied after synthesis in the AudioWorklet.
     Module._ssw_set_vor_mode(vorMode);
