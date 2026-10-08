@@ -38,3 +38,11 @@ done; done
 ./live_compare_bpfa /tmp/feeder_synth.mid /tmp/lb.bin 0 5 2.5 30 1 2>/dev/null
 cmp -s /tmp/la.bin /tmp/lb.bin && echo "live snapshots IDENTICAL" || echo "live snapshots DIFFER"
 rm -f render_compare_old render_compare_bpfa live_compare_old live_compare_bpfa
+
+# BPFA store vs current store: visual pages (HANDOFF sec. 45)
+g++ -O2 -std=c++17 -I../../src -I../../src/midi -o page_compare_old page_compare.cpp $SRCS || exit 1
+g++ -O2 -std=c++17 -DUSE_BPFA -I../../src -I../../src/midi -o page_compare_bpfa page_compare.cpp $SRCS || exit 1
+./page_compare_old /tmp/feeder_synth.mid /tmp/pa.bin 0 3 1.5 10 2>/dev/null
+./page_compare_bpfa /tmp/feeder_synth.mid /tmp/pb.bin 0 3 1.5 10 2>/dev/null
+cmp -s /tmp/pa.bin /tmp/pb.bin && echo "visual pages IDENTICAL" || echo "visual pages DIFFER"
+rm -f page_compare_old page_compare_bpfa
