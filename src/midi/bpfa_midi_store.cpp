@@ -5,12 +5,18 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
+
+#include <zstd.h>
 
 namespace wasmidi {
 
 namespace {
 
 constexpr uint64_t CheckpointEventInterval = 256;
+#ifndef WASMIDI_BPFA_NOTE_STORE
+#define WASMIDI_BPFA_NOTE_STORE 0
+#endif
 constexpr uint32_t NotesPerBlock = 1024;
 constexpr std::size_t ReadBlock = 8u * 1024u * 1024u;
 constexpr uint32_t DurationMask = 0x00000fffu;
@@ -19,6 +25,11 @@ constexpr uint32_t VelocityShift = 12;
 constexpr uint32_t NoteShift = 19;
 constexpr uint32_t ChannelShift = 27;
 constexpr uint32_t PendingDuration = 0x80000000u;
+constexpr std::size_t SourceBlockSize = 64u * 1024u;
+constexpr std::size_t SourceSlabSize = 16u * 1024u * 1024u;
+constexpr uint32_t SourceBlockCompressed = 0x80000000u;
+constexpr uint32_t SourceBlockStoredSize = 0x7fffffffu;
+constexpr std::size_t SourceCacheSlots = 128;
 
 uint32_t be32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
 uint16_t be16(const uint8_t* p) { return uint16_t((p[0] << 8) | p[1]); }
@@ -30,10 +41,23 @@ struct Decoder {
     uint32_t tick = 0;
     uint8_t runningStatus = 0;
     bool finished = false;
+    const BpfaMidiStore* store = nullptr;
+    const uint8_t* block = nullptr;
+    uint64_t blockBegin = 0;
+    uint64_t blockEnd = 0;
+    uint16_t blockSlot = 0xffffu;
 
     bool byte(uint8_t& v) {
         if (position >= end) return false;
-        v = bytes[position++];
+        if (bytes) {
+            v = bytes[position++];
+            return true;
+        }
+        if (!block || position < blockBegin || position >= blockEnd) {
+            if (!store->sourceBlock(position, blockSlot, block, blockBegin, blockEnd)) return false;
+        }
+        v = block[position - blockBegin];
+        ++position;
         return true;
     }
     bool var(uint32_t& v) {
@@ -85,9 +109,10 @@ Kind readEvent(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2, uint32_t& 
                 break;
             }
             if (type == 0x51 && length >= 3) {
-                const uint8_t* t = d.bytes + d.position;
-                tempo = (uint32_t(t[0]) << 16) | (uint32_t(t[1]) << 8) | t[2];
-                d.position += length;
+                uint8_t t0 = 0, t1 = 0, t2 = 0;
+                if (!d.byte(t0) || !d.byte(t1) || !d.byte(t2)) break;
+                tempo = (uint32_t(t0) << 16) | (uint32_t(t1) << 8) | t2;
+                d.position += length - 3u;
                 return Kind::Tempo;
             }
             d.position += length;
@@ -163,6 +188,12 @@ void BpfaMidiStore::clear()
     error_.clear();
     metadata_ = MidiDocument{};
     std::vector<uint8_t>().swap(fileBytes_);
+    sourceSlabs_.clear();
+    std::vector<SourceChunk>().swap(sourceChunks_);
+    storedSourceBytes_ = 0;
+    sourceSize_ = 0;
+    sourceCache_.clear();
+    sourceCacheAge_ = 0;
     tracks_.clear();
     stateEvents_.clear();
     sysex_.clear();
@@ -191,7 +222,9 @@ void BpfaMidiStore::clear()
 
 std::size_t BpfaMidiStore::memoryBytes() const
 {
-    std::size_t bytes = fileBytes_.capacity() + notes_.capacity() * sizeof(PackedNote) +
+    std::size_t bytes = fileBytes_.capacity() + sourceSlabs_.size() * SourceSlabSize +
+        sourceChunks_.capacity() * sizeof(SourceChunk) + sourceCache_.size() * SourceBlockSize +
+        notes_.capacity() * sizeof(PackedNote) +
         longNotes_.capacity() * sizeof(LongNote) + noteBlocks_.capacity() * sizeof(NoteBlock) +
         stateEvents_.capacity() * sizeof(SeekStateEvent);
     for (const auto& t : tracks_) bytes += t.checkpoints.capacity() * sizeof(TrackCheckpoint);
@@ -348,6 +381,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         buildTempoIndexLocal(out);
         out.durationSeconds = static_cast<float>(out.tickToSeconds(out.maxTick));
 
+#if WASMIDI_BPFA_NOTE_STORE
         // BPFA note store: 8-byte records, patched in place at the note-off
         // (per channel/key stack, newest first), long notes in a side table.
         notes_.resize(static_cast<std::size_t>(totalNotes));
@@ -402,6 +436,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         for (std::size_t t = 0; t < notesPerTrack.size(); ++t)
             trackNoteBegin_[t + 1] = trackNoteBegin_[t] + notesPerTrack[t];
         buildNoteBlocks();
+#endif
 
         std::stable_sort(sysex_.begin(), sysex_.end(), [](const SysExRef& a, const SysExRef& b) {
             if (a.tick != b.tick) return a.tick < b.tick;
@@ -414,6 +449,10 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             if (a.track != b.track) return a.track < b.track;
             return a.order < b.order;
         });
+
+        report(96, "BPFA: compressing source");
+        sourceSize_ = size;
+        if (!compressSource()) { error_ = "BPFA source compression failed"; clear(); return false; }
 
         metadata_ = out;
         buildColorTables();
@@ -485,7 +524,20 @@ void BpfaMidiStore::buildColorTables()
 
 bool BpfaMidiStore::decodeNext(Cursor& c, bool notesOnly) const
 {
-    Decoder d{fileBytes_.data(), c.position, c.end, c.tick, c.runningStatus, c.finished};
+    Decoder d{fileBytes_.empty() ? nullptr : fileBytes_.data(), c.position, c.end, c.tick, c.runningStatus,
+              c.finished};
+    d.store = this;
+    if (c.block && sourceSlotValid(c.blockSlot, c.blockBegin)) {
+        d.block = c.block;
+        d.blockBegin = c.blockBegin;
+        d.blockEnd = c.blockEnd;
+        d.blockSlot = c.blockSlot;
+    }
+    struct Save {
+        Cursor& c;
+        Decoder& d;
+        ~Save() { c.block = d.block; c.blockBegin = d.blockBegin; c.blockEnd = d.blockEnd; c.blockSlot = d.blockSlot; }
+    } save{c, d};
     uint8_t status = 0, d1 = 0, d2 = 0;
     uint32_t tempo = 0, dataLength = 0;
     uint64_t dataOffset = 0;
@@ -1174,6 +1226,121 @@ bool BpfaMidiStore::buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::v
     }
     output.reserve(items.size());
     for (const PageItem& item : items) output.push_back(item.note);
+    return true;
+}
+
+bool BpfaMidiStore::compressSource()
+{
+    struct UniqueBlock { uint64_t sourceOffset; uint32_t chunk; uint32_t next; };
+    constexpr uint32_t NoCollision = 0xffffffffu;
+    const uint8_t* bytes = fileBytes_.data();
+    const std::size_t sourceSize = fileBytes_.size();
+    const std::size_t blockCount = (sourceSize + SourceBlockSize - 1) / SourceBlockSize;
+    sourceChunks_.clear();
+    sourceChunks_.reserve(blockCount);
+    std::vector<UniqueBlock> unique;
+    unique.reserve(blockCount);
+    std::unordered_map<uint64_t, uint32_t> heads;
+    heads.reserve(blockCount);
+    std::size_t slabUsed = SourceSlabSize;
+    auto append = [&](const uint8_t* data, std::size_t size) -> uint64_t {
+        if (slabUsed + size > SourceSlabSize) {
+            sourceSlabs_.emplace_back(new uint8_t[SourceSlabSize]);
+            slabUsed = 0;
+        }
+        const uint64_t offset = uint64_t(sourceSlabs_.size() - 1) * SourceSlabSize + slabUsed;
+        std::memcpy(sourceSlabs_.back().get() + slabUsed, data, size);
+        slabUsed += size;
+        storedSourceBytes_ += size;
+        return offset;
+    };
+    std::vector<uint8_t> compressed(ZSTD_compressBound(SourceBlockSize));
+    for (std::size_t begin = 0; begin < sourceSize; begin += SourceBlockSize) {
+        const std::size_t size = std::min(SourceBlockSize, sourceSize - begin);
+        uint64_t hash = 1469598103934665603ull;
+        std::size_t i = 0;
+        for (; i + 8 <= size; i += 8) {
+            uint64_t word;
+            std::memcpy(&word, bytes + begin + i, 8);
+            hash = (hash ^ word) * 1099511628211ull;
+            hash ^= hash >> 29;
+        }
+        for (; i < size; ++i) hash = (hash ^ bytes[begin + i]) * 1099511628211ull;
+        const uint64_t key = hash ^ (uint64_t(size) * 0x9e3779b97f4a7c15ull);
+        SourceChunk chunk{0, 0, uint32_t(size)};
+        bool duplicate = false;
+        auto head = heads.find(key);
+        if (head != heads.end()) {
+            for (uint32_t i = head->second; i != NoCollision; i = unique[i].next) {
+                if (std::memcmp(bytes + unique[i].sourceOffset, bytes + begin, size) == 0) {
+                    chunk.physicalOffset = sourceChunks_[unique[i].chunk].physicalOffset;
+                    chunk.stored = sourceChunks_[unique[i].chunk].stored;
+                    duplicate = true;
+                    break;
+                }
+            }
+        }
+        if (!duplicate) {
+            const std::size_t result = ZSTD_compress(compressed.data(), compressed.size(), bytes + begin, size, 1);
+            const bool ok = !ZSTD_isError(result) && result < size;
+            chunk.physicalOffset = append(ok ? compressed.data() : bytes + begin, ok ? result : size);
+            chunk.stored = uint32_t(ok ? result : size) | (ok ? SourceBlockCompressed : 0u);
+            const uint32_t index = uint32_t(unique.size());
+            unique.push_back({uint64_t(begin), uint32_t(sourceChunks_.size()),
+                              head == heads.end() ? NoCollision : head->second});
+            if (head == heads.end()) heads.emplace(key, index);
+            else head->second = index;
+        }
+        sourceChunks_.push_back(chunk);
+    }
+    std::vector<uint8_t>().swap(fileBytes_);
+    sourceCache_.assign(SourceCacheSlots, CacheSlot{});
+    return true;
+}
+
+bool BpfaMidiStore::sourceSlotValid(uint16_t slot, uint64_t begin) const
+{
+    if (slot == 0xffffu) return true;
+    return slot < sourceCache_.size() && sourceCache_[slot].chunk == begin / SourceBlockSize;
+}
+
+bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uint8_t*& data, uint64_t& begin,
+                                uint64_t& end) const
+{
+    const uint64_t chunkIndex = position / SourceBlockSize;
+    if (chunkIndex >= sourceChunks_.size()) return false;
+    const SourceChunk& chunk = sourceChunks_[chunkIndex];
+    const uint8_t* stored = sourceSlabs_[chunk.physicalOffset / SourceSlabSize].get() +
+        chunk.physicalOffset % SourceSlabSize;
+    begin = chunkIndex * SourceBlockSize;
+    end = begin + chunk.size;
+    if (!(chunk.stored & SourceBlockCompressed)) {
+        data = stored;
+        slotHint = 0xffffu;
+        return true;
+    }
+    std::size_t selected = sourceCache_.size(), oldest = 0;
+    if (slotHint < sourceCache_.size() && sourceCache_[slotHint].chunk == chunkIndex) selected = slotHint;
+    for (std::size_t i = 0; selected == sourceCache_.size() && i < sourceCache_.size(); ++i) {
+        if (sourceCache_[i].chunk == chunkIndex) selected = i;
+        else if (sourceCache_[i].age < sourceCache_[oldest].age) oldest = i;
+    }
+    if (selected == sourceCache_.size()) {
+        selected = oldest;
+        CacheSlot& slot = sourceCache_[selected];
+        slot.bytes.resize(SourceBlockSize);
+        const std::size_t decoded = ZSTD_decompress(slot.bytes.data(), chunk.size, stored,
+                                                    chunk.stored & SourceBlockStoredSize);
+        if (ZSTD_isError(decoded) || decoded != chunk.size) {
+            slot.chunk = ~uint64_t(0);
+            return false;
+        }
+        slot.chunk = chunkIndex;
+    }
+    CacheSlot& slot = sourceCache_[selected];
+    slot.age = ++sourceCacheAge_;
+    slotHint = uint16_t(selected);
+    data = slot.bytes.data();
     return true;
 }
 

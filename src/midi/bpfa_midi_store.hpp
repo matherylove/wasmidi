@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <unordered_map>
 #include <cstdint>
 #include <string>
@@ -70,6 +71,12 @@ public:
                            bool forceReset = false);
     bool buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::vector<VisualNote>& output);
 
+    // BPFA compressed source: 64 KiB zstd blocks, deduplicated, LRU-decoded.
+    bool sourceBlock(uint64_t position, uint16_t& slotHint, const uint8_t*& data, uint64_t& begin,
+                     uint64_t& end) const;
+    bool sourceSlotValid(uint16_t slot, uint64_t begin) const;
+    uint64_t storedSourceBytes() const { return storedSourceBytes_; }
+
     std::size_t noteRecordCount() const { return notes_.size(); }
     std::size_t longNoteCount() const { return longNotes_.size(); }
     std::size_t memoryBytes() const;
@@ -111,6 +118,10 @@ private:
         uint32_t eventMessage = 0;
         uint64_t nextIndex = 0;
         uint64_t eventIndex = 0;
+        const uint8_t* block = nullptr;
+        uint64_t blockBegin = 0;
+        uint64_t blockEnd = 0;
+        uint16_t blockSlot = 0xffffu;
     };
 
     // Merged (tick, track) cursor over the original bytes; notesOnly keeps
@@ -128,6 +139,23 @@ private:
     void mergePop(MergeCursor& m);
     void buildNoteBlocks();
     void buildColorTables();
+    bool compressSource();
+    struct SourceChunk {
+        uint64_t physicalOffset;
+        uint32_t stored;
+        uint32_t size;
+    };
+    struct CacheSlot {
+        uint64_t chunk = ~uint64_t(0);
+        uint64_t age = 0;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<std::unique_ptr<uint8_t[]>> sourceSlabs_;
+    std::vector<SourceChunk> sourceChunks_;
+    uint64_t storedSourceBytes_ = 0;
+    uint64_t sourceSize_ = 0;
+    mutable std::vector<CacheSlot> sourceCache_;
+    mutable uint64_t sourceCacheAge_ = 0;
 
     bool valid_ = false;
     std::string error_;

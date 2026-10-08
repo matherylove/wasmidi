@@ -3234,4 +3234,99 @@ crudo. El store BPFA hace exactamente eso (archivo completo en RAM). El CI en No
 pasa con el MIDI virtual de 480 MB, pero si en el navegador aparecen fallos de memoria
 con MIDIs grandes, esta es la primera sospecha y la fase D (zstd) el remedio.
 
-Última revisión entregada: `wasmidi-main-rev54.1-bpfa-visual-page.zip`.
+Revisión anterior entregada: `wasmidi-main-rev54.1-bpfa-visual-page.zip`.
+
+---
+
+## 46. Revisión 55 — parser de BPFA, fase D (fuente comprimida con zstd)
+
+**Pedido del usuario:** continuar con lo que falta.
+
+**Cambio (`bpfa_midi_store.{hpp,cpp}`), como `PreprocessedMidi` de BPFA:**
+
+- Al terminar la carga, el archivo se parte en bloques de 64 KiB, cada uno con hash
+  FNV-1a; los bloques idénticos se deduplican (comparación byte a byte en colisión) y
+  el resto se comprime con `ZSTD_compress(..., 1)` (nivel 1, como BPFA; si no achica,
+  se guarda crudo). Los bloques viven en slabs de 16 MiB y **el archivo crudo se
+  libera**.
+- Lectura: el decodificador pide bytes por posición; los bloques comprimidos se
+  descomprimen en una caché LRU de 128 bloques (8 MiB). Cada cursor recuerda su bloque
+  y valida que el slot no haya sido reutilizado por otro cursor.
+- El escaneo, el emparejado de notas y la tabla de SysEx siguen usando el archivo crudo
+  durante la carga (pico de memoria = archivo + estructuras, como BPFA).
+- `CMakeLists.txt`: `FetchContent` de zstd 1.5.6 (release oficial de GitHub, **sin
+  hash fijado todavía**; conviene agregar `URL_HASH SHA256=...` cuando se verifique),
+  compilado como `wasmidi_zstd` (`lib/common`, `lib/compress`, `lib/decompress`,
+  `ZSTD_DISABLE_ASM`, `-sMEMORY64=1`) y enlazado a `midi_parser_core`. El CI necesita
+  red en el configure (GitHub Actions la tiene).
+- `tools/feeder_check/check.sh`: en hosts sin cabeceras de zstd genera un `zstd.h`
+  mínimo y enlaza `libzstd.so.1` del sistema.
+
+**Verificación:** todas las comparaciones con el parser anterior siguen **idénticas**
+(flujo del synth, barrido del renderer con colores globales y por pista, snapshots en
+vivo con seeks, páginas visuales), en el sintético y en Hypernova (101,5 s y más).
+
+**Medición (host, Hypernova):**
+
+| | rev. 54.1 (crudo) | rev. 55 (zstd) | parser anterior |
+|---|---|---|---|
+| Memoria del store | ~842 MB | **~461 MB** | — |
+| Carga | ~2,5 s | ~5,4 s | 6,7-21 s |
+| Seek lejano (teclado) | — | 0,08 s (60 s), 2,2 s (101,5 s), 7,8 s (125 s) | ~1,7 s promedio |
+
+**Pendientes y decisiones abiertas:**
+
+1. **`PackedNote`/`NoteBlock` (358 MB en Hypernova) no los usa ninguna función
+   todavía**: todas las salidas reproducen el parser anterior desde la fuente. O se
+   usan, o conviene no construirlos.
+2. **Seeks lejanos más lentos:** `rebuildVisualStateAt` reproduce cada pista desde el
+   inicio (igual que el parser anterior, que tampoco llenaba snapshots), ahora
+   decodificando y descomprimiendo. Bloquea el worker del parser (y la alimentación del
+   synth) durante el seek. Opción: reconstruir el estado desde `PackedNote` emparejado
+   FIFO por (pista, canal, tecla) usando los `NoteBlock` (requiere guardar el orden de
+   apertura por nota para las páginas). Cambiaría solo el desempate de color entre
+   canales de una misma pista en la misma tecla y tick (depende del orden interno del
+   `unordered_map`), así que la comparación byte a byte dejaría de servir para eso.
+3. **E — hilos:** sin hacer; requiere pthreads + Memory64 compartida en el módulo del
+   parser y pruebas en navegador.
+
+Revisión anterior entregada: `wasmidi-main-rev55-bpfa-zstd.zip`.
+
+---
+
+## 47. Revisión 55.1 — por qué rev. 55 carga lento, y arreglo
+
+**Pregunta del usuario:** por qué rev. 55 carga tan lento.
+
+**Medición por fase (host nativo, Hypernova 498 MB, 1 hilo):**
+
+| Fase | rev. 55 | rev. 55.1 |
+|---|---|---|
+| Archivo a RAM | 80 ms | 103 ms |
+| Escaneo de pistas (checkpoints, tempo, selectores, SysEx, colores) | 2232 ms | 1900 ms |
+| Almacén de notas `PackedNote`/`NoteBlock` | 1514 ms | **no se construye** |
+| Compresión (hash de deduplicación + zstd nivel 1) | 1773 ms | 1371 ms |
+| **Total** | **5886 ms** | **3656 ms** |
+| Memoria del store | 461 MB | **118 MB** (68 MB de fuente comprimida) |
+
+En el navegador cada fase corre más lenta (wasm, un solo hilo, lectura del `File` por
+`FileReaderSync`); BPFA reparte escaneo y compresión entre hilos.
+
+**Causas y cambios:**
+
+1. **Tres pasadas completas en un hilo**, y una de ellas inútil: el almacén de notas
+   de BPFA no lo usa ninguna salida todavía (§46). Ahora se compila solo con
+   `-DWASMIDI_BPFA_NOTE_STORE=1` (default 0): −1,5 s y −343 MB en Hypernova. El código
+   queda para cuando se use (seeks rápidos, §46 punto 2).
+2. **Hash de deduplicación byte a byte** (FNV-1a sobre 498 MB): ahora mezcla palabras de
+   8 bytes. La igualdad se sigue confirmando con `memcmp`, así que la deduplicación es
+   la misma.
+3. **zstd:** probados niveles 1, −1, −3, −7: 1036/1016/844/761 ms para 68/84/98/115 MB.
+   Se mantiene nivel 1 (BPFA): los negativos casi no ganan velocidad.
+
+**Verificación:** `check.sh` completo IDENTICAL (synth, barrido, snapshots, páginas).
+
+**Lo que queda del tiempo de carga:** escaneo (~1,9 s) y compresión (~1,4 s) nativos.
+Bajarlos de verdad requiere la fase E (hilos), como hace BPFA.
+
+Última revisión entregada: `wasmidi-main-rev55.1-bpfa-faster-load.zip`.

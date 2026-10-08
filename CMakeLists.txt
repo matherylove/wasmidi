@@ -87,6 +87,27 @@ if(EMSCRIPTEN)
         src/midi/midi_worker_core.cpp
     )
 
+    # zstd for the BPFA compressed MIDI source (HANDOFF sec. 46).
+    include(FetchContent)
+    if(POLICY CMP0169)
+        cmake_policy(SET CMP0169 OLD)
+    endif()
+    FetchContent_Declare(wasmidi_zstd
+        URL https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz)
+    FetchContent_GetProperties(wasmidi_zstd)
+    if(NOT wasmidi_zstd_POPULATED)
+        FetchContent_Populate(wasmidi_zstd)
+    endif()
+    file(GLOB WASMIDI_ZSTD_SOURCES
+        "${wasmidi_zstd_SOURCE_DIR}/lib/common/*.c"
+        "${wasmidi_zstd_SOURCE_DIR}/lib/compress/*.c"
+        "${wasmidi_zstd_SOURCE_DIR}/lib/decompress/*.c")
+    add_library(wasmidi_zstd STATIC ${WASMIDI_ZSTD_SOURCES})
+    target_include_directories(wasmidi_zstd PUBLIC "${wasmidi_zstd_SOURCE_DIR}/lib")
+    target_compile_definitions(wasmidi_zstd PRIVATE ZSTD_DISABLE_ASM=1 XXH_NAMESPACE=ZSTD_)
+    target_compile_options(wasmidi_zstd PRIVATE "-sMEMORY64=1" "-O3")
+    target_link_libraries(midi_parser_core PRIVATE wasmidi_zstd)
+
     set_target_properties(midi_parser_core PROPERTIES
         OUTPUT_NAME "wasmidi-midi-parser"
         SUFFIX ".js"
