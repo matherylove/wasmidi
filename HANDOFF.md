@@ -382,6 +382,9 @@ stealer sin una medición que lo exija.
     `viewStart` → `sharpRemoteSafeThrough_`) sale inflada, porque la cola retiene notas
     largas que empezaron mucho antes de `viewStart`; el horizonte caía al mínimo de 4
     pantallas y los frames se perdían mucho antes. No tocar el horizonte sin medirlo.
+14. **Dejar sin implementar una función "que la app no usa"** (rev. 54). El CI
+    (`midi_parser_bootstrap_smoke.cjs`) ejercita todo el contrato `wmp_*`; antes de
+    reemplazar un componente, buscar sus usos también en `tools/`.
 
 ---
 
@@ -3167,8 +3170,8 @@ suyas.
   de cada tecla depende del orden de iteración del `unordered_map`, así que hay que
   repetir exactamente las mismas operaciones; incluida la del original de borrar la
   cola cuando queda vacía. Sin eso, mismos conteos pero colores distintos en empates.
-- `buildVisualPage`: devuelve `false`. Nadie lo pide (`visual-prime` no se envía en la
-  app; el renderer remoto tiene ese camino apagado).
+- `buildVisualPage`: en rev. 54 devolvía `false` (la app no lo pide); **error**: el
+  smoke test del CI sí lo ejercita. Portado completo en rev. 54.1 (§45).
 
 **Verificación (`tools/feeder_check/`, en `check.sh`):** idéntico byte a byte al
 parser actual en
@@ -3198,4 +3201,37 @@ evento de canal en arreglos residentes. Con MIDIs de varios GB conviene la fase 
 **Prueba pedida:** cargar MIDIs grandes (Hypernova, Axley) y comprobar tiempo de carga,
 que el teclado, colores por pista, estadísticas y el audio se vean/oigan igual, y seeks.
 
-Última revisión entregada: `wasmidi-main-rev54-bpfa-parser.zip`.
+Revisión anterior entregada: `wasmidi-main-rev54-bpfa-parser.zip` (CI falló, ver §45).
+
+---
+
+## 45. Revisión 54.1 — CI: `buildVisualPage` del store BPFA
+
+**Falla del CI (rev. 54):** `tools/midi_parser_bootstrap_smoke.cjs` →
+"Mapped parser could not build a visual page after dense indexing". El smoke test
+exige que `_wmp_build_visual_page_js(0, 1)` devuelva notas; rev. 54 lo había dejado
+devolviendo `false` porque la app no lo usa. Lección (error nº 14): "mantener todas las
+funciones" incluye las que solo ejercita el CI.
+
+**Cambio (`bpfa_midi_store.{hpp,cpp}`):** port completo de `buildVisualPage` del
+parser anterior: estado rodante entre páginas consecutivas, checkpoints visuales
+(`ensureCheckpoint`: reconstrucción directa si el salto supera media grilla, si no
+avance con checkpoints de grilla), notas "carry" ordenadas por inicio/pista/orden de
+apertura, cierre de huérfanas en el fin de pista dentro de la página, duración mínima
+de 15 ms para notas de largo cero, desempate de inicios iguales de una misma pista por
+orden de cierre. Para eso el cursor ahora lleva el **índice de evento de canal por
+pista** (el "orden" del parser anterior) y los checkpoints de BPFA guardan ese índice.
+
+**Verificación (`tools/feeder_check/page_compare.cpp`, en `check.sh`):** 64 páginas
+seguidas de 0,1 s desde varias posiciones (calentamiento secuencial + seeks):
+**idéntico** al parser anterior en el sintético (5 posiciones, ~400k notas) y en
+Hypernova (0, 101,5 y 40 s; 14M notas de página). `check.sh` completo: synth, barrido,
+snapshots y páginas, todo IDENTICAL.
+
+**Nota para la memoria del navegador:** el smoke test recuerda que un fallo histórico
+(Pass 12.8/12.9) fue crecer el heap de 64 MiB a ~500 MiB para guardar el archivo
+crudo. El store BPFA hace exactamente eso (archivo completo en RAM). El CI en Node lo
+pasa con el MIDI virtual de 480 MB, pero si en el navegador aparecen fallos de memoria
+con MIDIs grandes, esta es la primera sospecha y la fase D (zstd) el remedio.
+
+Última revisión entregada: `wasmidi-main-rev54.1-bpfa-visual-page.zip`.

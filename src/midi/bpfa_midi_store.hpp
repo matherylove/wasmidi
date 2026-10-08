@@ -78,6 +78,7 @@ private:
 #pragma pack(push, 1)
     struct TrackCheckpoint {
         uint64_t byteOffset;
+        uint64_t eventIndex;
         uint32_t tick;
         uint8_t runningStatus;
     };
@@ -108,6 +109,8 @@ private:
         bool finished = false;
         uint32_t eventTick = 0;
         uint32_t eventMessage = 0;
+        uint64_t nextIndex = 0;
+        uint64_t eventIndex = 0;
     };
 
     // Merged (tick, track) cursor over the original bytes; notesOnly keeps
@@ -121,6 +124,7 @@ private:
     bool decodeNext(Cursor& cursor, bool notesOnly) const;
     void mergeReset(MergeCursor& m, uint32_t startTick, bool notesOnly);
     bool mergePeek(const MergeCursor& m, uint32_t& tick, uint32_t& message, uint16_t& track) const;
+    uint64_t mergeOrder(const MergeCursor& m) const { return m.cursors[m.heap.front()].eventIndex; }
     void mergePop(MergeCursor& m);
     void buildNoteBlocks();
     void buildColorTables();
@@ -152,9 +156,27 @@ private:
     struct DensityPoint { uint32_t tick; uint32_t count; };
     struct DeferredOff { uint32_t tick; uint32_t message; uint16_t track; };
     uint8_t colorByte(uint16_t track, uint8_t channel) const;
-    void applyVisualEvent(VisualState& state, uint32_t tick, uint32_t message, uint16_t track, uint64_t order) const;
+    struct PageItem {
+        VisualNote note{};
+        uint32_t track = 0;
+        uint64_t closeOrder = ~uint64_t(0);
+        uint64_t openOrder = 0;
+        bool minimumDuration = false;
+    };
+    using OutputIndices = std::unordered_map<uint32_t, std::deque<std::size_t>>;
+    struct VisualCheckpoint;
+    void applyVisualEvent(VisualState& state, uint32_t tick, uint32_t message, uint16_t track, uint64_t order,
+                          std::vector<PageItem>* output = nullptr, OutputIndices* outputIndices = nullptr) const;
+    void closePageOrphans(VisualState& state, uint32_t pageStart, uint32_t pageEnd, std::vector<PageItem>& output,
+                          OutputIndices& outputIndices) const;
+    const VisualState& ensureCheckpoint(uint32_t targetTick);
     void closeExpiredOrphans(VisualState& state, uint32_t beforeTick) const;
     void rebuildVisualStateAt(uint32_t targetTick, VisualState& state) const;
+    struct VisualCheckpointEntry { uint32_t tick; VisualState state; };
+    std::vector<VisualCheckpointEntry> visualCheckpoints_;
+    VisualState rollingVisualState_;
+    uint32_t rollingVisualTick_ = 0;
+    bool rollingVisualValid_ = false;
     VisualState liveState_;
     MergeCursor liveCursor_;
     bool liveCursorValid_ = false;

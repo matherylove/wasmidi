@@ -175,6 +175,10 @@ void BpfaMidiStore::clear()
     firstNotes_.clear();
     trackColors_.clear();
     renderHead_ = 1;
+    visualCheckpoints_.clear();
+    rollingVisualState_ = VisualState{};
+    rollingVisualValid_ = false;
+    rollingVisualTick_ = 0;
     liveState_ = VisualState{};
     liveCursor_ = MergeCursor{};
     liveCursorValid_ = false;
@@ -252,7 +256,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         // BPFA ScanTrack: checkpoints, tempo, sparse state events, SysEx, counts.
         for (uint16_t t = 0; t < out.trackCount; ++t) {
             TrackStorage& storage = tracks_[t];
-            storage.checkpoints.push_back({storage.byteBegin, 0, 0});
+            storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
             Decoder d{bytes, storage.byteBegin, storage.byteEnd};
             uint64_t events = 0, order = 0;
             FirstNote& first = firstNotes_[t];
@@ -312,7 +316,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 ++order;
                 ++events;
                 if ((events % CheckpointEventInterval) == 0)
-                    storage.checkpoints.push_back({d.position, d.tick, d.runningStatus});
+                    storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
                 out.activeChannelMasks[t] |= (1u << channel);
                 if (type == 0x90 && d2 != 0) {
                     ++notesPerTrack[t];
@@ -492,8 +496,10 @@ bool BpfaMidiStore::decodeNext(Cursor& c, bool notesOnly) const
             return false;
         }
         if (kind != Kind::Channel) continue;
+        const uint64_t index = c.nextIndex++;
         const uint8_t type = status & 0xf0;
         if (notesOnly && type != 0x80 && type != 0x90) continue;
+        c.eventIndex = index;
         uint8_t st = status, v2 = d2;
         if (type == 0x90 && d2 == 0) { st = uint8_t(0x80 | (status & 0x0f)); v2 = 64; }
         c.position = d.position; c.tick = d.tick; c.runningStatus = d.runningStatus; c.finished = false;
@@ -524,6 +530,7 @@ void BpfaMidiStore::mergeReset(MergeCursor& m, uint32_t startTick, bool notesOnl
         c.tick = cp.tick;
         c.runningStatus = cp.runningStatus;
         c.finished = false;
+        c.nextIndex = cp.eventIndex;
         bool ok = decodeNext(c, notesOnly);
         while (ok && c.eventTick < startTick) ok = decodeNext(c, notesOnly);
         if (!ok) continue;
@@ -807,22 +814,128 @@ uint8_t BpfaMidiStore::colorByte(uint16_t track, uint8_t channel) const
 }
 
 void BpfaMidiStore::applyVisualEvent(VisualState& state, uint32_t tick, uint32_t message, uint16_t track,
-                                     uint64_t order) const
+                                     uint64_t order, std::vector<PageItem>* output, OutputIndices* outputIndices) const
 {
     const uint8_t status = uint8_t(message & 0xffu), command = status & 0xf0;
     if (command != 0x90 && command != 0x80) return;
     const uint8_t channel = status & 0x0f;
     const uint8_t pitch = uint8_t((message >> 8) & 0x7fu);
     const uint8_t velocity = uint8_t((message >> 16) & 0x7fu);
+    const uint8_t color = colorByte(track, channel);
     const uint32_t key = (uint32_t(track) << 11) | (uint32_t(channel) << 7) | uint32_t(pitch);
     if (command == 0x90 && velocity != 0) {
-        state.pending[key].push_back({tick, velocity, colorByte(track, channel), order});
+        state.pending[key].push_back({tick, velocity, color, order});
+        if (output && outputIndices) {
+            const std::size_t index = output->size();
+            PageItem item;
+            item.note = {tick, 0u, uint32_t(velocity & 0x7f) | (uint32_t(pitch & 0x7f) << 8) |
+                                       (uint32_t(color & 0x0f) << 16) | (uint32_t((color >> 4) & 0x0f) << 20) |
+                                       (uint32_t(track & 0xffu) << 24)};
+            item.track = track;
+            item.openOrder = order;
+            output->push_back(item);
+            (*outputIndices)[key].push_back(index);
+        }
         return;
     }
     auto active = state.pending.find(key);
     if (active == state.pending.end() || active->second.empty()) return;
     active->second.pop_front();
+    if (output && outputIndices) {
+        auto oi = outputIndices->find(key);
+        if (oi != outputIndices->end() && !oi->second.empty()) {
+            const std::size_t index = oi->second.front();
+            oi->second.pop_front();
+            if (index < output->size()) {
+                PageItem& item = (*output)[index];
+                item.minimumDuration = tick <= item.note.startTick;
+                item.note.endTick = tick > item.note.startTick ? tick
+                    : (item.note.startTick == std::numeric_limits<uint32_t>::max() ? item.note.startTick
+                                                                                   : item.note.startTick + 1u);
+                item.closeOrder = order;
+            }
+            if (oi->second.empty()) outputIndices->erase(oi);
+        }
+    }
     if (active->second.empty()) state.pending.erase(active);
+}
+
+void BpfaMidiStore::closePageOrphans(VisualState& state, uint32_t pageStart, uint32_t pageEnd,
+                                     std::vector<PageItem>& output, OutputIndices& outputIndices) const
+{
+    for (auto it = state.pending.begin(); it != state.pending.end();) {
+        const uint32_t key = it->first, track = key >> 11;
+        if (track >= tracks_.size()) { ++it; continue; }
+        const uint32_t endTick = tracks_[track].maxTick;
+        if (endTick < pageStart || endTick > pageEnd) { ++it; continue; }
+        auto oi = outputIndices.find(key);
+        while (!it->second.empty()) {
+            if (oi != outputIndices.end() && !oi->second.empty()) {
+                const std::size_t index = oi->second.front();
+                oi->second.pop_front();
+                if (index < output.size()) {
+                    PageItem& item = output[index];
+                    item.minimumDuration = endTick <= item.note.startTick;
+                    item.note.endTick = endTick > item.note.startTick ? endTick
+                        : (item.note.startTick == std::numeric_limits<uint32_t>::max() ? item.note.startTick
+                                                                                       : item.note.startTick + 1u);
+                    item.closeOrder = std::numeric_limits<uint64_t>::max() - uint64_t(0xffffffffu - key);
+                }
+            }
+            it->second.pop_front();
+        }
+        if (oi != outputIndices.end()) outputIndices.erase(oi);
+        it = state.pending.erase(it);
+    }
+}
+
+const BpfaMidiStore::VisualState& BpfaMidiStore::ensureCheckpoint(uint32_t targetTick)
+{
+    auto& cps = visualCheckpoints_;
+    if (cps.empty()) cps.push_back({0, VisualState{}});
+    targetTick = std::min(targetTick, metadata_.maxTick);
+    auto lowerTick = [](const VisualCheckpointEntry& cp, uint32_t value) { return cp.tick < value; };
+    auto exact = std::lower_bound(cps.begin(), cps.end(), targetTick, lowerTick);
+    if (exact != cps.end() && exact->tick == targetTick) return exact->state;
+    auto baseIt = exact == cps.begin() ? cps.begin() : exact - 1;
+    const uint32_t baseTick = baseIt->tick;
+    VisualState state = baseIt->state;
+    const uint64_t gap = uint64_t(targetTick) - uint64_t(baseTick);
+    const uint64_t directThreshold = std::max<uint64_t>(1u, uint64_t(visualCheckpointSpan_) / 2u);
+    if (gap > directThreshold) {
+        rebuildVisualStateAt(targetTick, state);
+        auto pos = std::lower_bound(cps.begin(), cps.end(), targetTick, lowerTick);
+        if (pos == cps.end() || pos->tick != targetTick) pos = cps.insert(pos, {targetTick, state});
+        return pos->state;
+    }
+    MergeCursor it;
+    mergeReset(it, baseTick, false);
+    uint32_t nextGrid = baseTick;
+    if (visualCheckpointSpan_ > 0) {
+        const uint64_t grid = (uint64_t(baseTick) / visualCheckpointSpan_ + 1u) * uint64_t(visualCheckpointSpan_);
+        nextGrid = static_cast<uint32_t>(std::min<uint64_t>(grid, metadata_.maxTick));
+    }
+    uint32_t tick = 0, message = 0;
+    uint16_t track = 0;
+    while (mergePeek(it, tick, message, track) && tick < targetTick) {
+        while (visualCheckpointSpan_ > 0 && nextGrid > baseTick && nextGrid < targetTick && nextGrid <= tick) {
+            auto pos = std::lower_bound(cps.begin(), cps.end(), nextGrid, lowerTick);
+            closeExpiredOrphans(state, nextGrid);
+            if (pos == cps.end() || pos->tick != nextGrid) cps.insert(pos, {nextGrid, state});
+            if (metadata_.maxTick - nextGrid < visualCheckpointSpan_) {
+                nextGrid = targetTick;
+                break;
+            }
+            nextGrid += visualCheckpointSpan_;
+        }
+        const uint64_t order = mergeOrder(it);
+        mergePop(it);
+        applyVisualEvent(state, tick, message, track, order);
+    }
+    closeExpiredOrphans(state, targetTick);
+    auto pos = std::lower_bound(cps.begin(), cps.end(), targetTick, lowerTick);
+    if (pos == cps.end() || pos->tick != targetTick) pos = cps.insert(pos, {targetTick, state});
+    return pos->state;
 }
 
 void BpfaMidiStore::closeExpiredOrphans(VisualState& state, uint32_t beforeTick) const
@@ -841,11 +954,9 @@ void BpfaMidiStore::rebuildVisualStateAt(uint32_t targetTick, VisualState& state
         Cursor c;
         c.position = tracks_[t].byteBegin;
         c.end = tracks_[t].byteEnd;
-        uint64_t index = 0;
         while (decodeNext(c, false)) {
             if (c.eventTick >= targetTick) break;
-            applyVisualEvent(state, c.eventTick, c.eventMessage, t, index);
-            ++index;
+            applyVisualEvent(state, c.eventTick, c.eventMessage, t, c.eventIndex);
         }
     }
     closeExpiredOrphans(state, targetTick);
@@ -975,11 +1086,95 @@ bool BpfaMidiStore::buildLiveSnapshot(double tick, double npsStartTick, double c
     return true;
 }
 
-bool BpfaMidiStore::buildVisualPage(uint32_t, uint32_t, std::vector<VisualNote>& output)
+bool BpfaMidiStore::buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::vector<VisualNote>& output)
 {
-    // The legacy page builder is not used by the remote renderer (HANDOFF sec. 44).
     output.clear();
-    return false;
+    if (!valid_) return false;
+    if (pageEnd < pageStart) std::swap(pageStart, pageEnd);
+    pageStart = std::min(pageStart, metadata_.maxTick);
+    pageEnd = std::min(pageEnd, metadata_.maxTick);
+    VisualState state;
+    if (rollingVisualValid_ && rollingVisualTick_ == pageStart) {
+        state = std::move(rollingVisualState_);
+        rollingVisualState_ = VisualState{};
+        rollingVisualValid_ = false;
+    } else {
+        state = ensureCheckpoint(pageStart);
+    }
+    std::vector<PageItem> items;
+    OutputIndices outputIndices;
+    std::size_t activeCount = 0;
+    for (const auto& entry : state.pending) activeCount += entry.second.size();
+    items.reserve(activeCount + 1024);
+    outputIndices.reserve(state.pending.size() + 64);
+    struct CarrySeed { uint32_t key; PageItem item; };
+    std::vector<CarrySeed> carries;
+    carries.reserve(activeCount);
+    for (const auto& entry : state.pending) {
+        const uint32_t key = entry.first, track = key >> 11;
+        const uint8_t pitch = uint8_t(key & 0x7f);
+        for (const ActiveVisualNote& active : entry.second) {
+            PageItem item;
+            item.note = {active.startTick, 0u, uint32_t(active.velocity & 0x7f) | (uint32_t(pitch & 0x7f) << 8) |
+                                                   (uint32_t(active.color & 0x0f) << 16) |
+                                                   (uint32_t((active.color >> 4) & 0x0f) << 20) |
+                                                   (uint32_t(track & 0xffu) << 24)};
+            item.track = track;
+            item.openOrder = active.openOrder;
+            carries.push_back({key, item});
+        }
+    }
+    std::stable_sort(carries.begin(), carries.end(), [](const CarrySeed& a, const CarrySeed& b) {
+        if (a.item.note.startTick != b.item.note.startTick) return a.item.note.startTick < b.item.note.startTick;
+        if (a.item.track != b.item.track) return a.item.track < b.item.track;
+        return a.item.openOrder < b.item.openOrder;
+    });
+    for (CarrySeed& seed : carries) {
+        outputIndices[seed.key].push_back(items.size());
+        items.push_back(seed.item);
+    }
+    MergeCursor it;
+    mergeReset(it, pageStart, false);
+    uint32_t tick = 0, message = 0;
+    uint16_t track = 0;
+    while (mergePeek(it, tick, message, track)) {
+        if (tick > pageEnd) break;
+        const uint64_t order = mergeOrder(it);
+        mergePop(it);
+        applyVisualEvent(state, tick, message, track, order, &items, &outputIndices);
+    }
+    closePageOrphans(state, pageStart, pageEnd, items, outputIndices);
+    if (pageEnd < metadata_.maxTick) {
+        rollingVisualTick_ = pageEnd + 1u;
+        rollingVisualState_ = std::move(state);
+        rollingVisualValid_ = true;
+    } else {
+        rollingVisualState_ = VisualState{};
+        rollingVisualTick_ = metadata_.maxTick;
+        rollingVisualValid_ = false;
+    }
+    for (PageItem& item : items) {
+        if (!item.minimumDuration) continue;
+        const double minEndSeconds = metadata_.tickToSeconds(item.note.startTick) + 0.015;
+        const double minEndTick = std::ceil(metadata_.secondsToTick(minEndSeconds));
+        item.note.endTick = static_cast<uint32_t>(std::clamp<double>(minEndTick, double(item.note.startTick) + 1.0,
+                                                                     double(std::numeric_limits<uint32_t>::max())));
+    }
+    for (std::size_t first = 0; first < items.size();) {
+        std::size_t last = first + 1;
+        while (last < items.size() && items[last].note.startTick == items[first].note.startTick &&
+               items[last].track == items[first].track) ++last;
+        if (last - first > 1)
+            std::stable_sort(items.begin() + std::ptrdiff_t(first), items.begin() + std::ptrdiff_t(last),
+                [](const PageItem& a, const PageItem& b) {
+                    if (a.closeOrder != b.closeOrder) return a.closeOrder < b.closeOrder;
+                    return a.openOrder < b.openOrder;
+                });
+        first = last;
+    }
+    output.reserve(items.size());
+    for (const PageItem& item : items) output.push_back(item.note);
+    return true;
 }
 
 } // namespace wasmidi
