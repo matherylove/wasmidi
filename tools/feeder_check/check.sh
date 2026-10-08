@@ -1,6 +1,25 @@
 #!/bin/sh
 # Run from tools/feeder_check. See HANDOFF sec. 26.
-g++ -O2 -std=c++17 -I../../src -I../../src/midi -o ref ref.cpp ../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp || exit 1
+
+# zstd for bpfa_midi_store.cpp on hosts without zstd headers (HANDOFF sec. 46)
+mkdir -p /tmp/wasmidi_zstd_inc
+cat > /tmp/wasmidi_zstd_inc/zstd.h <<'ZEOF'
+#pragma once
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+size_t ZSTD_compress(void* dst, size_t dstCapacity, const void* src, size_t srcSize, int level);
+size_t ZSTD_decompress(void* dst, size_t dstCapacity, const void* src, size_t compressedSize);
+unsigned ZSTD_isError(size_t code);
+size_t ZSTD_compressBound(size_t srcSize);
+#ifdef __cplusplus
+}
+#endif
+ZEOF
+ZSTD_FLAGS="-I/tmp/wasmidi_zstd_inc"
+ZSTD_LIBS="-l:libzstd.so.1"
+g++ -O2 -std=c++17 $ZSTD_FLAGS -I../../src -I../../src/midi -o ref ref.cpp ../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp || exit 1
 python3 synth_mid.py /tmp/feeder_synth.mid
 for w in "0 30" "5.5 20" "12.3 20" "60 5"; do
   set -- $w
@@ -12,8 +31,8 @@ for w in "0 30" "5.5 20" "12.3 20" "60 5"; do
 done
 
 # BPFA store vs current store, synth stream (HANDOFF sec. 43)
-g++ -O2 -std=c++17 -I../../src -I../../src/midi -o cmp_old store_compare.cpp ../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp ../../src/midi/bpfa_midi_store.cpp || exit 1
-g++ -O2 -std=c++17 -DUSE_BPFA -I../../src -I../../src/midi -o cmp_bpfa store_compare.cpp ../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp ../../src/midi/bpfa_midi_store.cpp || exit 1
+g++ -O2 -std=c++17 $ZSTD_FLAGS -I../../src -I../../src/midi -o cmp_old store_compare.cpp ../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp ../../src/midi/bpfa_midi_store.cpp $ZSTD_LIBS || exit 1
+g++ -O2 -std=c++17 -DUSE_BPFA $ZSTD_FLAGS -I../../src -I../../src/midi -o cmp_bpfa store_compare.cpp ../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp ../../src/midi/bpfa_midi_store.cpp $ZSTD_LIBS || exit 1
 for w in "0 30" "1.0 20" "5.5 20" "12.3 20" "25 30" "60 5"; do
   set -- $w
   ./cmp_old /tmp/feeder_synth.mid $1 $2 0 /tmp/a.bin 2>/dev/null
@@ -25,8 +44,8 @@ rm -f cmp_old cmp_bpfa
 # BPFA store vs current store: renderer sweep and live/keyboard snapshots (HANDOFF sec. 44)
 SRCS="../../src/midi/midi_mapped_store.cpp ../../src/midi/midi_parser.cpp ../../src/midi/midi_document_codec.cpp ../../src/midi/bpfa_midi_store.cpp"
 for tool in render_compare live_compare; do
-  g++ -O2 -std=c++17 -I../../src -I../../src/midi -o ${tool}_old $tool.cpp $SRCS || exit 1
-  g++ -O2 -std=c++17 -DUSE_BPFA -I../../src -I../../src/midi -o ${tool}_bpfa $tool.cpp $SRCS || exit 1
+  g++ -O2 -std=c++17 $ZSTD_FLAGS -I../../src -I../../src/midi -o ${tool}_old $tool.cpp $SRCS $ZSTD_LIBS || exit 1
+  g++ -O2 -std=c++17 -DUSE_BPFA $ZSTD_FLAGS -I../../src -I../../src/midi -o ${tool}_bpfa $tool.cpp $SRCS $ZSTD_LIBS || exit 1
 done
 for pt in 0 1; do for w in "0 40" "5.5 20"; do
   set -- $w
@@ -40,8 +59,8 @@ cmp -s /tmp/la.bin /tmp/lb.bin && echo "live snapshots IDENTICAL" || echo "live 
 rm -f render_compare_old render_compare_bpfa live_compare_old live_compare_bpfa
 
 # BPFA store vs current store: visual pages (HANDOFF sec. 45)
-g++ -O2 -std=c++17 -I../../src -I../../src/midi -o page_compare_old page_compare.cpp $SRCS || exit 1
-g++ -O2 -std=c++17 -DUSE_BPFA -I../../src -I../../src/midi -o page_compare_bpfa page_compare.cpp $SRCS || exit 1
+g++ -O2 -std=c++17 $ZSTD_FLAGS -I../../src -I../../src/midi -o page_compare_old page_compare.cpp $SRCS $ZSTD_LIBS || exit 1
+g++ -O2 -std=c++17 -DUSE_BPFA $ZSTD_FLAGS -I../../src -I../../src/midi -o page_compare_bpfa page_compare.cpp $SRCS $ZSTD_LIBS || exit 1
 ./page_compare_old /tmp/feeder_synth.mid /tmp/pa.bin 0 3 1.5 10 2>/dev/null
 ./page_compare_bpfa /tmp/feeder_synth.mid /tmp/pb.bin 0 3 1.5 10 2>/dev/null
 cmp -s /tmp/pa.bin /tmp/pb.bin && echo "visual pages IDENTICAL" || echo "visual pages DIFFER"
