@@ -510,7 +510,10 @@ async function drainSharpRenderer() {
             // Keep SnappySynth responsive without demoting the renderer to the
             // old page-at-the-last-second model. One bounded source sweep is
             // followed by an event-loop yield.
-            if (synthPumpActive || performance.now() < synthPriorityUntil) {
+            // A visible frame never waits for WasmiSynth (HANDOFF sec. 48).
+            const visibleFrameMissing = sharpRenderSafeThrough < sharpRenderUrgentThrough;
+            if (!visibleFrameMissing &&
+                (synthPumpActive || performance.now() < synthPriorityUntil)) {
                 await new Promise(resolve => setTimeout(resolve, 0));
                 continue;
             }

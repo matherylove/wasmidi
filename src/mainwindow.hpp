@@ -376,6 +376,9 @@ private:
     QElapsedTimer playbackClock_;
     float playbackAnchorSeconds_ = 0.0f;
     qint64 playbackLastElapsedMs_ = 0;
+    // Wall clock leads; audio only re-anchors it (HANDOFF sec. 48).
+    double presentationOffsetSeconds_ = 0.0;
+    bool presentationOffsetLocked_ = false;
     quint64 visualFrameSerial_ = 0;
     quint64 playbackConsumedVisualFrameSerial_ = 0;
 

@@ -3329,4 +3329,59 @@ En el navegador cada fase corre más lenta (wasm, un solo hilo, lectura del `Fil
 **Lo que queda del tiempo de carga:** escaneo (~1,9 s) y compresión (~1,4 s) nativos.
 Bajarlos de verdad requiere la fase E (hilos), como hace BPFA.
 
-Última revisión entregada: `wasmidi-main-rev55.1-bpfa-faster-load.zip`.
+Revisión anterior entregada: `wasmidi-main-rev55.1-bpfa-faster-load.zip`.
+
+---
+
+## 48. Revisión 56 — seeks lejanos rápidos y visual independiente de WasmiSynth
+
+**Pedido del usuario:** arreglar los seeks lejanos y asegurar que los gráficos, el
+teclado y el visualizador no puedan ser ralentizados por WasmiSynth.
+
+### Seeks lejanos (`bpfa_midi_store.{hpp,cpp}`)
+
+El estado visual de un seek se reconstruía reproduciendo cada pista desde el
+principio (heredado del parser anterior, cuyos checkpoints nunca guardaban notas
+activas). Ahora el escaneo mantiene por pista las colas FIFO de notas abiertas por
+(canal, tecla) y, cada 131072 eventos de canal, guarda un **snapshot** (posición para
+retomar + notas abiertas con inicio, velocity y orden de apertura), salvo que haya más
+de 65536 notas abiertas. `rebuildVisualStateAt` arranca de la última instantánea
+anterior al destino y reproduce solo desde ahí.
+
+| Seek en Hypernova | rev. 55.1 | rev. 56 |
+|---|---|---|
+| 60 s | 77 ms | 18 ms |
+| 101,5 s | 2214 ms | 143 ms |
+| 125 s | 7772 ms | 49 ms |
+
+Prueba de snapshots (3 seeks + 360 frames): 11,2 s → 0,94 s (el parser anterior:
+5,2 s). Carga sin cambio (~3,4 s), memoria +5 MB.
+
+El contenido de las colas es exacto; solo podría cambiar el orden interno del
+`unordered_map` y con él el desempate de color de una tecla entre canales de una misma
+pista con mismo inicio y misma cantidad. En las comparaciones con Hypernova (10, 101,5,
+60 y 125 s) y el sintético, teclado, estadísticas y páginas siguen **idénticos**.
+
+### Visual independiente de WasmiSynth
+
+1. **Reloj de presentación (`mainwindow.cpp`, `updateCurrentTime`).** Antes, con el
+   synth cargado, roll/teclado/gráficos seguían el reloj del PCM entregado por el
+   AudioWorklet: si el synth se atrasaba, todo se atrasaba. Ahora manda el reloj de
+   pared. Al arrancar o hacer seek se espera a que el audio empiece (como mucho 1 s) y
+   se fija la latencia de salida (`presentationOffsetSeconds_`, 0-1 s); después la
+   latencia solo puede **achicarse** (si el audio va adelante), nunca crecer. Si el synth
+   se atrasa, el audio queda detrás del visual en vez de frenarlo. Pendiente a observar:
+   tras varias faltas de audio, el desfase puede acumularse (no se resincroniza el synth
+   a propósito: resetearlo por atraso causó el bug de "suena un segundo y muere").
+2. **Worker del parser (`midi-parser-worker.js`, `drainSharpRenderer`).** El barrido del
+   renderer cedía siempre ante los lotes del synth. Ahora, si falta el frame visible
+   (`sharpRenderSafeThrough < sharpRenderUrgentThrough`), barre sin esperar; la prioridad
+   del synth solo aplica al trabajo especulativo.
+
+**Verificación:** `check.sh` completo IDENTICAL; `node --check` de todos los workers.
+`mainwindow.cpp` no se puede compilar acá (Qt).
+
+**Prueba pedida:** seeks lejanos en Hypernova/Axley; en una zona donde WasmiSynth
+lagea, el roll, el teclado y los gráficos deben seguir a velocidad normal.
+
+Última revisión entregada: `wasmidi-main-rev56-fast-seek-visual-clock.zip`.

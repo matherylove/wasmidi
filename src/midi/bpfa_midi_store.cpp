@@ -14,6 +14,8 @@ namespace wasmidi {
 namespace {
 
 constexpr uint64_t CheckpointEventInterval = 256;
+constexpr uint64_t SnapshotEventInterval = 131072;
+constexpr std::size_t SnapshotMaxNotes = 65536;
 #ifndef WASMIDI_BPFA_NOTE_STORE
 #define WASMIDI_BPFA_NOTE_STORE 0
 #endif
@@ -227,7 +229,10 @@ std::size_t BpfaMidiStore::memoryBytes() const
         notes_.capacity() * sizeof(PackedNote) +
         longNotes_.capacity() * sizeof(LongNote) + noteBlocks_.capacity() * sizeof(NoteBlock) +
         stateEvents_.capacity() * sizeof(SeekStateEvent);
-    for (const auto& t : tracks_) bytes += t.checkpoints.capacity() * sizeof(TrackCheckpoint);
+    for (const auto& t : tracks_) {
+        bytes += t.checkpoints.capacity() * sizeof(TrackCheckpoint);
+        for (const auto& v : t.snapshots) bytes += sizeof(VisualSnapshot) + v.notes.capacity() * sizeof(SnapshotNote);
+    }
     for (const auto& s : sysex_) bytes += s.data.capacity() + sizeof(SysExRef);
     return bytes;
 }
@@ -287,6 +292,7 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         uint64_t totalNotes = 0, totalControls = 0;
 
         // BPFA ScanTrack: checkpoints, tempo, sparse state events, SysEx, counts.
+        std::vector<std::deque<SnapshotNote>> open(16u * 128u);
         for (uint16_t t = 0; t < out.trackCount; ++t) {
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
@@ -298,6 +304,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             std::array<uint8_t, 16> firstPitch{};
             uint16_t firstClosedMask = 0;
             uint64_t closureOrder = 0;
+            for (auto& queue : open) queue.clear();
+            std::size_t openCount = 0;
             uint8_t status = 0, d1 = 0, d2 = 0;
             uint32_t tempo = 0, dataLength = 0;
             uint64_t dataOffset = 0;
@@ -330,6 +338,13 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                     const uint16_t vkey = uint16_t((uint16_t(channel) << 7) | (d1 & 0x7f));
                     const uint16_t bit = uint16_t(1u << channel);
                     if (noteOn) {
+                        open[vkey].push_back({d.tick, uint32_t(std::min<uint64_t>(events, 0xffffffffu)), vkey, d2, 0});
+                        ++openCount;
+                    } else if (noteOff && !open[vkey].empty()) {
+                        open[vkey].pop_front();
+                        --openCount;
+                    }
+                    if (noteOn) {
                         if (activeCounts[vkey] != std::numeric_limits<uint32_t>::max()) ++activeCounts[vkey];
                         if ((first.seenMask & bit) == 0) {
                             first.seenMask |= bit;
@@ -350,6 +365,14 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 ++events;
                 if ((events % CheckpointEventInterval) == 0)
                     storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
+                if ((events % SnapshotEventInterval) == 0 && openCount <= SnapshotMaxNotes) {
+                    VisualSnapshot snapshot;
+                    snapshot.resume = {d.position, events, d.tick, d.runningStatus};
+                    snapshot.notes.reserve(openCount);
+                    for (const auto& queue : open)
+                        for (const SnapshotNote& note : queue) snapshot.notes.push_back(note);
+                    storage.snapshots.push_back(std::move(snapshot));
+                }
                 out.activeChannelMasks[t] |= (1u << channel);
                 if (type == 0x90 && d2 != 0) {
                     ++notesPerTrack[t];
@@ -1006,6 +1029,21 @@ void BpfaMidiStore::rebuildVisualStateAt(uint32_t targetTick, VisualState& state
         Cursor c;
         c.position = tracks_[t].byteBegin;
         c.end = tracks_[t].byteEnd;
+        const auto& snaps = tracks_[t].snapshots;
+        auto snap = std::lower_bound(snaps.begin(), snaps.end(), targetTick,
+            [](const VisualSnapshot& v, uint32_t tick) { return v.resume.tick < tick; });
+        if (snap != snaps.begin()) {
+            const VisualSnapshot& use = *(snap - 1);
+            for (const SnapshotNote& note : use.notes) {
+                const uint8_t channel = uint8_t(note.key >> 7);
+                const uint32_t key = (uint32_t(t) << 11) | note.key;
+                state.pending[key].push_back({note.startTick, note.velocity, colorByte(t, channel), note.openOrder});
+            }
+            c.position = use.resume.byteOffset;
+            c.tick = use.resume.tick;
+            c.runningStatus = use.resume.runningStatus;
+            c.nextIndex = use.resume.eventIndex;
+        }
         while (decodeNext(c, false)) {
             if (c.eventTick >= targetTick) break;
             applyVisualEvent(state, c.eventTick, c.eventMessage, t, c.eventIndex);

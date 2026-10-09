@@ -96,11 +96,24 @@ private:
         uint32_t message;
     };
 #pragma pack(pop)
+    // Active-note snapshot of one track, for fast far seeks (HANDOFF sec. 48).
+    struct SnapshotNote {
+        uint32_t startTick;
+        uint32_t openOrder;
+        uint16_t key;
+        uint8_t velocity;
+        uint8_t reserved;
+    };
+    struct VisualSnapshot {
+        TrackCheckpoint resume;
+        std::vector<SnapshotNote> notes;
+    };
     struct TrackStorage {
         uint64_t byteBegin = 0;
         uint64_t byteEnd = 0;
         uint32_t maxTick = 0;
         std::vector<TrackCheckpoint> checkpoints;
+        std::vector<VisualSnapshot> snapshots;
     };
     struct SysExRef {
         uint32_t tick = 0;

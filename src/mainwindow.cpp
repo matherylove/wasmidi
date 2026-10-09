@@ -2303,6 +2303,8 @@ void MainWindow::play()
     playbackAnchorSeconds_ = currentTime_;
     playbackClock_.restart();
     playbackLastElapsedMs_ = 0;
+    presentationOffsetSeconds_ = 0.0;
+    presentationOffsetLocked_ = false;
     playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
     synthLastHardResyncElapsedMs_ = -100000;
     synthWasStarved_ = false;
@@ -2377,6 +2379,8 @@ void MainWindow::stop()
 
     playbackAnchorSeconds_ = 0.0f;
     playbackLastElapsedMs_ = 0;
+    presentationOffsetSeconds_ = 0.0;
+    presentationOffsetLocked_ = false;
     playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
     synthWasStarved_ = false;
     synthStarvedSinceElapsedMs_ = -1;
@@ -2433,6 +2437,8 @@ void MainWindow::seek(float seconds)
     if (isPlaying_) {
         playbackClock_.restart();
         playbackLastElapsedMs_ = 0;
+        presentationOffsetSeconds_ = 0.0;
+        presentationOffsetLocked_ = false;
         playbackConsumedVisualFrameSerial_ = visualFrameSerial_;
         synthStarvedSinceElapsedMs_ = -1;
         synthCatchupGraceUntilElapsedMs_ = 600;
@@ -3647,18 +3653,27 @@ void MainWindow::updateCurrentTime()
             duration_);
 
 #ifdef __EMSCRIPTEN__
-    // Once SnappySynth owns the audible transport, use the AudioWorklet's
-    // delivered-PCM clock as the single presentation clock for music, roll,
-    // piano and live graphs.  QElapsedTimer keeps the UI moving only when no
-    // synth is loaded.  This removes the intermittent drift after device
-    // underruns/queue stalls where wall time advanced while the audible device
-    // clock did not.
     if (soundfontLoaded_ && synthReady_) {
+        // The roll, keyboard and graphs run on the wall clock; WasmiSynth can
+        // only re-anchor it, never slow it down (HANDOFF sec. 48).
         const double audioClock = wasmidi_snappy_audio_clock();
+        const double wallTime = double(nextTime);
         if (std::isfinite(audioClock) && audioClock >= 0.0) {
-            nextTime = static_cast<float>(std::clamp<double>(
-                audioClock, 0.0, double(duration_)));
+            const double gap = wallTime - audioClock;
+            if (!presentationOffsetLocked_) {
+                if (audioClock > double(playbackAnchorSeconds_) + 0.001 || elapsedMs > 1000) {
+                    presentationOffsetSeconds_ = std::clamp(gap, 0.0, 1.0);
+                    presentationOffsetLocked_ = true;
+                } else {
+                    nextTime = playbackAnchorSeconds_;
+                }
+            } else if (gap < presentationOffsetSeconds_) {
+                presentationOffsetSeconds_ = std::max(0.0, gap);
+            }
         }
+        if (presentationOffsetLocked_)
+            nextTime = static_cast<float>(std::clamp<double>(
+                wallTime - presentationOffsetSeconds_, 0.0, double(duration_)));
     }
 #endif
 
