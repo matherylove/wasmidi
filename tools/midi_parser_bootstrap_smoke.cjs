@@ -61,10 +61,15 @@ function parsePaged(Module, source) {
     activePagedSource = source;
     pagedReadCalls = 0;
     pagedMaxRead = 0;
+    // Like the browser worker (mappedFileReady keeps the File), a loaded source
+    // stays readable: the BPFA store reads it on demand after indexing.
     try {
-        return Module._wmp_parse_file_js(size);
-    } finally {
+        const ok = Module._wmp_parse_file_js(size);
+        if (!ok) activePagedSource = null;
+        return ok;
+    } catch (error) {
         activePagedSource = null;
+        throw error;
     }
 }
 
@@ -490,6 +495,12 @@ async function main() {
     // a fractional Memory.grow page count here (for example
     // 10.999984741210938) and BigInt() aborted. The dense visual page is large
     // enough to force the 64 MiB initial heap to grow.
+    // The BPFA store streams the source into compressed blocks and may not need
+    // more than the initial heap; force the growth path explicitly.
+    if (Module.HEAPU8.buffer.byteLength <= 64 * 1024 * 1024 &&
+        !Module._wmp_memory_growth_probe_js(96)) {
+        throw new Error("Memory64 growth probe allocation failed.");
+    }
     const grownHeapBytes = Module.HEAPU8.buffer.byteLength;
     if (grownHeapBytes <= 64 * 1024 * 1024 ||
         (grownHeapBytes % (64 * 1024)) !== 0) {
