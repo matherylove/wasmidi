@@ -46,6 +46,11 @@ public:
     BpfaMidiStore& operator=(const BpfaMidiStore&) = delete;
 
     void clear();
+    // Provisional (HANDOFF sec. 50): read the MIDI from readAt on demand instead of
+    // keeping compressed source blocks. readAt must stay valid after index().
+    // pageBytes 0 = automatic: a ~64 MiB cache with at least two pages per track.
+    void setOnDemandSource(bool enabled, std::size_t pageBytes = 0, std::size_t pages = 0)
+    { onDemand_ = enabled; onDemandRequestPageBytes_ = pageBytes; onDemandRequestPages_ = pages; }
     bool index(uint64_t size, MidiReadAt readAt, void* readUser, MidiDocument& metadata,
                MidiParseProgress progress = nullptr, void* progressUser = nullptr);
 
@@ -152,7 +157,9 @@ private:
     void mergePop(MergeCursor& m);
     void buildNoteBlocks();
     void buildColorTables();
-    bool compressSource();
+    bool ingestSource(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
+                      void* progressUser);
+    bool copySource(uint64_t position, uint8_t* destination, std::size_t length) const;
     struct SourceChunk {
         uint64_t physicalOffset;
         uint32_t stored;
@@ -166,6 +173,17 @@ private:
     std::vector<std::unique_ptr<uint8_t[]>> sourceSlabs_;
     std::vector<SourceChunk> sourceChunks_;
     uint64_t storedSourceBytes_ = 0;
+    bool onDemand_ = true;
+    std::size_t onDemandRequestPageBytes_ = 0;
+    std::size_t onDemandRequestPages_ = 0;
+    std::size_t onDemandPageBytes_ = 64u * 1024u;
+    std::size_t onDemandPages_ = 64;
+    MidiReadAt readAt_ = nullptr;
+    void* readUser_ = nullptr;
+    mutable uint64_t onDemandReads_ = 0;
+  public:
+    uint64_t onDemandReads() const { return onDemandReads_; }
+  private:
     uint64_t sourceSize_ = 0;
     mutable std::vector<CacheSlot> sourceCache_;
     mutable uint64_t sourceCacheAge_ = 0;

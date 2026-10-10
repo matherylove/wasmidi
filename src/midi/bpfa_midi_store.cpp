@@ -16,6 +16,7 @@ namespace {
 constexpr uint64_t CheckpointEventInterval = 256;
 constexpr uint64_t SnapshotEventInterval = 131072;
 constexpr std::size_t SnapshotMaxNotes = 65536;
+constexpr uint64_t SnapshotBudgetNotes = 16ull * 1024ull * 1024ull;
 #ifndef WASMIDI_BPFA_NOTE_STORE
 #define WASMIDI_BPFA_NOTE_STORE 0
 #endif
@@ -50,14 +51,25 @@ struct Decoder {
     uint16_t blockSlot = 0xffffu;
 
     bool byte(uint8_t& v) {
-        if (position >= end) return false;
-        if (bytes) {
-            v = bytes[position++];
+        // One unsigned compare covers both window edges (HANDOFF sec. 49).
+        if (block && position - blockBegin < blockEnd - blockBegin) {
+            v = block[position - blockBegin];
+            ++position;
             return true;
         }
-        if (!block || position < blockBegin || position >= blockEnd) {
-            if (!store->sourceBlock(position, blockSlot, block, blockBegin, blockEnd)) return false;
+        return refill(v);
+    }
+    bool refill(uint8_t& v) {
+        if (position >= end) return false;
+        if (bytes) {
+            block = bytes;
+            blockBegin = 0;
+            blockEnd = end;
+            blockSlot = 0xffffu;
+        } else if (!store->sourceBlock(position, blockSlot, block, blockBegin, blockEnd)) {
+            return false;
         }
+        if (blockEnd > end) blockEnd = end;
         v = block[position - blockBegin];
         ++position;
         return true;
@@ -78,8 +90,8 @@ enum class Kind { Channel, Tempo, SysEx, End };
 
 // BPFA ReadNextEvent, extended to report tempo payloads of length >= 3 and every
 // SysEx (WASMIDI keeps them all; the synth decides what it supports).
-Kind readEvent(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2, uint32_t& tempo,
-               uint64_t& dataOffset, uint32_t& dataLength)
+inline __attribute__((always_inline)) Kind readEventImpl(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2,
+                                                         uint32_t& tempo, uint64_t& dataOffset, uint32_t& dataLength)
 {
     while (!d.finished && d.position < d.end) {
         uint32_t delta = 0;
@@ -142,6 +154,26 @@ Kind readEvent(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2, uint32_t& 
     }
     d.finished = true;
     return Kind::End;
+}
+
+// Decodes on register copies: byte stores through uint8_t references would
+// otherwise alias the decoder fields and force reloads on every byte.
+Kind readEvent(Decoder& d, uint8_t& status, uint8_t& d1, uint8_t& d2, uint32_t& tempo,
+               uint64_t& dataOffset, uint32_t& dataLength)
+{
+    Decoder local = d;
+    uint8_t s = 0, a = 0, b = 0;
+    uint32_t t = 0, length = 0;
+    uint64_t offset = 0;
+    const Kind kind = readEventImpl(local, s, a, b, t, offset, length);
+    d = local;
+    status = s;
+    d1 = a;
+    d2 = b;
+    tempo = t;
+    dataOffset = offset;
+    dataLength = length;
+    return kind;
 }
 
 void buildTempoIndexLocal(MidiDocument& output)
@@ -225,7 +257,8 @@ void BpfaMidiStore::clear()
 std::size_t BpfaMidiStore::memoryBytes() const
 {
     std::size_t bytes = fileBytes_.capacity() + sourceSlabs_.size() * SourceSlabSize +
-        sourceChunks_.capacity() * sizeof(SourceChunk) + sourceCache_.size() * SourceBlockSize +
+        sourceChunks_.capacity() * sizeof(SourceChunk) +
+        sourceCache_.size() * (onDemand_ ? onDemandPageBytes_ : SourceBlockSize) +
         notes_.capacity() * sizeof(PackedNote) +
         longNotes_.capacity() * sizeof(LongNote) + noteBlocks_.capacity() * sizeof(NoteBlock) +
         stateEvents_.capacity() * sizeof(SeekStateEvent);
@@ -246,28 +279,33 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         if (!readAt || size < 14) { error_ = "MIDI data is too short"; return false; }
         if (size > std::numeric_limits<std::size_t>::max()) { error_ = "MIDI file is too large"; return false; }
 
-        // BPFA: Disk to RAM.
-        fileBytes_.resize(static_cast<std::size_t>(size));
-        for (uint64_t done = 0; done < size;) {
-            const std::size_t amount = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - done));
-            if (!readAt(readUser, done, fileBytes_.data() + done, amount)) {
-                error_ = "Could not read MIDI source";
-                return false;
-            }
-            done += amount;
-            report(int(1 + 39.0 * double(done) / double(size)), "BPFA: disk to RAM");
+        // BPFA source blocks, streamed: the raw file is never resident (HANDOFF sec. 49).
+        readAt_ = readAt;
+        readUser_ = readUser;
+        sourceSize_ = size;
+        const std::size_t requestedPageBytes = onDemandRequestPageBytes_;
+        if (onDemand_) {
+            onDemandPageBytes_ = requestedPageBytes ? requestedPageBytes : 64u * 1024u;
+            onDemandPages_ = requestedPageBytes && onDemandRequestPages_ ? onDemandRequestPages_ : 64u;
+            sourceCache_.assign(onDemandPages_, CacheSlot{});
+        } else if (!ingestSource(size, readAt, readUser, progress, progressUser)) {
+            if (error_.empty()) error_ = "Could not read MIDI source";
+            return false;
         }
-        const uint8_t* bytes = fileBytes_.data();
-        if (std::memcmp(bytes, "MThd", 4) != 0) { error_ = "Missing MThd header"; return false; }
-        const uint32_t headerSize = be32(bytes + 4);
+        uint8_t header[14];
+        if (!copySource(0, header, sizeof(header)) || std::memcmp(header, "MThd", 4) != 0) {
+            error_ = "Missing MThd header";
+            return false;
+        }
+        const uint32_t headerSize = be32(header + 4);
         if (headerSize < 6 || 8ull + headerSize > size) { error_ = "Invalid MIDI header"; return false; }
         MidiDocument out;
         out.remoteIndexed = true;
         out.minPitch = 127;
         out.maxPitch = 0;
-        out.format = be16(bytes + 8);
-        out.trackCount = be16(bytes + 10);
-        out.ticksPerBeat = be16(bytes + 12);
+        out.format = be16(header + 8);
+        out.trackCount = be16(header + 10);
+        out.ticksPerBeat = be16(header + 12);
         if (out.format > 1) { error_ = "Only MIDI Format 0 and 1 are supported"; return false; }
         if (out.ticksPerBeat == 0 || (out.ticksPerBeat & 0x8000)) { error_ = "SMPTE timing is not supported"; return false; }
 
@@ -275,17 +313,27 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         tracks_.resize(out.trackCount);
         firstNotes_.assign(out.trackCount, FirstNote{});
         for (uint16_t t = 0; t < out.trackCount; ++t) {
-            if (size - position < 8 || std::memcmp(bytes + position, "MTrk", 4) != 0) {
+            uint8_t chunk[8];
+            if (size - position < 8 || !copySource(position, chunk, 8) || std::memcmp(chunk, "MTrk", 4) != 0) {
                 error_ = "Invalid or truncated MTrk chunk";
                 return false;
             }
-            const uint32_t length = be32(bytes + position + 4);
+            const uint32_t length = be32(chunk + 4);
             if (uint64_t(length) > size - position - 8) { error_ = "Truncated MIDI track"; return false; }
             tracks_[t].byteBegin = position + 8;
             tracks_[t].byteEnd = position + 8 + length;
             position += 8ull + length;
         }
 
+        if (onDemand_ && requestedPageBytes == 0) {
+            const std::size_t budget = 64u * 1024u * 1024u;
+            const std::size_t perTrack = budget / std::max<std::size_t>(1, 2u * out.trackCount);
+            std::size_t page = 1u << 20;
+            while (page > 64u * 1024u && page > perTrack) page >>= 1;
+            onDemandPageBytes_ = page;
+            onDemandPages_ = std::max<std::size_t>(2u * out.trackCount, budget / page);
+            sourceCache_.assign(onDemandPages_, CacheSlot{});
+        }
         out.activeChannelMasks.assign(out.trackCount, 0);
         out.tempoMap.push_back({0, 500000});
         std::vector<uint64_t> notesPerTrack(out.trackCount, 0);
@@ -293,10 +341,12 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
 
         // BPFA ScanTrack: checkpoints, tempo, sparse state events, SysEx, counts.
         std::vector<std::deque<SnapshotNote>> open(16u * 128u);
+        uint64_t snapshotNotesUsed = 0;
         for (uint16_t t = 0; t < out.trackCount; ++t) {
             TrackStorage& storage = tracks_[t];
             storage.checkpoints.push_back({storage.byteBegin, 0, 0, 0});
-            Decoder d{bytes, storage.byteBegin, storage.byteEnd};
+            Decoder d{nullptr, storage.byteBegin, storage.byteEnd};
+            d.store = this;
             uint64_t events = 0, order = 0;
             FirstNote& first = firstNotes_[t];
             first.closeOrder.fill(std::numeric_limits<uint64_t>::max());
@@ -324,7 +374,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                     sx.order = order++;
                     sx.data.resize(std::size_t(dataLength) + 1u);
                     sx.data[0] = status;
-                    if (dataLength) std::memcpy(sx.data.data() + 1, bytes + dataOffset, dataLength);
+                    if (dataLength && !copySource(dataOffset, sx.data.data() + 1, dataLength)) break;
+                    d.block = nullptr;
                     sysex_.push_back(std::move(sx));
                     continue;
                 }
@@ -365,7 +416,9 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                 ++events;
                 if ((events % CheckpointEventInterval) == 0)
                     storage.checkpoints.push_back({d.position, events, d.tick, d.runningStatus});
-                if ((events % SnapshotEventInterval) == 0 && openCount <= SnapshotMaxNotes) {
+                if ((events % SnapshotEventInterval) == 0 && openCount <= SnapshotMaxNotes &&
+                    snapshotNotesUsed + openCount <= SnapshotBudgetNotes) {
+                    snapshotNotesUsed += openCount;
                     VisualSnapshot snapshot;
                     snapshot.resume = {d.position, events, d.tick, d.runningStatus};
                     snapshot.notes.reserve(openCount);
@@ -413,7 +466,8 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             const TrackStorage& storage = tracks_[t];
             const uint64_t trackBegin = write;
             std::vector<std::vector<uint32_t>> active(16 * 256);
-            Decoder d{bytes, storage.byteBegin, storage.byteEnd};
+            Decoder d{nullptr, storage.byteBegin, storage.byteEnd};
+            d.store = this;
             uint8_t status = 0, d1 = 0, d2 = 0;
             uint32_t tempo = 0, dataLength = 0;
             uint64_t dataOffset = 0;
@@ -473,9 +527,6 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             return a.order < b.order;
         });
 
-        report(96, "BPFA: compressing source");
-        sourceSize_ = size;
-        if (!compressSource()) { error_ = "BPFA source compression failed"; clear(); return false; }
 
         metadata_ = out;
         buildColorTables();
@@ -1267,84 +1318,149 @@ bool BpfaMidiStore::buildVisualPage(uint32_t pageStart, uint32_t pageEnd, std::v
     return true;
 }
 
-bool BpfaMidiStore::compressSource()
+bool BpfaMidiStore::ingestSource(uint64_t size, MidiReadAt readAt, void* readUser, MidiParseProgress progress,
+                                 void* progressUser)
 {
-    struct UniqueBlock { uint64_t sourceOffset; uint32_t chunk; uint32_t next; };
+    struct UniqueBlock { uint32_t chunk; uint32_t next; };
     constexpr uint32_t NoCollision = 0xffffffffu;
-    const uint8_t* bytes = fileBytes_.data();
-    const std::size_t sourceSize = fileBytes_.size();
-    const std::size_t blockCount = (sourceSize + SourceBlockSize - 1) / SourceBlockSize;
+    sourceSize_ = size;
+    const uint64_t blockCount = (size + SourceBlockSize - 1) / SourceBlockSize;
     sourceChunks_.clear();
-    sourceChunks_.reserve(blockCount);
+    sourceChunks_.reserve(static_cast<std::size_t>(blockCount));
     std::vector<UniqueBlock> unique;
-    unique.reserve(blockCount);
     std::unordered_map<uint64_t, uint32_t> heads;
-    heads.reserve(blockCount);
     std::size_t slabUsed = SourceSlabSize;
-    auto append = [&](const uint8_t* data, std::size_t size) -> uint64_t {
-        if (slabUsed + size > SourceSlabSize) {
+    auto append = [&](const uint8_t* data, std::size_t length) -> uint64_t {
+        if (slabUsed + length > SourceSlabSize) {
             sourceSlabs_.emplace_back(new uint8_t[SourceSlabSize]);
             slabUsed = 0;
         }
         const uint64_t offset = uint64_t(sourceSlabs_.size() - 1) * SourceSlabSize + slabUsed;
-        std::memcpy(sourceSlabs_.back().get() + slabUsed, data, size);
-        slabUsed += size;
-        storedSourceBytes_ += size;
+        std::memcpy(sourceSlabs_.back().get() + slabUsed, data, length);
+        slabUsed += length;
+        storedSourceBytes_ += length;
         return offset;
     };
+    auto stored = [&](const SourceChunk& chunk) {
+        return sourceSlabs_[chunk.physicalOffset / SourceSlabSize].get() + chunk.physicalOffset % SourceSlabSize;
+    };
+    std::vector<uint8_t> window(ReadBlock);
     std::vector<uint8_t> compressed(ZSTD_compressBound(SourceBlockSize));
-    for (std::size_t begin = 0; begin < sourceSize; begin += SourceBlockSize) {
-        const std::size_t size = std::min(SourceBlockSize, sourceSize - begin);
-        uint64_t hash = 1469598103934665603ull;
-        std::size_t i = 0;
-        for (; i + 8 <= size; i += 8) {
-            uint64_t word;
-            std::memcpy(&word, bytes + begin + i, 8);
-            hash = (hash ^ word) * 1099511628211ull;
-            hash ^= hash >> 29;
+    std::vector<uint8_t> candidate(SourceBlockSize);
+    for (uint64_t windowBegin = 0; windowBegin < size; windowBegin += ReadBlock) {
+        const std::size_t windowSize = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - windowBegin));
+        if (!readAt(readUser, windowBegin, window.data(), windowSize)) {
+            error_ = "Could not read MIDI source";
+            return false;
         }
-        for (; i < size; ++i) hash = (hash ^ bytes[begin + i]) * 1099511628211ull;
-        const uint64_t key = hash ^ (uint64_t(size) * 0x9e3779b97f4a7c15ull);
-        SourceChunk chunk{0, 0, uint32_t(size)};
-        bool duplicate = false;
-        auto head = heads.find(key);
-        if (head != heads.end()) {
-            for (uint32_t i = head->second; i != NoCollision; i = unique[i].next) {
-                if (std::memcmp(bytes + unique[i].sourceOffset, bytes + begin, size) == 0) {
-                    chunk.physicalOffset = sourceChunks_[unique[i].chunk].physicalOffset;
-                    chunk.stored = sourceChunks_[unique[i].chunk].stored;
-                    duplicate = true;
-                    break;
+        for (std::size_t begin = 0; begin < windowSize; begin += SourceBlockSize) {
+            const std::size_t length = std::min(SourceBlockSize, windowSize - begin);
+            const uint8_t* block = window.data() + begin;
+            uint64_t hash = 1469598103934665603ull;
+            std::size_t i = 0;
+            for (; i + 8 <= length; i += 8) {
+                uint64_t word;
+                std::memcpy(&word, block + i, 8);
+                hash = (hash ^ word) * 1099511628211ull;
+                hash ^= hash >> 29;
+            }
+            for (; i < length; ++i) hash = (hash ^ block[i]) * 1099511628211ull;
+            const uint64_t key = hash ^ (uint64_t(length) * 0x9e3779b97f4a7c15ull);
+            SourceChunk chunk{0, 0, uint32_t(length)};
+            bool duplicate = false;
+            auto head = heads.find(key);
+            if (head != heads.end()) {
+                for (uint32_t u = head->second; u != NoCollision && !duplicate; u = unique[u].next) {
+                    const SourceChunk& other = sourceChunks_[unique[u].chunk];
+                    if (other.size != length) continue;
+                    const uint8_t* otherBytes = stored(other);
+                    if (other.stored & SourceBlockCompressed) {
+                        const std::size_t decoded = ZSTD_decompress(candidate.data(), length, otherBytes,
+                                                                    other.stored & SourceBlockStoredSize);
+                        if (ZSTD_isError(decoded) || decoded != length) continue;
+                        otherBytes = candidate.data();
+                    }
+                    if (std::memcmp(otherBytes, block, length) == 0) {
+                        chunk.physicalOffset = other.physicalOffset;
+                        chunk.stored = other.stored;
+                        duplicate = true;
+                    }
                 }
             }
+            if (!duplicate) {
+                const std::size_t result = ZSTD_compress(compressed.data(), compressed.size(), block, length, 1);
+                const bool ok = !ZSTD_isError(result) && result < length;
+                chunk.physicalOffset = append(ok ? compressed.data() : block, ok ? result : length);
+                chunk.stored = uint32_t(ok ? result : length) | (ok ? SourceBlockCompressed : 0u);
+                const uint32_t index = uint32_t(unique.size());
+                unique.push_back({uint32_t(sourceChunks_.size()), head == heads.end() ? NoCollision : head->second});
+                if (head == heads.end()) heads.emplace(key, index);
+                else head->second = index;
+            }
+            sourceChunks_.push_back(chunk);
         }
-        if (!duplicate) {
-            const std::size_t result = ZSTD_compress(compressed.data(), compressed.size(), bytes + begin, size, 1);
-            const bool ok = !ZSTD_isError(result) && result < size;
-            chunk.physicalOffset = append(ok ? compressed.data() : bytes + begin, ok ? result : size);
-            chunk.stored = uint32_t(ok ? result : size) | (ok ? SourceBlockCompressed : 0u);
-            const uint32_t index = uint32_t(unique.size());
-            unique.push_back({uint64_t(begin), uint32_t(sourceChunks_.size()),
-                              head == heads.end() ? NoCollision : head->second});
-            if (head == heads.end()) heads.emplace(key, index);
-            else head->second = index;
-        }
-        sourceChunks_.push_back(chunk);
+        if (progress)
+            progress(progressUser, int(1 + 39.0 * double(windowBegin + windowSize) / double(size)),
+                     "BPFA: compressing source");
     }
-    std::vector<uint8_t>().swap(fileBytes_);
     sourceCache_.assign(SourceCacheSlots, CacheSlot{});
+    return true;
+}
+
+bool BpfaMidiStore::copySource(uint64_t position, uint8_t* destination, std::size_t length) const
+{
+    uint16_t slot = 0xffffu;
+    while (length) {
+        const uint8_t* data = nullptr;
+        uint64_t begin = 0, end = 0;
+        if (!sourceBlock(position, slot, data, begin, end) || position >= end) return false;
+        const std::size_t amount = static_cast<std::size_t>(std::min<uint64_t>(length, end - position));
+        std::memcpy(destination, data + (position - begin), amount);
+        destination += amount;
+        position += amount;
+        length -= amount;
+    }
     return true;
 }
 
 bool BpfaMidiStore::sourceSlotValid(uint16_t slot, uint64_t begin) const
 {
     if (slot == 0xffffu) return true;
-    return slot < sourceCache_.size() && sourceCache_[slot].chunk == begin / SourceBlockSize;
+    return slot < sourceCache_.size() &&
+        sourceCache_[slot].chunk == begin / (onDemand_ ? onDemandPageBytes_ : SourceBlockSize);
 }
 
 bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uint8_t*& data, uint64_t& begin,
                                 uint64_t& end) const
 {
+    if (onDemand_) {
+        if (position >= sourceSize_) return false;
+        const uint64_t page = position / onDemandPageBytes_;
+        std::size_t selected = sourceCache_.size(), oldest = 0;
+        if (slotHint < sourceCache_.size() && sourceCache_[slotHint].chunk == page) selected = slotHint;
+        for (std::size_t i = 0; selected == sourceCache_.size() && i < sourceCache_.size(); ++i) {
+            if (sourceCache_[i].chunk == page) selected = i;
+            else if (sourceCache_[i].age < sourceCache_[oldest].age) oldest = i;
+        }
+        begin = page * onDemandPageBytes_;
+        end = std::min<uint64_t>(sourceSize_, begin + onDemandPageBytes_);
+        if (selected == sourceCache_.size()) {
+            selected = oldest;
+            CacheSlot& slot = sourceCache_[selected];
+            slot.bytes.resize(onDemandPageBytes_);
+            ++onDemandReads_;
+            if (!readAt_(readUser_, begin, slot.bytes.data(), static_cast<std::size_t>(end - begin))) {
+                slot.chunk = ~uint64_t(0);
+                return false;
+            }
+            slot.chunk = page;
+        }
+        CacheSlot& slot = sourceCache_[selected];
+        slot.age = ++sourceCacheAge_;
+        slotHint = uint16_t(selected);
+        data = slot.bytes.data();
+        return true;
+    }
     const uint64_t chunkIndex = position / SourceBlockSize;
     if (chunkIndex >= sourceChunks_.size()) return false;
     const SourceChunk& chunk = sourceChunks_[chunkIndex];

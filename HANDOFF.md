@@ -3384,4 +3384,110 @@ pista con mismo inicio y misma cantidad. En las comparaciones con Hypernova (10,
 **Prueba pedida:** seeks lejanos en Hypernova/Axley; en una zona donde WasmiSynth
 lagea, el roll, el teclado y los gráficos deben seguir a velocidad normal.
 
-Última revisión entregada: `wasmidi-main-rev56-fast-seek-visual-clock.zip`.
+Revisión anterior entregada: `wasmidi-main-rev56-fast-seek-visual-clock.zip`.
+
+---
+
+## 49. Revisión 57 — MIDIs de miles de millones de notas: la fuente ya no se carga entera
+
+**Reporte del usuario:** al cargar un MIDI de varios miles de millones de notas:
+"Background MIDI parser failed while BPFA: compressing source: Cannot enlarge memory,
+requested 17184825344 bytes, but the limit is 17179869184 bytes!" (16 GiB, el
+`MAXIMUM_MEMORY` del módulo del parser).
+
+**Causa:** el store BPFA leía el archivo crudo completo a RAM ("Disk to RAM") y recién
+al final lo comprimía: pico = archivo + bloques comprimidos + estructuras. Con un MIDI
+de varios GB pasa el techo de 16 GiB. (Es el mismo riesgo que anotaba el smoke test
+sobre Pass 12.8/12.9.)
+
+**Cambio (`bpfa_midi_store.{hpp,cpp}`):**
+
+- `ingestSource()`: lee el archivo por `readAt` en ventanas de 8 MiB y cada bloque de
+  64 KiB va directo a hash → deduplicación → zstd nivel 1 → slab. **El archivo crudo
+  nunca está entero en memoria**: pico = fuente comprimida + una ventana. La
+  confirmación de duplicados descomprime el bloque candidato (ya no hay bytes crudos
+  para `memcmp`).
+- Cabecera, tabla de pistas, escaneo y SysEx se leen desde la fuente comprimida
+  (`copySource`, decodificador con caché de bloques). Tras copiar un SysEx se invalida el
+  bloque del decodificador (la copia puede reciclar su slot de la LRU).
+- Decodificador: ventana con un solo compare sin signo en el camino rápido.
+- Snapshots del §48 con presupuesto total de 16M notas (~192 MB) para que MIDIs gigantes
+  no los multipliquen; pasado el presupuesto, los seeks en esa zona reproducen más.
+- `midi_worker_core.cpp`: export `wmp_memory_growth_probe_js(megas)` (reserva, toca y
+  libera). `tools/midi_parser_bootstrap_smoke.cjs` lo usa si el heap no superó 64 MiB:
+  el store nuevo ya no hace crecer el heap con los MIDIs de prueba, y la prueba de
+  regresión de Memory64 (crecimiento con cantidad de páginas fraccional) necesita que
+  crezca. Exportado en `CMakeLists.txt`.
+
+**Medición (host, Hypernova, misma sesión; la CPU del contenedor varía entre corridas):**
+
+| | rev. 56 | rev. 57 |
+|---|---|---|
+| Carga | ~5,4 s | ~6,3 s |
+| Pico de memoria del store | archivo (498 MB) + ~68 MB | **~100 MB** |
+| Memoria final | 123 MB | 123 MB |
+
+La carga cuesta ~0,9 s más (descompresión durante el escaneo: ~0,67 s de las 7,6k
+lecturas de bloque). Escalado: un MIDI de 20 GB con una relación como la de Hypernova
+(7×) quedaría en ~3 GB comprimidos, bajo el techo de 16 GiB.
+
+**Verificación:** `check.sh` (sintético) y Hypernova: flujo del synth, barrido del
+renderer, teclado/estadísticas con seeks y páginas visuales **idénticos** al parser
+anterior.
+
+**Prueba pedida:** el MIDI de miles de millones de notas que falló.
+
+Revisión anterior entregada: `wasmidi-main-rev57-bpfa-streaming-source.zip`.
+
+---
+
+## 50. Revisión 58 (provisional) — leer el MIDI bajo demanda en vez de guardarlo comprimido
+
+**Pedido del usuario:** implementarlo de forma provisional, medir y descartarlo si no
+mejora. Idea de fondo: el MIDI ya está en disco y el worker conserva el `File` después
+de cargar (`mappedFileReady`, Pass 13), así que no hace falta tenerlo en RAM, ni crudo
+ni comprimido.
+
+**Implementación (`bpfa_midi_store.{hpp,cpp}`):** `setOnDemandSource(true)` (default):
+sin `ingestSource`; `sourceBlock()` lee páginas por `readAt` a una caché LRU. Tamaño
+automático: ~64 MiB con al menos 2 páginas por pista (página de 1 MiB a 64 KiB según la
+cantidad de pistas). `setOnDemandSource(false)` vuelve a la fuente comprimida de rev. 57.
+`tools/midi_parser_bootstrap_smoke.cjs`: la fuente queda instalada tras una carga
+exitosa, como hace el worker del navegador (antes se desinstalaba y el store nuevo ya
+no tenía de dónde leer).
+
+**Benchmarks (host, Hypernova, `tools/host_bench/ondemand_bench.cpp`, lecturas con
+`pread` reales; caché del sistema caliente, la CPU del contenedor varía ±10%):**
+
+| | Comprimido (rev. 57) | Bajo demanda (rev. 58) |
+|---|---|---|
+| Carga | 4,8-5,1 s | **3,1-3,3 s** (−35%) |
+| Memoria del store | 123 MB | **99 MB** |
+| 2 s de la zona densa (synth + renderer) | ~1,2-1,3 s | ~1,1-1,4 s; 88 MB leídos en 88 lecturas |
+| Seeks 101,5 / 60 / 125 s | ~185 / 27 / 60 ms | ~175 / 25 / 53 ms |
+
+En el navegador hay una ganancia extra: para archivos chicos y medianos el worker ya
+guarda una copia contigua del archivo en JS (`fastSourceLimitBytes`, hasta 1/8 de la
+RAM). Con la fuente comprimida esa copia y la del wasm coexistían; bajo demanda se lee
+directo de ella. Para archivos más grandes se lee del `File` con `FileReaderSync`,
+como el parser original.
+
+**Caché vs. pistas (riesgo de thrash):** con 16 páginas de 1 MiB para 26 pistas se
+leyeron 368 MB en 2 s densos (cada pista expulsa la página de otra). Por eso el tamaño
+automático garantiza 2 páginas por pista. 128 × 256 KiB: 74 MB en 296 lecturas. Con
+MIDIs de miles de pistas las páginas bajan a 64 KiB.
+
+**Carga progresiva (medido por partes, no implementado):** cabecera, tabla de pistas y
+la primera página de cada pista: **2,6 ms**. Pero el tempo de Hypernova está en la
+pista 1 (0,1 MB, 19844 cambios), no en la 0: no se puede asumir que esté en la primera.
+Una pasada mínima solo para el tempo decodifica el archivo entero en **~0,5 s** nativos.
+O sea, se podría empezar a sonar con el tempo exacto en ~0,5 s (contra ~3,2 s) y armar
+el resto del índice detrás.
+
+**Verificación:** `check.sh` completo y Hypernova (synth, renderer, teclado con seeks,
+páginas): **idénticos** al parser original.
+
+**Decisión pendiente del usuario:** mantener bajo demanda (recomendado) y, si se quiere,
+seguir con la carga progresiva.
+
+Última revisión entregada: `wasmidi-main-rev58-ondemand-source.zip`.

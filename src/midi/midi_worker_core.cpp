@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <exception>
 #include <new>
@@ -869,6 +870,22 @@ EMSCRIPTEN_KEEPALIVE
 double wmp_error_size_js()
 {
     return static_cast<double>(g_error.size());
+}
+
+// CI probe for Memory64 heap growth, now that the BPFA store keeps the heap small
+// (HANDOFF sec. 49).
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+int wmp_memory_growth_probe_js(double megabytes)
+{
+    const std::size_t bytes = static_cast<std::size_t>(std::max(1.0, megabytes)) * 1024u * 1024u;
+    uint8_t* block = new (std::nothrow) uint8_t[bytes];
+    if (!block) return 0;
+    std::memset(block, 1, bytes);
+    const int ok = block[bytes - 1] == 1;
+    delete[] block;
+    return ok;
 }
 
 #ifdef __EMSCRIPTEN__
