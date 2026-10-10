@@ -385,6 +385,9 @@ stealer sin una medición que lo exija.
 14. **Dejar sin implementar una función "que la app no usa"** (rev. 54). El CI
     (`midi_parser_bootstrap_smoke.cjs`) ejercita todo el contrato `wmp_*`; antes de
     reemplazar un componente, buscar sus usos también en `tools/`.
+15. **Decidir con benchmarks de host algo dominado por el navegador** (rev. 58). La
+    lectura bajo demanda ganaba 35% con `pread` en host y en el navegador cargó más
+    lento: el costo real eran los cruces EM_JS y `FileReaderSync` por página.
 
 ---
 
@@ -3490,4 +3493,28 @@ páginas): **idénticos** al parser original.
 **Decisión pendiente del usuario:** mantener bajo demanda (recomendado) y, si se quiere,
 seguir con la carga progresiva.
 
-Última revisión entregada: `wasmidi-main-rev58-ondemand-source.zip`.
+Revisión anterior entregada: `wasmidi-main-rev58-ondemand-source.zip` (descartada, ver §51).
+
+---
+
+## 51. Revisión 58.1 — se descarta la lectura bajo demanda
+
+**Prueba del usuario en el navegador (rev. 58):** todo carga más lento. Según la regla
+acordada ("si no mejora o empeora, lo descartamos"), vuelve la fuente comprimida de
+rev. 57 como default (`onDemand_ = false`). El código queda, apagado, por si se retoma.
+
+**Por qué el host engañó:** en el host cada lectura es un `pread` barato desde la caché
+del sistema. En el navegador cada página pasa por `wmp_read_file_slice` (EM_JS): copia
+desde la copia contigua en JS (`HEAPU8.set`) o, para archivos grandes,
+`File.slice` + `FileReaderSync.readAsArrayBuffer` por página, con costo fijo por
+llamada. La fuente comprimida lee el archivo una sola vez en ventanas de 8 MiB y
+después todo ocurre dentro del wasm. **Lección (error nº 15):** no decidir con
+benchmarks de host algo cuyo costo dominante es el cruce JS↔wasm o la API de archivos
+del navegador.
+
+Se mantiene el cambio del smoke test (la fuente queda instalada tras una carga exitosa,
+como en el navegador); con la fuente comprimida no se usa, es inofensivo.
+
+**Verificación:** `check.sh` completo IDENTICAL con la fuente comprimida.
+
+Última revisión entregada: `wasmidi-main-rev58.1-compressed-again.zip`.
