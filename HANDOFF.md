@@ -3517,4 +3517,137 @@ como en el navegador); con la fuente comprimida no se usa, es inofensivo.
 
 **Verificación:** `check.sh` completo IDENTICAL con la fuente comprimida.
 
-Última revisión entregada: `wasmidi-main-rev58.1-compressed-again.zip`.
+Revisión anterior entregada: `wasmidi-main-rev58.1-compressed-again.zip`.
+
+---
+
+## 52. Revisión 59 — revisión de Kimrashi (carga y parseo de MIDI)
+
+**Pedido del usuario:** revisar la carga y el parseo de MIDI de Kimrashi
+(`Kimrashi-main.zip`, Rust, reproductor Black MIDI para Windows) y tomar lo útil.
+
+**Licencia: GPLv3** (el shader de notas viene de Wasabi, también GPLv3). WASMIDI no tiene
+`LICENSE` en el repo: copiar código de Kimrashi obligaría a que WASMIDI sea compatible
+con GPLv3. Se toman ideas, no código; el bosquejo de medición
+(`tools/host_bench/kimrashi_pack_estimate.cpp`) es una reimplementación propia del
+formato descrito y no se usa en la app.
+
+**Qué hace Kimrashi (`src/parser.rs`):**
+
+- Cada pista se re-codifica en registros: `vlv(delta<<2 | flags) [status] key [vel]
+  [vlv(dur+1)]`; los note-off se pliegan en la duración (emparejado FIFO por
+  canal+tecla con listas enlazadas de ordinales), velocity y duración "corridas"; CC,
+  programa, pitch bend y aftertouch se conservan; metas salvo tempo y SysEx se
+  descartan; velocity cuantizable.
+- Los bytes de cada pista se cortan en chunks definidos por contenido (gear hash,
+  ~256 B, 64-1024) y cada chunk distinto se guarda una vez (hash por shards + comparación
+  de bytes). En MIDIs "merge" llega a 0,02-0,14 del tamaño del archivo.
+- Carga en paralelo por pista (rayon): cada hilo lee una pista con su propio handle, la
+  empaqueta y la descarta; un presupuesto de bytes limita lo crudo en vuelo. También
+  carga desde archivos comprimidos/zip/7z, y salta notas cuando el synth se atrasa.
+
+**Mediciones propias sobre Hypernova (host, 1 hilo):**
+
+| | Bytes/nota | Tamaño | Tiempo |
+|---|---|---|---|
+| Fuente zstd de WASMIDI (rev. 57/58.1) | 1,52 | 68 MB | escaneo + compresión ~5 s |
+| Formato Kimrashi antes de dedup | 3,04 | 130 MB | |
+| Formato Kimrashi con dedup por contenido | **1,30** | 55,5 MB | 2,7 s (solo empaquetar) |
+| Dedup por contenido sobre bytes crudos (256 B) + zstd por chunk | 2,0 | 85,5 MB | |
+
+Hypernova no es un "merge" muy repetido: el formato de Kimrashi ahorra solo ~19% contra
+la fuente zstd actual. Su gran ventaja aparece en merges (tabla del README), que no
+tenemos para medir.
+
+**Qué se tomó:**
+
+- **Emparejado FIFO con listas enlazadas** para las notas abiertas del escaneo (en
+  lugar de un `std::deque` por canal+tecla), con un pool de nodos reciclados para que la
+  memoria dependa de las notas abiertas y no del total de la pista. Escaneo de Hypernova
+  ~3,9-4,3 s → ~3,6 s (−10-15%), carga total ~−6%. Resultados idénticos (`check.sh`,
+  teclado con seeks y páginas en Hypernova).
+
+**Qué no se tomó y por qué:**
+
+- **Formato empaquetado como almacenamiento:** pliega los note-off, así que el flujo del
+  synth y el barrido SharpMIDI (que dependen del orden original de on/off entre pistas)
+  dejarían de ser idénticos; en Hypernova el ahorro es chico.
+- **Cuantizar velocity:** cambia sonido y opacidad.
+- **Dedup por contenido sobre bytes crudos:** en Hypernova queda peor que zstd en
+  bloques de 64 KiB.
+
+**Lo que vale la pena después (necesita navegador):**
+
+- **Carga en paralelo por pista con varios Web Workers**, como los hilos de Kimrashi:
+  cada worker lee sus pistas del `File` en lecturas grandes (no por páginas, que fue lo
+  que falló en §51), arma su parte del índice y la fuente comprimida, y la transfiere al
+  worker del parser. El escaneo por pista ya es independiente salvo tempo, colores y
+  SysEx, que se combinan al final.
+- **Probar el formato de Kimrashi con un MIDI "merge" real** antes de descartarlo para
+  siempre.
+- **Cargar desde .zip/.7z/.gz/.zst** como función nueva.
+
+Revisión anterior entregada: `wasmidi-main-rev59-kimrashi-review.zip`.
+
+---
+
+## 53. Revisión 60 — zstd solo para archivos grandes
+
+**Pregunta del usuario:** ¿zstd está empeorando todo?
+
+**Medición (host, Hypernova 498 MB, dos corridas):**
+
+| | Carga | Memoria del store |
+|---|---|---|
+| zstd siempre (rev. 57-59) | 4,5-5,1 s (1,3 s comprimiendo + descompresión durante el escaneo) | 123 MB |
+| crudo en RAM | **3,35-3,74 s** (−25-30%) | 511 MB |
+
+Respuesta: para la carga, sí: zstd cuesta ~1,1-1,4 s en Hypernova. Pero es lo que
+permite cargar MIDIs de varios GB (§49) y baja la memoria 4×.
+
+**Cambio:**
+
+- `bpfa_midi_store`: `setRawSourceLimit(bytes)`, default **512 MiB**. Hasta ese tamaño
+  el archivo se lee entero (ventanas de 8 MiB) y se decodifica directo; más grande, la
+  fuente zstd en streaming de §49. `setRawSourceLimit(0)` = siempre zstd.
+- `midi-parser-worker.js`: al terminar una carga exitosa se descarta la copia contigua
+  del archivo en JS (`__wasmidiMidiParserWholeFile`, hasta 1/8 de la RAM). El store BPFA
+  nunca vuelve a leer el archivo después de indexar (ni crudo ni zstd), así que esa
+  copia solo duplicaba memoria. El `File` se conserva (está en disco).
+
+**Verificación:** `check.sh` y Hypernova en modo crudo (synth, renderer, teclado con
+seeks, páginas): **idénticos** al parser original. El modo zstd no cambió desde rev. 59.
+
+**Prueba pedida:** tiempo de carga de Hypernova (crudo) y de un MIDI de más de 512 MiB
+(zstd).
+
+Revisión anterior entregada: `wasmidi-main-rev60-zstd-only-large.zip`.
+
+---
+
+## 54. Revisión 61 — zstd solo cuando el MIDI crudo no entraría
+
+**Pedido del usuario:** que zstd se active solo cuando el MIDI pueda exceder los límites
+o usar más que la RAM del sistema, no con un umbral fijo.
+
+**Cambio:**
+
+- `midi-parser-worker.js`, `rawSourceLimitBytes()`: límite = mínimo entre
+  - el heap del parser (`MAXIMUM_MEMORY` 16 GiB) menos 2 GiB para índice y estructuras
+    → 14 GiB, y
+  - el 75% de la RAM según `navigator.deviceMemory` (si no hay dato, se asumen 8 GiB);
+    a la mitad si durante la carga coexiste la copia contigua del archivo en JS
+    (solo pasa con archivos de hasta 1/8 de la RAM).
+  Se pasa antes de cada parseo con el export nuevo `wmp_set_raw_source_limit_js(bytes)`
+  (exportado en CMake). Ejemplos: `deviceMemory` 8 → crudo hasta 6 GiB; 4 → 3 GiB.
+- `midi_worker_core.cpp`: `g_rawSourceLimit` (default 512 MiB si el worker no lo fija,
+  como en CI/Node) aplicado a `BpfaMidiStore::setRawSourceLimit` antes de `index()`.
+
+**Límite conocido:** `navigator.deviceMemory` está topado en 8 por especificación (y
+Brave lo puede alterar), así que en máquinas con más RAM el límite real queda en 6 GiB:
+archivos más grandes van por zstd aunque entrarían crudos. Es el lado seguro.
+
+**Verificación:** `node --check` de workers y smoke test; `midi_worker_core.cpp`
+compila con y sin `WASMIDI_PARSER_BPFA`. El store no cambió (§53 verificado).
+
+Última revisión entregada: `wasmidi-main-rev61-zstd-by-budget.zip`.

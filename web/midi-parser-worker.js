@@ -12,6 +12,19 @@ const FAST_SOURCE_MIN_BYTES = 256 * 1024 * 1024;
 const FAST_SOURCE_DEFAULT_BYTES = 512 * 1024 * 1024;
 const FAST_SOURCE_MAX_BYTES = 1024 * 1024 * 1024;
 
+// zstd only when keeping the MIDI raw could exceed the parser heap (16 GiB) or the
+// machine's RAM (HANDOFF sec. 54). navigator.deviceMemory is coarse and capped at 8 GiB.
+function rawSourceLimitBytes(wholeFileCopied) {
+    const GiB = 1024 * 1024 * 1024;
+    const heapRoom = 16 * GiB - 2 * GiB;
+    const deviceGiB = Number(self.navigator && self.navigator.deviceMemory);
+    const ram = Number.isFinite(deviceGiB) && deviceGiB > 0 ? deviceGiB * GiB : 8 * GiB;
+    let ramRoom = ram * 0.75;
+    // While loading, the contiguous JS copy and the raw store coexist.
+    if (wholeFileCopied) ramRoom /= 2;
+    return Math.max(0, Math.min(heapRoom, ramRoom));
+}
+
 function fastSourceLimitBytes() {
     // MPWGL2 reads the whole MIDI once and then parses a contiguous Uint8Array,
     // which is much faster than repeated Blob.slice/FileReaderSync crossings.
@@ -1098,6 +1111,9 @@ self.onmessage = async event => {
             ? "Parsing MIDI from memory"
             : "Opening MIDI as a paged source");
 
+        if (typeof Module._wmp_set_raw_source_limit_js === "function")
+            Module._wmp_set_raw_source_limit_js(
+                rawSourceLimitBytes(!!self.__wasmidiMidiParserWholeFile));
         const ok = Module._wmp_parse_file_js(total);
         if (!ok) {
             const parserText = parserErrorText(Module, "Could not parse MIDI");
@@ -1112,6 +1128,9 @@ self.onmessage = async event => {
         // MemoryMappedFile. Only metadata is packed to Qt; render/playback
         // pages continue to read bounded windows from this File after loading.
         mappedFileReady = true;
+        // The BPFA store keeps its own copy of the source (raw or zstd) and never reads
+        // the file after indexing: drop the contiguous JS copy (HANDOFF sec. 53).
+        self.__wasmidiMidiParserWholeFile = null;
 
         self.__wasmidiMidiParserStage = "Packing mapped MIDI metadata";
         const packed = Module._wmp_pack();

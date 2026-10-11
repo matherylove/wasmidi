@@ -49,6 +49,9 @@ public:
     // Discarded experiment, off by default (HANDOFF sec. 50-51): read the MIDI from readAt on demand instead of
     // keeping compressed source blocks. readAt must stay valid after index().
     // pageBytes 0 = automatic: a ~64 MiB cache with at least two pages per track.
+    // Files up to this size stay uncompressed in RAM; bigger ones use the zstd source.
+    // The worker sets it from the heap/RAM budget (HANDOFF sec. 53-54). 0 = always zstd.
+    void setRawSourceLimit(uint64_t bytes) { rawSourceLimit_ = bytes; }
     void setOnDemandSource(bool enabled, std::size_t pageBytes = 0, std::size_t pages = 0)
     { onDemand_ = enabled; onDemandRequestPageBytes_ = pageBytes; onDemandRequestPages_ = pages; }
     bool index(uint64_t size, MidiReadAt readAt, void* readUser, MidiDocument& metadata,
@@ -174,6 +177,7 @@ private:
     std::vector<SourceChunk> sourceChunks_;
     uint64_t storedSourceBytes_ = 0;
     bool onDemand_ = false;
+    uint64_t rawSourceLimit_ = 512ull * 1024ull * 1024ull;
     std::size_t onDemandRequestPageBytes_ = 0;
     std::size_t onDemandRequestPages_ = 0;
     std::size_t onDemandPageBytes_ = 64u * 1024u;

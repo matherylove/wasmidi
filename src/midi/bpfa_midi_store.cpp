@@ -288,6 +288,18 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             onDemandPageBytes_ = requestedPageBytes ? requestedPageBytes : 64u * 1024u;
             onDemandPages_ = requestedPageBytes && onDemandRequestPages_ ? onDemandRequestPages_ : 64u;
             sourceCache_.assign(onDemandPages_, CacheSlot{});
+        } else if (size <= rawSourceLimit_) {
+            fileBytes_.resize(static_cast<std::size_t>(size));
+            for (uint64_t done = 0; done < size;) {
+                const std::size_t amount = static_cast<std::size_t>(std::min<uint64_t>(ReadBlock, size - done));
+                if (!readAt(readUser, done, fileBytes_.data() + done, amount)) {
+                    error_ = "Could not read MIDI source";
+                    return false;
+                }
+                done += amount;
+                if (progress)
+                    progress(progressUser, int(1 + 39.0 * double(done) / double(size)), "BPFA: reading source");
+            }
         } else if (!ingestSource(size, readAt, readUser, progress, progressUser)) {
             if (error_.empty()) error_ = "Could not read MIDI source";
             return false;
@@ -340,7 +352,13 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
         uint64_t totalNotes = 0, totalControls = 0;
 
         // BPFA ScanTrack: checkpoints, tempo, sparse state events, SysEx, counts.
-        std::vector<std::deque<SnapshotNote>> open(16u * 128u);
+        // Open notes per channel+key as FIFO lists over a recycled node pool (the
+        // pairing structure of Kimrashi's packer; HANDOFF sec. 52).
+        struct OpenNode { SnapshotNote note; uint32_t next; };
+        constexpr uint32_t NoNode = 0xffffffffu;
+        std::vector<OpenNode> openPool;
+        uint32_t openFree = NoNode;
+        std::array<uint32_t, 16u * 128u> openHead{}, openTail{};
         uint64_t snapshotNotesUsed = 0;
         for (uint16_t t = 0; t < out.trackCount; ++t) {
             TrackStorage& storage = tracks_[t];
@@ -354,7 +372,10 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
             std::array<uint8_t, 16> firstPitch{};
             uint16_t firstClosedMask = 0;
             uint64_t closureOrder = 0;
-            for (auto& queue : open) queue.clear();
+            openPool.clear();
+            openFree = NoNode;
+            openHead.fill(NoNode);
+            openTail.fill(NoNode);
             std::size_t openCount = 0;
             uint8_t status = 0, d1 = 0, d2 = 0;
             uint32_t tempo = 0, dataLength = 0;
@@ -389,10 +410,24 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                     const uint16_t vkey = uint16_t((uint16_t(channel) << 7) | (d1 & 0x7f));
                     const uint16_t bit = uint16_t(1u << channel);
                     if (noteOn) {
-                        open[vkey].push_back({d.tick, uint32_t(std::min<uint64_t>(events, 0xffffffffu)), vkey, d2, 0});
+                        uint32_t node = openFree;
+                        if (node != NoNode) {
+                            openFree = openPool[node].next;
+                        } else {
+                            node = uint32_t(openPool.size());
+                            openPool.push_back({});
+                        }
+                        openPool[node] = {{d.tick, uint32_t(std::min<uint64_t>(events, 0xffffffffu)), vkey, d2, 0}, NoNode};
+                        if (openTail[vkey] == NoNode) openHead[vkey] = node;
+                        else openPool[openTail[vkey]].next = node;
+                        openTail[vkey] = node;
                         ++openCount;
-                    } else if (noteOff && !open[vkey].empty()) {
-                        open[vkey].pop_front();
+                    } else if (noteOff && openHead[vkey] != NoNode) {
+                        const uint32_t node = openHead[vkey];
+                        openHead[vkey] = openPool[node].next;
+                        if (openHead[vkey] == NoNode) openTail[vkey] = NoNode;
+                        openPool[node].next = openFree;
+                        openFree = node;
                         --openCount;
                     }
                     if (noteOn) {
@@ -422,8 +457,9 @@ bool BpfaMidiStore::index(uint64_t size, MidiReadAt readAt, void* readUser, Midi
                     VisualSnapshot snapshot;
                     snapshot.resume = {d.position, events, d.tick, d.runningStatus};
                     snapshot.notes.reserve(openCount);
-                    for (const auto& queue : open)
-                        for (const SnapshotNote& note : queue) snapshot.notes.push_back(note);
+                    for (uint32_t key = 0; key < openHead.size(); ++key)
+                        for (uint32_t node = openHead[key]; node != NoNode; node = openPool[node].next)
+                            snapshot.notes.push_back(openPool[node].note);
                     storage.snapshots.push_back(std::move(snapshot));
                 }
                 out.activeChannelMasks[t] |= (1u << channel);
@@ -1433,6 +1469,14 @@ bool BpfaMidiStore::sourceSlotValid(uint16_t slot, uint64_t begin) const
 bool BpfaMidiStore::sourceBlock(uint64_t position, uint16_t& slotHint, const uint8_t*& data, uint64_t& begin,
                                 uint64_t& end) const
 {
+    if (!fileBytes_.empty()) {
+        if (position >= fileBytes_.size()) return false;
+        data = fileBytes_.data();
+        begin = 0;
+        end = fileBytes_.size();
+        slotHint = 0xffffu;
+        return true;
+    }
     if (onDemand_) {
         if (position >= sourceSize_) return false;
         const uint64_t page = position / onDemandPageBytes_;

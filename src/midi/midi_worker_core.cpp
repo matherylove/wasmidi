@@ -27,6 +27,9 @@ namespace {
 #endif
 #if WASMIDI_PARSER_BPFA
 wasmidi::BpfaMidiStore g_mappedStore;
+// Raw (uncompressed) source up to this size; set by the worker from the memory budget
+// before each parse (HANDOFF sec. 54).
+uint64_t g_rawSourceLimit = 512ull * 1024ull * 1024ull;
 #else
 wasmidi::MidiMappedStore g_mappedStore;
 #endif
@@ -284,6 +287,9 @@ int parseFileDocument(std::size_t size)
         // Pass 13: browser File/Blob is the memory-mapped backing store. The
         // worker indexes every track and builds bounded state checkpoints, but
         // never materializes one CompactEvent/VisualNote per source event.
+#if WASMIDI_PARSER_BPFA
+        g_mappedStore.setRawSourceLimit(g_rawSourceLimit);
+#endif
         if (!g_mappedStore.index(
                 static_cast<uint64_t>(size),
                 &browserReadAt,
@@ -870,6 +876,18 @@ EMSCRIPTEN_KEEPALIVE
 double wmp_error_size_js()
 {
     return static_cast<double>(g_error.size());
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void wmp_set_raw_source_limit_js(double bytes)
+{
+#if WASMIDI_PARSER_BPFA
+    g_rawSourceLimit = bytes > 0.0 ? static_cast<uint64_t>(bytes) : 0u;
+#else
+    (void)bytes;
+#endif
 }
 
 // CI probe for Memory64 heap growth, now that the BPFA store keeps the heap small
